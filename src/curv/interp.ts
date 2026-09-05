@@ -36,9 +36,14 @@ export interface EvalResult { shape: SNode | null; traces: SolveTrace[]; usesTim
 export interface Inputs { viewport: { x: number; y: number; w: number; h: number }; time: number; mouse: { x: number; y: number; down: boolean }; params?: Record<string, number | boolean | number[]> }
 
 export class Env {
-  constructor(public vars: Map<string, Value> = new Map(), public parent: Env | null = null) {}
+  /** readonly: shared, immutable (builtins / prelude).  Assignments to a readonly-held name create a
+   *  same-frame shadow binding in the dynamic env of that frame instead of corrupting the shared map. */
+  constructor(public vars: Map<string, Value> = new Map(), public parent: Env | null = null, public readonly = false) {}
   lookup(n: string): Value | undefined { let e: Env | null = this; while (e) { if (e.vars.has(n)) return e.vars.get(n); e = e.parent; } return undefined; }
-  owner(n: string): Env | null { let e: Env | null = this; while (e) { if (e.vars.has(n)) return e; e = e.parent; } return null; }
+  /** first writable env having `n` */
+  owner(n: string): Env | null { let e: Env | null = this; while (e) { if (e.vars.has(n) && !e.readonly) return e; e = e.parent; } return null; }
+  /** true when some (possibly readonly) env in the chain has `n` */
+  has(n: string): boolean { let e: Env | null = this; while (e) { if (e.vars.has(n)) return true; e = e.parent; } return false; }
   child() { return new Env(new Map(), this); }
 }
 
@@ -272,6 +277,10 @@ class ValueHasher {
 }
 
 // ---------- interpreter ----------
+// Shape accessors are frame-independent (they dispatch through `activeInterp`): one Fn per (node, which),
+// one record per node — reused by every frame and every interp, which also keeps `ValueHasher` keys stable.
+const shapeFnMemo = new WeakMap<SNode, { dist?: Fn; colour?: Fn }>();
+const shapeRecMemo = new WeakMap<SNode, Rec>();
 /**
  * The currently evaluating interpreter.  Closures dispatch their body evaluation through this
  * instead of the instance that created them, which makes closures independent of their creator's
@@ -289,66 +298,21 @@ let activeInterp: Interp | null = null;
  *  prelude `Fn` identities stable across frames, so `fnHashMemo` and the call memo stay warm. */
 let sharedPrelude: Env | null = null;
 
-export class Interp {
-  traces: SolveTrace[] = []; usesTime = false; usesMouse = false; usesViewport = false; params: ParamDesc[] = [];
-  callMemo: CallMemoStats = { hits: 0, misses: 0, measured: 0, skipped: 0, hashMs: 0 };
-  private cpuFns = new WeakMap<SNode, { dist: (x: number, y: number, t: number) => number; colour: (x: number, y: number, t: number) => number[] }>();
-  constructor(public atlas: Atlas, public inputs: Inputs) {}
-
-  // ---- shader-side helpers -------------------------------------------------
-  /** Fn value that evaluates (CPU) / compiles (GPU) the distance or colour of a shape node. */
-  shapeFn(node: SNode, which: "dist" | "colour"): Fn {
-    const f = new Fn(`shape.${which}`, (p, l) => {
-      const [x, y] = vec2(p, "a point", l); const t = isList(p) && p.length >= 4 && isNum(p[3]) ? p[3] : this.inputs.time;
-      const c = this.cpuCompile(node);
-      return which === "dist" ? c.dist(x, y, t) : c.colour(x, y, t);
-    });
-    f.sc = (sc, arg, line) => {
-      const p4 = sc.g.let(sc.toE(arg, line));
-      const p2 = p4.t === "v2" ? p4 : sc.g.vec([sc.g.idx(p4, 0), sc.g.idx(p4, 1)]);
-      const r = genShape(sc.g, node, sc.g.let(p2), { ...sc.ctx, cull: false });
-      return sc.dyn(which === "dist" ? r.d : sc.g.swz(r.c, [0, 1, 2]));
-    };
-    // hashable by content (plain nodes do not read host state), so a function receiving `s.dist` can still be memoised
-    const h = nodeHash(node); if (h !== null) f.key = which + ":" + h;
-    return f;
-  }
-  cpuCompile(node: SNode) {
-    let c = this.cpuFns.get(node);
-    if (!c) {
-      const g = new JS();
-      const ctx: GenCtx = { atlas: this.atlas, zoom: { t: "f", s: "1" }, time: { t: "f", s: "T" }, cull: false, defaultColour: DEFAULT_COLOUR };
-      const r = genShape(g, node, { t: "v2", s: "p0" }, ctx);
-      const body = `const p0 = [x, y];\n${g.code()}\nreturn [${r.d.s}, ${r.c.s}];`;
-      const fn = new Function("P", "R", "x", "y", "T", body) as (P: number[], R: unknown, x: number, y: number, T: number) => [number, number[]];
-      const R = makeJSRuntime(() => 0.5); const P = g.finalParams();
-      c = { dist: (x, y, t) => fn(P, R, x, y, t)[0], colour: (x, y, t) => fn(P, R, x, y, t)[1].slice(0, 3) };
-      this.cpuFns.set(node, c);
-    }
-    return c;
-  }
-  shaderFn(f: Value, name: string, line?: number): ShaderFn {
-    if (!(f instanceof Fn)) throw err(`${name} must be a function, got ${typeName(f)}`, line);
-    return { name, compile: (g: Gen, p: E, ctx: GenCtx) => compileFnAt(this, g, f, p, ctx, line) };
-  }
-  shapeRec(s: Shape): Rec {
-    const b = bboxOf(s.node, this.atlas);
-    const bb: Value = b ? [[b[0], b[1], 0], [b[2], b[3], 0]] : [[-Infinity, -Infinity, 0], [Infinity, Infinity, 0]];
-    return new Rec(new Map<string, Value>([["dist", this.shapeFn(s.node, "dist")], ["colour", this.shapeFn(s.node, "colour")], ["bbox", bb], ["is_2d", true], ["is_3d", false]]));
-  }
-  makeShape(r: Rec, line?: number): Shape {
-    if (r.get("is_3d") === true && r.get("is_2d") !== true) throw err("3D shapes are not supported in this 2D playground (only is_2d shapes)", line);
-    const d = r.get("dist"), c = r.get("colour");
-    let bbox: BBox | null = null;
-    const bv = r.get("bbox") ?? null;
-    if (isList(bv) && bv.length === 2 && isList(bv[0]) && isList(bv[1])) { const lo = nums(bv[0], line), hi = nums(bv[1], line); bbox = [lo[0], lo[1], hi[0], hi[1]]; if (!bbox.every(Number.isFinite)) bbox = null; }
-    return S({ k: "custom", dist: d === undefined ? null : this.shaderFn(d, "dist", line), colour: c === undefined ? null : this.shaderFn(c, "colour", line), bbox, name: "make_shape" });
-  }
-
   // ---- builtins -------------------------------------------------------------
-  builtins(): Env {
-    const env = new Env();
-    const b = (name: string, v: Value) => { env.vars.set(name, v); if (v instanceof Fn && v.key === undefined) { v.key = name; if (v.fields) for (const [k, x] of v.fields) if (x instanceof Fn && x.key === undefined) x.key = name + "." + k; } return v; };
+const staticBuiltinMaps = new WeakMap<Atlas, Map<string, Value>>();
+/**
+ * The shared, per-atlas builtin environment: every definition that depends only on its arguments
+ * and the (constant) glyph atlas — math, lists, strings, colours, shape constructors/operators.
+ * It is created once and shared read-only by every run; `time` / `mouse` / `viewport` live in the
+ * small dynamic part (`Interp.builtins`).  Definitions that build custom nodes from user shader
+ * functions dispatch through `activeInterp` so the result belongs to the frame calling them.
+ */
+function staticBuiltins(atlas: Atlas): Map<string, Value> {
+  const hit = staticBuiltinMaps.get(atlas);
+  if (hit) return hit;
+  const vars = new Map<string, Value>();
+  staticBuiltinMaps.set(atlas, vars);
+  const b = (name: string, v: Value) => { vars.set(name, v); if (v instanceof Fn && v.key === undefined) { v.key = name; if (v.fields) for (const [k, x] of v.fields) if (x instanceof Fn && x.key === undefined) x.key = name + "." + k; } return v; };
     const scUnary = (f: Fn, gname: string) => { f.sc = (sc, a, l) => { if (sc.allStatic([a])) return sc.static(f.call(sc.staticValue(a, l), l)); return sc.dyn(sc.g.fn(gname, [sc.toE(a, l)])); }; return f; };
     const scList = (f: Fn, n: number, build: (sc: SC, xs: E[]) => E) => {
       f.sc = (sc, a, l) => { if (sc.allStatic([a])) return sc.static(f.call(sc.staticValue(a, l), l)); const items = sc.items(a, l); if (!items || items.length !== n) throw err(`${f.name} expects a list of ${n}`, l); return sc.dyn(build(sc, items.map((x) => sc.toE(x, l)))); }; return f;
@@ -398,9 +362,9 @@ export class Interp {
     b("strcat", fn1("strcat", (a) => (isList(a) ? a : [a]).map((x) => (typeof x === "string" ? x : show(x))).join("")));
     b("repr", fn1("repr", (a) => show(a)));
     b("fields", fn1("fields", (a, l) => [...rec(a, l).f.keys()]));
-    b("text_width", fn2("text_width", (t, s, l) => measureText(this.atlas, typeof t === "string" ? t : show(t), num(s, "font size", l))));
+    b("text_width", fn2("text_width", (t, s, l) => measureText(atlas, typeof t === "string" ? t : show(t), num(s, "font size", l))));
     // intrinsic size of a label as (w, h): h is the font's line height (ascent + descent ≈ 1.25 em)
-    b("text_size", fn2("text_size", (t, s, l) => { const sz = num(s, "font size", l); return [measureText(this.atlas, typeof t === "string" ? t : show(t), sz), sz * 1.25]; }));
+    b("text_size", fn2("text_size", (t, s, l) => { const sz = num(s, "font size", l); return [measureText(atlas, typeof t === "string" ? t : show(t), sz), sz * 1.25]; }));
     // --- constraint strengths: tag constraint values so a combinator can mix priorities
     //     strength "weak" (same_w items)   ·   weight 5 (a == b)   ·   soft c  (= strength "weak")
     const tagCons = (v: Value, f: (c: Cons) => Cons, l?: number): Value => {
@@ -467,10 +431,10 @@ export class Interp {
     }));
     b("text", fn2("text", (t, s, l) => S({ k: "text", text: typeof t === "string" ? t : show(t), size: num(s, "font size", l), align: "center" })));
     b("text_left", fn2("text_left", (t, s, l) => S({ k: "text", text: typeof t === "string" ? t : show(t), size: num(s, "font size", l), align: "left" })));
-    b("make_shape", fn1("make_shape", (r, l) => this.makeShape(rec(r, l), l)));
-    b("make_texture", fn1("make_texture", (f, l) => S({ k: "custom", dist: null, colour: this.shaderFn(f, "texture", l), bbox: null, name: "make_texture" })));
+    b("make_shape", fn1("make_shape", (r, l) => (activeInterp ?? (() => { throw err("make_shape is only available while evaluating"); })()).makeShape(rec(r, l), l)));
+    b("make_texture", fn1("make_texture", (f, l) => S({ k: "custom", dist: null, colour: (activeInterp ?? (() => { throw err("make_texture is only available while evaluating"); })()).shaderFn(f, "texture", l), bbox: null, name: "make_texture" })));
     for (const n of ["cube", "sphere", "cylinder", "cone", "torus", "box", "extrude", "revolve", "rotate_extrude", "perimeter_extrude", "twist", "bend", "capsule", "half_space", "gyroid", "tetrahedron", "octahedron", "dodecahedron", "icosahedron", "prism", "pyramid", "ellipsoid", "lathe", "stretch3"])
-      if (!env.vars.has(n)) b(n, fn1(n, (_a, l) => { throw err(`'${n}' is a 3D operation – this playground renders 2D shapes only (is_2d)`, l); }));
+      if (!vars.has(n)) b(n, fn1(n, (_a, l) => { throw err(`'${n}' is a 3D operation – this playground renders 2D shapes only (is_2d)`, l); }));
     // box helpers (a box is a record {x,y,w,h}, e.g. a solved layout variable); Curv's 3D box is rejected above
     b("frame", fn1("frame", (v, l) => { const bx = boxOf(v, l); return S({ k: "xform", tx: bx.x + bx.w / 2, ty: bx.y + bx.h / 2, rot: 0, sc: 1, s: { k: "rect", w: bx.w, h: bx.h, r: 0 } }); }));
     b("frame_r", fn2("frame_r", (r, v, l) => { const bx = boxOf(v, l); return S({ k: "xform", tx: bx.x + bx.w / 2, ty: bx.y + bx.h / 2, rot: 0, sc: 1, s: { k: "rect", w: bx.w, h: bx.h, r: num(r, "corner radius", l) } }); }));
@@ -494,7 +458,7 @@ export class Interp {
     ])); }));
     b("morph", fn2("morph", (t, v, l) => { const ks = shapes(v, l); if (ks.length !== 2) throw err("morph expects [a, b]", l); return S({ k: "morph", t: num(t, "morph factor", l), a: ks[0], b: ks[1] }); }));
     b("offset", fn2("offset", (r, s, l) => S({ k: "round", r: num(r, "offset", l), s: shape(s, l) })));
-    b("inflate", env.vars.get("offset")!);
+    b("inflate", vars.get("offset")!);
     b("shell", fn2("shell", (w, s, l) => S({ k: "stroke", w: num(w, "shell thickness", l), s: shape(s, l) })));
     b("stroke", fn1("stroke", (a, l) => {
       if (a instanceof Rec) { const [x1, y1] = vec2(a.get("from") ?? [0, 0], "from", l), [x2, y2] = vec2(a.get("to") ?? [0, 0], "to", l); return S({ k: "seg", x1, y1, x2, y2, th: num(a.get("d") ?? 1, "d", l) }); }
@@ -502,8 +466,8 @@ export class Interp {
     }));
     b("lipschitz", fn2("lipschitz", (k, s, l) => S({ k: "lipschitz", lip: num(k, "lipschitz bound", l), s: shape(s, l) })));
     const col = fn2("colour", (c, s, l) => {
-      if (c instanceof Fn) return S({ k: "colourfn", f: this.shaderFn(c, "colour", l), s: shape(s, l) });
-      if (isList(c) && c.length === 2 && c[0] instanceof Fn && c[1] instanceof Fn) { const [ifield, cmap] = c as Fn[]; const f = new Fn("colour", (p, l2) => cmap.call(ifield.call(p, l2), l2)); f.closure = undefined; f.sc = (sc, a, l2) => sc.call(sc.static(cmap), sc.call(sc.static(ifield), a, l2), l2); return S({ k: "colourfn", f: this.shaderFn(f, "colour", l), s: shape(s, l) }); }
+      if (c instanceof Fn) return S({ k: "colourfn", f: (activeInterp ?? (() => { throw err("colour fn is only available while evaluating"); })()).shaderFn(c, "colour", l), s: shape(s, l) });
+      if (isList(c) && c.length === 2 && c[0] instanceof Fn && c[1] instanceof Fn) { const [ifield, cmap] = c as Fn[]; const f = new Fn("colour", (p, l2) => cmap.call(ifield.call(p, l2), l2)); f.closure = undefined; f.sc = (sc, a, l2) => sc.call(sc.static(cmap), sc.call(sc.static(ifield), a, l2), l2); return S({ k: "colourfn", f: (activeInterp ?? (() => { throw err("colour fn is only available while evaluating"); })()).shaderFn(f, "colour", l), s: shape(s, l) }); }
       return S({ k: "colour", c: colour(c, l), s: shape(s, l) });
     });
     b("colour", col); b("color", col); b("texture", fn2("texture", (c, s, l) => (col.call(c, l) as Fn).call(s, l)));
@@ -511,7 +475,7 @@ export class Interp {
     b("gradient", fn3("gradient", (cs, pts, s, l) => { if (!isList(cs) || cs.length !== 2 || !isList(pts) || pts.length !== 2) throw err("gradient expects (c1,c2) (p0,p1) shape", l); const [x0, y0] = vec2(pts[0], "point", l), [x1, y1] = vec2(pts[1], "point", l); return S({ k: "grad", c1: colour(cs[0], l), c2: colour(cs[1], l), x0, y0, x1, y1, s: shape(s, l) }); }));
     b("shadow", fn3("shadow", (o, bl, s, l) => { const [dx, dy] = vec2(o, "offset", l); return S({ k: "shadow", dx, dy, blur: num(bl, "blur", l), a: 0.45, s: shape(s, l) }); }));
     b("translate", fn2("translate", (v, s, l) => { const [tx, ty] = vec2(v, "offset", l); return S({ k: "xform", tx, ty, rot: 0, sc: 1, s: shape(s, l) }); }));
-    b("move", env.vars.get("translate")!);
+    b("move", vars.get("translate")!);
     b("rotate", fn2("rotate", (a, s, l) => { if (a instanceof Rec) { if (a.f.has("axis")) throw err("rotate {angle, axis} is 3D – use rotate angle", l); a = a.get("angle") ?? 0; } return S({ k: "xform", tx: 0, ty: 0, rot: num(a, "angle", l), sc: 1, s: shape(s, l) }); }));
     b("scale", fn2("scale", (k, s, l) => { if (isList(k)) { const [sx, sy] = vec2(k, "scale", l); return S({ k: "stretch", sx, sy, s: shape(s, l) }); } return S({ k: "xform", tx: 0, ty: 0, rot: 0, sc: num(k, "scale factor", l), s: shape(s, l) }); }));
     b("stretch", fn2("stretch", (k, s, l) => { const [sx, sy] = vec2(k, "scale", l); return S({ k: "stretch", sx, sy, s: shape(s, l) }); }));
@@ -528,26 +492,101 @@ export class Interp {
     b("into", fn2("into", (f, l1, l) => { if (!(f instanceof Fn) || !isList(l1)) throw err("into expects a function and a list", l); return fn1("into'", (s, l2) => f.call([s, ...l1], l2)); }));
     const rowF = (gap: number, v: Value, l?: number): Value => {
       const ks = shapes(v, l); let x = 0; const kids: SNode[] = [];
-      for (const k of ks) { const bb = bboxOf(k, this.atlas); const w = bb && Number.isFinite(bb[0]) && Number.isFinite(bb[2]) ? bb[2] - bb[0] : 2; const x0 = bb && Number.isFinite(bb[0]) ? bb[0] : -w / 2; kids.push({ k: "xform", tx: x - x0, ty: 0, rot: 0, sc: 1, s: k }); x += w + gap; }
+      for (const k of ks) { const bb = bboxOf(k, atlas); const w = bb && Number.isFinite(bb[0]) && Number.isFinite(bb[2]) ? bb[2] - bb[0] : 2; const x0 = bb && Number.isFinite(bb[0]) ? bb[0] : -w / 2; kids.push({ k: "xform", tx: x - x0, ty: 0, rot: 0, sc: 1, s: k }); x += w + gap; }
       const total = x - gap; return S({ k: "xform", tx: -total / 2, ty: 0, rot: 0, sc: 1, s: { k: "union", kids } });
     };
     b("row", fn1("row", (a, l) => (isNum(a) ? fn1("row'", (v, l2) => rowF(a, v, l2)) : rowF(0.5, a, l))));
     b("show_axes", fn1("show_axes", (s, l) => {
-      const n = shape(s, l); const bb = bboxOf(n, this.atlas); const ext = bb && bb.every(Number.isFinite) ? Math.max(bb[2] - bb[0], bb[3] - bb[1], 1) : 20; const th = ext / 250;
+      const n = shape(s, l); const bb = bboxOf(n, atlas); const ext = bb && bb.every(Number.isFinite) ? Math.max(bb[2] - bb[0], bb[3] - bb[1], 1) : 20; const th = ext / 250;
       const axis = (c: RGBA, x1: number, y1: number, x2: number, y2: number): SNode => ({ k: "colour", c, s: { k: "seg", x1, y1, x2, y2, th } });
       return S({ k: "union", kids: [n, axis([1, 0.3, 0.3, 1], -1e5, 0, 1e5, 0), axis([0.3, 1, 0.3, 1], 0, -1e5, 0, 1e5)] });
     }));
-    b("show_bbox", fn1("show_bbox", (s, l) => { const n = shape(s, l); const bb = bboxOf(n, this.atlas); if (!bb || !bb.every(Number.isFinite)) return s; return S({ k: "union", kids: [n, { k: "colour", c: [1, 0.4, 0.8, 1], s: { k: "stroke", w: Math.max(bb[2] - bb[0], bb[3] - bb[1]) / 200, s: { k: "xform", tx: (bb[0] + bb[2]) / 2, ty: (bb[1] + bb[3]) / 2, rot: 0, sc: 1, s: { k: "rect", w: bb[2] - bb[0], h: bb[3] - bb[1], r: 0 } } } }] }); }));
+    b("show_bbox", fn1("show_bbox", (s, l) => { const n = shape(s, l); const bb = bboxOf(n, atlas); if (!bb || !bb.every(Number.isFinite)) return s; return S({ k: "union", kids: [n, { k: "colour", c: [1, 0.4, 0.8, 1], s: { k: "stroke", w: Math.max(bb[2] - bb[0], bb[3] - bb[1]) / 200, s: { k: "xform", tx: (bb[0] + bb[2]) / 2, ty: (bb[1] + bb[3]) / 2, rot: 0, sc: 1, s: { k: "rect", w: bb[2] - bb[0], h: bb[3] - bb[1], r: 0 } } } }] }); }));
     // --- environment
     // viewport: the visible world rectangle (a box record, y up).  Programs that use it are
     // "responsive": they are re-solved whenever the camera or canvas changes.
+
+    return vars;
+}
+
+export class Interp {
+  traces: SolveTrace[] = []; usesTime = false; usesMouse = false; usesViewport = false; params: ParamDesc[] = [];
+  callMemo: CallMemoStats = { hits: 0, misses: 0, measured: 0, skipped: 0, hashMs: 0 };
+  private cpuFns = new WeakMap<SNode, { dist: (x: number, y: number, t: number) => number; colour: (x: number, y: number, t: number) => number[] }>();
+  constructor(public atlas: Atlas, public inputs: Inputs) {}
+
+  // ---- shader-side helpers -------------------------------------------------
+  /** Fn value that evaluates (CPU) / compiles (GPU) the distance or colour of a shape node. */
+  shapeFn(node: SNode, which: "dist" | "colour"): Fn {
+    const perNode = shapeFnMemo.get(node) ?? shapeFnMemo.set(node, {}).get(node)!;
+    const have = which === "dist" ? perNode.dist : perNode.colour;
+    if (have) return have;
+    const f = new Fn(`shape.${which}`, (p, l) => {
+      const I = activeInterp ?? this; // evaluate against the current frame (Fn may be memoised across frames)
+      const [x, y] = vec2(p, "a point", l); const t = isList(p) && p.length >= 4 && isNum(p[3]) ? p[3] : I.inputs.time;
+      const c = I.cpuCompile(node);
+      return which === "dist" ? c.dist(x, y, t) : c.colour(x, y, t);
+    });
+    f.sc = (sc, arg, line) => {
+      const p4 = sc.g.let(sc.toE(arg, line));
+      const p2 = p4.t === "v2" ? p4 : sc.g.vec([sc.g.idx(p4, 0), sc.g.idx(p4, 1)]);
+      const r = genShape(sc.g, node, sc.g.let(p2), { ...sc.ctx, cull: false });
+      return sc.dyn(which === "dist" ? r.d : sc.g.swz(r.c, [0, 1, 2]));
+    };
+    // hashable by content (plain nodes do not read host state), so a function receiving `s.dist` can still be memoised
+    const h = nodeHash(node); if (h !== null) f.key = which + ":" + h;
+    if (which === "dist") perNode.dist = f; else perNode.colour = f;
+    return f;
+  }
+  cpuCompile(node: SNode) {
+    let c = this.cpuFns.get(node);
+    if (!c) {
+      const g = new JS();
+      const ctx: GenCtx = { atlas: this.atlas, zoom: { t: "f", s: "1" }, time: { t: "f", s: "T" }, cull: false, defaultColour: DEFAULT_COLOUR };
+      const r = genShape(g, node, { t: "v2", s: "p0" }, ctx);
+      const body = `const p0 = [x, y];\n${g.code()}\nreturn [${r.d.s}, ${r.c.s}];`;
+      const fn = new Function("P", "R", "x", "y", "T", body) as (P: number[], R: unknown, x: number, y: number, T: number) => [number, number[]];
+      const R = makeJSRuntime(() => 0.5); const P = g.finalParams();
+      c = { dist: (x, y, t) => fn(P, R, x, y, t)[0], colour: (x, y, t) => fn(P, R, x, y, t)[1].slice(0, 3) };
+      this.cpuFns.set(node, c);
+    }
+    return c;
+  }
+  shaderFn(f: Value, name: string, line?: number): ShaderFn {
+    if (!(f instanceof Fn)) throw err(`${name} must be a function, got ${typeName(f)}`, line);
+    return { name, compile: (g: Gen, p: E, ctx: GenCtx) => compileFnAt(this, g, f, p, ctx, line) };
+  }
+  shapeRec(s: Shape): Rec {
+    const hit = shapeRecMemo.get(s.node); // memoised per node: values are static and accessors are frame-independent
+    if (hit) return hit;
+    const b = bboxOf(s.node, this.atlas);
+    const bb: Value = b ? [[b[0], b[1], 0], [b[2], b[3], 0]] : [[-Infinity, -Infinity, 0], [Infinity, Infinity, 0]];
+    const r = new Rec(new Map<string, Value>([["dist", this.shapeFn(s.node, "dist")], ["colour", this.shapeFn(s.node, "colour")], ["bbox", bb], ["is_2d", true], ["is_3d", false]]));
+    shapeRecMemo.set(s.node, r);
+    return r;
+  }
+  makeShape(r: Rec, line?: number): Shape {
+    if (r.get("is_3d") === true && r.get("is_2d") !== true) throw err("3D shapes are not supported in this 2D playground (only is_2d shapes)", line);
+    const d = r.get("dist"), c = r.get("colour");
+    let bbox: BBox | null = null;
+    const bv = r.get("bbox") ?? null;
+    if (isList(bv) && bv.length === 2 && isList(bv[0]) && isList(bv[1])) { const lo = nums(bv[0], line), hi = nums(bv[1], line); bbox = [lo[0], lo[1], hi[0], hi[1]]; if (!bbox.every(Number.isFinite)) bbox = null; }
+    return S({ k: "custom", dist: d === undefined ? null : this.shaderFn(d, "dist", line), colour: c === undefined ? null : this.shaderFn(c, "colour", line), bbox, name: "make_shape" });
+  }
+
+
+
+  /** The small per-frame builtin layer: live inputs only.  Its parent is the shared static env. */
+  builtins(): Env {
+    const dyn = new Env(new Map<string, Value>(), new Env(staticBuiltins(this.atlas), null, /* readonly */ true));
+    const b = (name: string, v: Value) => { dyn.vars.set(name, v); };
     const vp = this.inputs.viewport;
     const viewport = makeBoxRec(vp.x, vp.y, vp.w, vp.h);
     viewport.f.set("width", vp.w); viewport.f.set("height", vp.h);
     b("viewport", viewport); b("parent", viewport); // `parent` kept as an alias for older programs
     b("time", this.inputs.time);
     b("mouse", new Rec(new Map<string, Value>([["x", this.inputs.mouse.x], ["y", this.inputs.mouse.y], ["down", this.inputs.mouse.down], ["pos", [this.inputs.mouse.x, this.inputs.mouse.y]]])));
-    return env;
+    return dyn;
   }
 
   run(src: string): EvalResult {
@@ -555,18 +594,17 @@ export class Interp {
     this.traces.length = 0; this.params.length = 0; this.usesTime = this.usesMouse = this.usesViewport = false;
     this.callMemo = { hits: 0, misses: 0, measured: 0, skipped: 0, hashMs: 0 };
     activeInterp = this;
-    const base = this.builtins();
+    const base = this.builtins(); // the small dynamic layer (time/mouse/viewport) over shared static builtins
     if (!sharedPrelude) { // the prelude is bind-time pure (constants, colour strings, function defs)
       const penv = new Env(new Map(), base);
       const pre = (preludeAst ??= parse("{" + PRELUDE + "}"));
       if (pre.k === "rec") this.bindDefs(pre.defs, penv);
+      penv.readonly = true; // assignments to prelude names shadow in the user's writable env instead
       sharedPrelude = penv;
     }
     sharedPrelude.parent = base; // prelude bodies resolve builtins of THIS run (time, mouse, viewport)
-    // per-run copy: user assignments to prelude names write here, never into the shared map
-    const preludeEnv = new Env(new Map(sharedPrelude.vars), sharedPrelude);
     const ast = parseCached(src);
-    const value = this.eval(ast, preludeEnv.child());
+    const value = this.eval(ast, sharedPrelude.child());
     let node: SNode | null = null;
     if (value instanceof Shape) node = value.node;
     else if (isList(value) && value.length > 0 && value.every((v) => v instanceof Shape)) node = { k: "union", kids: value.map((v) => (v as Shape).node) };
@@ -788,7 +826,7 @@ export class Interp {
     for (const s of ss) {
       switch (s.k) {
         case "local": case "def": { const d = s.k === "local" ? s.def : s.def; if (d.params.length > 0) this.bindDefs([d], env); else this.bindPat(d.pat, this.eval(d.body, env), env, d.line); break; }
-        case "assign": { const o = env.owner(s.name); if (!o) throw err(`Unknown variable '${s.name}'`, s.line); setVar(o, s.name, this.eval(s.e, env)); break; }
+        case "assign": { const o = env.owner(s.name); if (!o) { if (!env.has(s.name)) throw err(`Unknown variable '${s.name}'`, s.line); setVar(env, s.name, this.eval(s.e, env)); /* shadow a readonly (builtin/prelude) binding for this frame */ break; } setVar(o, s.name, this.eval(s.e, env)); break; }
         case "if": if (truthy(this.eval(s.cond, env), s.line)) this.execDo(s.body, env.child()); else if (s.else) this.execDo(s.else, env.child()); break;
         case "for": { const l = this.eval(s.iter, env); if (!isList(l)) throw err("for expects a list", s.line); for (const x of l) { const e2 = env.child(); this.bindPat(s.pat, x, e2, s.line); if (s.until && truthy(this.eval(s.until, e2), s.line)) break; this.execDo(s.body, e2); } break; }
         case "while": { let n = 0; while (truthy(this.eval(s.cond, env), s.line)) { this.execDo(s.body, env.child()); if (++n > 1e6) throw err("while loop did not terminate", s.line); } break; }
@@ -879,7 +917,7 @@ export class Interp {
             break;
           }
           case "def": case "local": this.bindDefs([s.def], env); break;
-          case "assign": { const o = env.owner(s.name); if (!o) throw err(`Unknown variable '${s.name}'`, s.line); setVar(o, s.name, this.eval(s.e, env)); break; }
+          case "assign": { const o = env.owner(s.name); if (!o) { if (!env.has(s.name)) throw err(`Unknown variable '${s.name}'`, s.line); setVar(env, s.name, this.eval(s.e, env)); /* shadow a readonly (builtin/prelude) binding for this frame */ break; } setVar(o, s.name, this.eval(s.e, env)); break; }
           case "cons": {
             // `a == b;` or `weak: expr;` — expr may be any expression producing constraint values
             // (a comparison, or a call such as `hstack 12 main cards`)

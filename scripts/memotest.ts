@@ -67,6 +67,8 @@ const ccases: [string, string, boolean, boolean][] = [ // [name, src, expectHits
   ["closure over later-mutated var", `let f h = h 1 + ${W}; in do local k = time; local g = x -> x + k; local a = f g; k := k + 100; local b = f g; in [a, b, f g]`, true, true],
   ["solve block inside", `let f w = (solve { var b : box; b.w == w + time; b.h == 10; b.x == 0; b.y == 0; }).b.w + ${W}; in [for (i in 0..5) f i]`, true, true],
   ["recursive", `let f n = if (n <= 1) n + ${W} else f (n - 1) + f (n - 2); in f 8 + time`, true, true],
+  ["returns shape accessor", `let f x = let dd = ${W} in (circle 1).dist in [(f 5) [2, 0], (f 5) [0.4, 0]]`, true, false],
+  ["returns shape bbox", `let f b = let dd = ${W} in (circle b).bbox in (f 2).[1].[X] + (f 2).[1].[Y]`, true, false],
 ];
 for (const [name, src, expectHits, expectTimeDep] of ccases) {
   resetSolveCache();
