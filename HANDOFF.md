@@ -1,4 +1,4 @@
-# Curv+solve — handoff (dev round 9)
+# Curv+solve — handoff (dev round 10)
 
 Browser playground for **Curv** (2D F-Rep, compiled to WGSL / JS) extended with
 `solve { }` constraint blocks solved by **psolve** (LP + convex QP, WebAssembly).
@@ -17,17 +17,37 @@ All four were green at the end of this round (`paramcheck` and `memotest` exit 1
 
 ## What changed in this round
 
+1. **Shared static builtin environment** (`staticBuiltins`, per-atlas `WeakMap`).  All ~150 builtins that
+   depend only on their arguments (math, lists, strings, colours, shape constructors/operators, text
+   metrics via the atlas) now live in one read-only per-process env; the per-frame layer is just
+   `time`/`mouse`/`viewport` (`parent` alias).  Definitions that turn user shader functions into custom
+   nodes (`make_shape`, `make_texture`, `colour f`, `[ifield, cmap]`) dispatch through `activeInterp` so
+   their results belong to the calling frame.  **Fixed per-run overhead: 125 µs → 5.6 µs.**
+   Supporting mechanism: `Env.readonly` — the chain is
+   `user child envs → dynamicEnv → sharedPrelude (ro) → staticBuiltins (ro)`; `owner()` skips readonly
+   envs, and assigning to a name that only a *readonly* env holds creates a **same-frame shadow** binding
+   in the statement's env (so `do surface := "tampered"` / `do sin := 3` still work, visibly, for that
+   frame only — next frame sees the original).  No per-frame copies anywhere, and `envEpoch` no longer
+   moves at all in normal frames, so `fnHashMemo` is warm process-wide.
+2. **Shape accessors and `s.bbox` records memoised per `SNode`** (module weakmaps): `s.dist`/`s.colour`
+   are one `Fn` per node across all frames and interps (hash keys stable), and they dispatch through
+   `activeInterp` — this also fixed a latent bug where a call-memoised accessor evaluated distances at
+   the *creation* frame's `time` instead of the current one.  `shapeRec` (`s.bbox`, `s.dist`, …) is one
+   record per node.  Two new memotest cases (33 total).
+3. Warm-frame effect (`prof.ts`, noisy sandbox but consistent): split eval 0.15 → 0.04 ms, dashboard
+   1.3 → 0.9 ms, toolbar 0.7 → 0.8 ms with 27 memo hits; params-only on cached trees is 0.01–0.1 ms.
+
+## Round 9 recap (kept from the round-9 handoff — all still in force)
+
 1. **Shared prelude environment** (`Interp.run`).  The prelude (≈60 defs: palette, box helpers, layout
    combinators, UI components) is bind-time pure, so it is evaluated **once per process** into a shared
-   `Env` whose vars map is read-only afterwards; each run re-points `sharedPrelude.parent` at the fresh
-   builtins env (which carries this frame's `time`/`mouse`/`viewport`), so names inside prelude bodies
-   resolve against the current frame.  The user program evaluates in a child of a **shallow copy** of the
-   shared map, so assignments to prelude names (`surface := …`) stay frame-local.  Closures dispatch their
-   bodies through a module-level `activeInterp` (set by `run`) instead of the instance that created them —
-   prelude closures and call-memoised closures returned across frames now execute against the current
-   frame's `inputs`/`traces`/memo bookkeeping.  Effects: ~35 % less fixed per-run overhead (156 → 125 µs
-   for a trivial program: no 60-def `bindDefs` per frame), and stable prelude `Fn` identity keeps
-   `fnHashMemo` (and thus block/call key hashing) warm across frames.
+   `Env`; each run re-points `sharedPrelude.parent` at the fresh dynamic-builtin layer (which carries this
+   frame's `time`/`mouse`/`viewport`), so names inside prelude bodies resolve against the current frame.
+   Closures dispatch their bodies through a module-level `activeInterp` (set by `run`) instead of the
+   instance that created them — prelude closures and call-memoised closures returned across frames now
+   execute against the current frame's `inputs`/`traces`/memo bookkeeping.  Effects: stable prelude `Fn`
+   identity keeps `fnHashMemo` (and thus block/call key hashing) warm across frames.  (Round 10 removed
+   the per-run shallow copy: the env is marked readonly and assignments shadow instead — see above.)
 2. **Codegen LRU by structural key** (`compileTree`).  A `key !== null` tree that was compiled before (cap
    32, per backend) reuses its `code`/`d`/`c`/`usesTime` and only walks for parameters — hopping back to a
    previous example no longer pays `genShape` (1–5 ms), matching the renderer's pipeline cache.
@@ -101,10 +121,11 @@ All four were green at the end of this round (`paramcheck` and `memotest` exit 1
 ```
 src/curv/parser.ts      lexer + parser (Curv syntax + solve/var/weak:/minimize statements)
 src/curv/freevars.ts    static free-variable analysis (blocks + closure bodies), astId; FreeInfo.why
-src/curv/interp.ts      tree-walking interpreter, builtins (Fn.key), Cons values + strength tags,
-                        shared prelude env + activeInterp dispatch, solve { } → block memo →
-                        fingerprint cache (astId + LRU) → psolve Problem,
-                        call memo (applyMemo/ValueHasher/CALL_* knobs, envEpoch, setVar, fnHashMemo),
+src/curv/interp.ts      tree-walking interpreter, shared static builtins + dynamic layer (Fn.key),
+                        Cons values + strength tags, shared prelude env (Env.readonly + shadow-assign),
+                        activeInterp dispatch, solve { } → block memo → fingerprint cache (astId + LRU) →
+                        psolve Problem, call memo (applyMemo/ValueHasher/CALL_* knobs, envEpoch, setVar,
+                        fnHashMemo), shapeRec/shapeFn per-node memos,
                         compileTree (structural-key reuse + codeLru) / collectParams / collectParamsFast
 src/curv/subcurv.ts     SubCurv: compiles user dist/colour functions to shader code (inlining, loops);
                         tags the point argument, reports time reads (Gen.usesTime)
@@ -174,17 +195,22 @@ scripts/                selftest, paramcheck, memotest, prof (headless, tsx)
   per-run copy); don't add prelude defs for host-state-dependent values.
 * New `Fn`-producing helpers must dispatch body evaluation through `activeInterp` (as `makeClosure` does)
   so shared / memoised closures execute against the current frame.
+* **Shared envs are readonly**: never `setVar` into `staticBuiltins(...)` or `sharedPrelude` after
+  creation.  New per-process values must be bind-time pure for their env (builtins: args + atlas only —
+  anything reading `time`/`mouse`/`viewport` belongs in the small dynamic layer `Interp.builtins()`).
+* Shape accessor `Fn`s are shared per node: they must never capture per-frame interp state (dispatch
+  through `activeInterp`), and their CPU evaluation must be a pure function of (node, point, time).
+* `owner()` skipping readonly envs is load-bearing for frame isolation: `x := y` where `y` is a builtin
+  or prelude name must stay a same-frame shadow, not corruption of the shared env.
 * `codeLru` entries must only ever depend on (backend, structural key): anything else baked into code
   (colours, atlas constants that can differ per document) would need to join the key.
 
 ## Known gaps / next steps
 
-* Eval of the *rest* of an animated cached frame (top-level `union`, builtin pipelines `s >> colour …`,
-  record construction) is all that remains on warm frames: dashboard ≈ 0.6–1.4 ms raw (noisy sandbox; in
-  the App static examples skip evaluation entirely).  The prelude is shared per-process as of round 9;
-  what's left is per-frame allocation of the *user* tree (records, `SNode`s) and `builtins()` (~100 fresh
-  `Fn`s per run — could be shared the same way once a similar purity proof is made; `time`/`mouse`/
-  `viewport` are *values* there, so the shared parts and the per-frame parts would have to be split).
+* Eval of the *rest* of an animated cached frame (user-tree construction, `union` literals) is nearly
+  all that remains on warm frames (split 0.04 ms, dashboard ≈ 0.9 ms raw; static examples skip
+  evaluation entirely).  Builtins (round 10) and the prelude (round 9) are shared per-process now; the
+  per-frame cost is now dominated by the program's own tree allocation.
 * The shader-only-time fast path keeps the quality scale while animating; settling to full resolution
   only happens on pause / interactions (a settle tick that schedules itself per frame was judged too
   finicky).
