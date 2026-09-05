@@ -45,7 +45,12 @@ for (const ex of EXAMPLES) {
     for (let i = 0; i < N; i++) { const t0 = performance.now(); compileTree(a.shape, atlas, "wgsl"); const t1 = performance.now(); collectParams(a.shape, atlas); const t2 = performance.now(); collectParamsFast(a.shape, atlas); tw += performance.now() - t2; tp += t2 - t1; tf += t1 - t0; }
     const ok = same && codeSame && paramsB && memoSame;
     if (!ok) fails++;
-    console.log(`${ok ? "OK " : "ERR"} ${ex.id.padEnd(14)} params=${full.params.length} sameParams=${same}${walkSame ? "" : " (WALK DIFFERS)"} key=${ka === null ? "none (custom)" : ka === kb ? "stable" : "CHANGED"} reused=${second.reused} codeSame=${codeSame} paramsB=${paramsB} memo=${memo}${memoSame ? "" : " MISMATCH"}  codegen ${(tf / N).toFixed(2)}ms → params-only ${(tp / N).toFixed(2)}ms → walk ${(tw / N).toFixed(2)}ms`);
+    // App static-frame skip oracle: a program that read no time/mouse/viewport must produce the identical
+    // key and parameter buffer for any time/mouse/viewport — exactly the inputs the App varies between frames.
+    const isStatic = !a.usesTime && !a.usesMouse && !a.usesViewport && !b.usesTime && !b.usesMouse && !b.usesViewport;
+    let staticOk = true;
+    if (isStatic) { staticOk = ka === kb && eqP(collectParams(a.shape, atlas), collectParams(b.shape, atlas)); if (!staticOk) fails++; }
+    console.log(`${ok && staticOk ? "OK " : "ERR"} ${ex.id.padEnd(14)} params=${full.params.length} sameParams=${same}${walkSame ? "" : " (WALK DIFFERS)"} key=${ka === null ? "none (custom)" : ka === kb ? "stable" : "CHANGED"} reused=${second.reused} codeSame=${codeSame} paramsB=${paramsB} memo=${memo}${memoSame ? "" : " MISMATCH"} skip=${isStatic ? (staticOk ? "safe" : "NOT SAFE") : "-"}  codegen ${(tf / N).toFixed(2)}ms → params-only ${(tp / N).toFixed(2)}ms → walk ${(tw / N).toFixed(2)}ms`);
   } catch (e: any) { fails++; console.log(`ERR ${ex.id}: ${e.message}`); }
 }
 if (fails) process.exitCode = 1;

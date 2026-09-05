@@ -1,4 +1,4 @@
-# Curv+solve — handoff (dev round 7)
+# Curv+solve — handoff (dev round 8)
 
 Browser playground for **Curv** (2D F-Rep, compiled to WGSL / JS) extended with
 `solve { }` constraint blocks solved by **psolve** (LP + convex QP, WebAssembly).
@@ -9,13 +9,34 @@ Headless checks (all use the JS backend, no browser needed):
 | command | what it does |
 |---|---|
 | `npx tsx scripts/selftest.ts [id \| file.curv …]` | evaluates every example, compiles both backends (`anim`/`anim(shader)` flags when the program reads time in the evaluator / only inside compiled shader code), renders `/tmp/t/<id>.png` |
-| `npx tsx scripts/paramcheck.ts` | **fast-path oracle**: `walkParams` buffer == ParamsOnly buffer == full codegen's; key stable and shader text identical across time/viewport; **memoised evaluations produce the same buffer as cold ones** (`memo=` column) |
+| `npx tsx scripts/paramcheck.ts` | **fast-path oracle**: `walkParams` buffer == ParamsOnly buffer == full codegen's; key stable and shader text identical across time/viewport; **memoised evaluations produce the same buffer as cold ones** (`memo=` column); **`skip=safe`** when a program reads no time/mouse/viewport and its key *and* parameter buffer are identical for every input (the exact precondition of the App's static-frame skip) |
 | `npx tsx scripts/memotest.ts` | solve-block **and call-memo** dependency tests (time/mouse/viewport through closures, shadowing, mutations, impure bodies, `print`/`parametric`, node identity …) |
 | `npx tsx scripts/prof.ts [-v]` | warm eval / codegen / params-only timings, per-`solve` cache kind, call-memo hit/miss counters; `-v` prints the per-function memo decisions (calls, warm avg µs, LRU entries, skip reason) |
 
 All four were green at the end of this round (`paramcheck` and `memotest` exit 1 on any failure — check the exit code).
 
 ## What changed in this round
+
+1. **App static-frame skip** (`src/App.tsx` `evaluate`).  After a successful evaluation, if the program read no
+   `time`/`mouse`/`viewport` (`usesTime || CompiledTree.usesTime` covers the shader side too), its
+   `{fp}` is cached where `fp = src + JSON(parametric values) + debug-flag`.  Any later dirty frame with the
+   same fp (pan/zoom, resize, settle ticks — the camera and canvas size are render **uniforms**, not program
+   inputs) re-renders `lastProg` directly: no interpreter, no `compileTree`, status line shows `· static` in
+   green.  Consequences this forced: the **debug-boxes overlay stroke width is a constant 1.5 world units**
+   (it used to be `1/zoom` — camera-dependent); camera **fitting runs inside the same evaluation** (`needFit`
+   branch: responsive programs re-run the same `Interp` with the home viewport — `Interp.run` is now
+   **idempotent** and wipes its per-instance state — instead of a second Interp whose results were silently
+   dropped); the skip is only taken when `!needFit`.  Render calls funnel through a `paint(prog, q, updateCode)`
+   helper shared by the evaluation path, the skip path and the shader-time path.
+2. **Adaptive call-memo threshold.**  The decision at `CALL_MEMO_SAMPLES` now also measures the *warm* cost of
+   keying this very call (hashes the closure + argument twice and times the second — the first primes
+   `fnHashMemo` for the frame's fresh closure graph): memoise iff `avgWarmBody ≥ max(CALL_MEMO_MIN_MS (8 µs),
+   2 × warmHash)`.  Known-unhashable calls are skipped outright.  This replaces the fixed 25 µs wall and
+   picks up the 15–60 µs prelude helpers (`nav`, `panel`, `progress`, `avatar`, `button`): dashboard hits went
+   8 → 24 per warm frame with hashing ≈ 0.12 ms; a 9 µs body hashed in ~7 µs is correctly skipped.
+3. **`paramcheck` static-skip oracle** (`skip=safe` column) and Reference rows for the new behaviour.
+
+## Round 7 recap (kept from the round-7 handoff — all still in force)
 
 1. **Call memo for pure user functions** (`Interp.applyMemo`, used by `makeClosure`'s final application).
    Each function *body* is profiled for `CALL_MEMO_SAMPLES` (4) calls — the first call is
@@ -75,8 +96,9 @@ src/gpu/renderer.ts     WebGPU renderer (pipeline cache keyed by code, timestamp
 src/gpu/atlas.ts        SDF glyph atlas (Canvas2D + EDT), GLYPHS charset, kerning
 src/psolve/*.ts         Lin/Quad affine expressions, Cons, presolve, QP/LP assembly, bridge to psolve.wasm (b64 inline)
 psolve-src/             C bridge + build instructions for the wasm (unmodified psolve cores)
-src/App.tsx             UI: editor, preview (camera, pause, CPU-aware quality controller, shader-time
-                        re-render path), solver + params panels, memo hit counter in the status line
+src/App.tsx             UI: editor, preview (camera, pause, CPU-aware quality controller, static-frame
+                        skip cache, shader-time re-render path, single-eval camera fitting), solver +
+                        params panels, memo hits + static badge in the status line
 scripts/                selftest, paramcheck, memotest, prof (headless, tsx)
 ```
 
@@ -117,20 +139,28 @@ scripts/                selftest, paramcheck, memotest, prof (headless, tsx)
 * `weak`, `medium`, `strong`, `required` are keywords — new strength-related builtins need other names.
 * The fast frame-loop path (`shaderTimeOnly`) may re-render without evaluating **only** when the program
   used no evaluator-side `time`: any `res.usesTime` means the tree itself changes per frame.
+* The **static-frame skip** (App) is valid only because every program input is part of the fingerprint —
+  src text, parametric values, debug flag — and because `time`/`mouse`/`viewport` reads are flagged
+  (`res.usesTime || CompiledTree.usesTime` / `usesMouse` / `usesViewport` must stay exhaustive for ALL
+  evaluator and SubCurv paths; missing flag = stale picture with no error).  The camera/canvas size must
+  stay render-uniform-only: nothing in evaluation, the debug overlay or parameter generation may depend on
+  it (that is why the overlay stroke width is a constant and fitting is one evaluation, not two).
+* `Interp.run` must stay idempotent (App re-runs on the same instance for the fit retry): reset all
+  per-instance state at the top.
 
 ## Known gaps / next steps
 
-* Eval of the *rest* of a cached frame (top-level `union`, builtin pipelines `s >> colour …`, record
-  construction) still dominates: dashboard ≈ 0.5–1.5 ms (noisy sandbox).  Candidates: memoise
-  `shapeFn`/`shapeRec` per node-identity, or a `run()` fast path that skips evaluation when
-  `!usesTime && !usesMouse && !usesViewport && inputs equal && last value is a plain shape` — pure by
-  construction (see the NOTE in `Interp.run`); it would collapse a static frame to the walk params.
-* `CALL_MEMO_MIN_MS` is a fixed 25 µs — could adapt from measured hash cost.  Bodies whose cost sits
-  just below the threshold (`vstack`/`hstack`/`grid` at 30–80 µs depending on load) are skipped even
-  when called once per frame by example programs; raising `CALL_MEMO_SAMPLES` or profiling on node
-  *warmup* frames could pick them up cheaply.
-* The shader-only-time fast path keeps the previous quality scale; no settle-to-full-quality tick is
-  scheduled per frame (it re-schedules only when `evaluate` ran).
+* Eval of the *rest* of an animated cached frame (top-level `union`, builtin pipelines `s >> colour …`,
+  record construction) is all that remains on warm frames: dashboard ≈ 0.6–1.4 ms raw (noisy sandbox; in
+  the App static examples skip evaluation entirely).  Candidate: **share the prelude environment across
+  runs** — one shared `Env.vars` map with per-frame parent, prelude closures dispatching through an
+  indirection to the *current* Interp (they capture the creating instance today, which is the blocker).
+  It would skip ~50 `bindDefs` per frame AND make prelude `Fn` hashes (`fnHashMemo`) warm across frames.
+  Requires proving the prelude never reads `time`/`mouse`/`viewport` and re-routing flag/trace side
+  effects of nested calls to the right interp — left out of round 8 as too invasive for the win.
+* The shader-only-time fast path keeps the quality scale while animating; settling to full resolution
+  only happens on pause / interactions (a settle tick that schedules itself per frame was judged too
+  finicky).
 * Solids-of-revolution style 3D shapes are rejected ('box [w,h,d]' error) — only 2D SDF.
 * `flow` needs a *numeric* maximum width (wrapping is discrete); `hstack_fit` gives all items the same
   font size / padding.
