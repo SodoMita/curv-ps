@@ -13,6 +13,8 @@ const sections: { title: string; rows: [string, string][] }[] = [
       ["viewport.left/right/top/bottom/w/h/cx/cy", "the visible world rectangle as a box record; constraining against it makes a layout responsive (re-solved on resize/pan/zoom)"],
       ["c = a.w == 2*b.w;  [c, b.h >= 40]", "a comparison on solver variables is a first-class constraint value (lists / boxes broadcast); any statement whose value holds constraints adds them, `weak:` etc. apply to the whole value"],
       ["my_rule b items = [ … constraints … ];", "so ordinary functions are layout combinators; box (x,y,w,h) and inset d box accept solver expressions"],
+      ["fit_labels gap pad s maxw labels", "numeric adaptation: the longest prefix (+1) whose chips fit maxw, from font metrics — drop items instead of going infeasible"],
+      ["F = flow_fit gap maxw maxh pad s labels b items;", "wrap like flow_text but first bisect the largest font ≤ s whose rows fit maxh; read F.size (export via a var) and add F.cells"],
     ],
   },
   {

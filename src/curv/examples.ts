@@ -164,12 +164,15 @@ in union [
     group: "solve",
     id: "buttons",
     name: "Intrinsic sizing",
-    blurb: "Buttons measure their labels (text_width) and the solver distributes the leftover space.",
+    blurb: "Buttons measure their labels (text_width); the solver distributes the leftover space; fit_labels drops what cannot fit. Narrow the window.",
     src: `// Content-driven layout: each button must be at least as wide as its
 // label + padding, all buttons share one width if possible (weak), and
-// the row is centred in the viewport.  Change a label and watch it re-flow.
+// the row is centred in the viewport.  fit_labels drops the buttons that
+// cannot fit the window (measured with the font metrics), so the row
+// adapts instead of overflowing.  Change a label and watch it re-flow.
 let
-  labels = ["Cancel", "Save draft", "Publish now", "Schedule for later"];
+  all = ["Cancel", "Save draft", "Publish now", "Schedule for later", "Export as PDF"];
+  labels = fit_labels 10 18 14 (viewport.w - 32) all;
   n = count labels;  gap = 10;  h = 42;
   L = solve {
     var b : box[n];
@@ -188,10 +191,8 @@ let
   };
 in union [
   frame_r 14 (inset (-14) L.row) >> colour surface,
-  ghost_button L.b.[0] labels.[0],
-  ghost_button L.b.[1] labels.[1],
-  button L.b.[2] labels.[2],
-  button L.b.[3] labels.[3],
+  // the last visible button is the primary action; as the list truncates, the style follows
+  for (i in 0 ..< count labels) (if (i == count labels - 1) then button L.b.[i] labels.[i] else ghost_button L.b.[i] labels.[i]),
   text "b[i].w >= text_width label 14 + 36" 12 >> colour muted
     >> translate (0, L.row.bottom - 44),
 ]`,
@@ -200,14 +201,15 @@ in union [
     group: "solve",
     id: "toolbar",
     name: "Toolbar & wrapping tags",
-    blurb: "hstack_fit sizes a toolbar from its labels; flow_text wraps chips of intrinsic size into rows; soft / strength tag priorities inside combinators. Resize the preview to see it reflow.",
+    blurb: "hstack_fit sizes a toolbar from its labels (fit_labels drops what cannot fit), flow_text wraps chips of intrinsic size into rows. Resize to a sliver: it never goes infeasible.",
     src: `// Intrinsic sizes + wrapping.  hstack_fit keeps the toolbar's buttons equal
 // while there is room and falls back to label widths when there is not (the
 // equality is tagged \`soft\` inside the combinator).  flow_text decides the
 // line breaks from the measured chip sizes, so only positions are solved.
 let
   pad = 16; gap = 10;
-  tools = ["File", "Edit", "View", "Insert", "Format", "Tools", "Window", "Help"];
+  tool_names = ["File", "Edit", "View", "Insert", "Format", "Tools", "Window", "Help", "Overflow", "More…"];
+  tools = fit_labels 6 14 13 (viewport.w - 2*pad - 12) tool_names;   // only the tools that fit (adaptation)
   tags  = ["WebGPU", "F-Rep", "Curv", "psolve", "LP + QP", "WGSL", "kerning: AVATAR WAVE", "Latin-1: café · naïve · Ærø",
            "→ arrows ←", "≤ ≥ ≠ ≈ ∞", "★ ✓ ♥", "£ € ° ±", "Constraint values", "hstack_fit", "flow_text", "soft", "strength", "weight"];
   chip_w = viewport.w - 2*pad - 2*14;      // width available to the chip flow (a number)
@@ -220,11 +222,12 @@ let
     bar.h == 44;  footer.h == 28;  space.h >= 0;   // …the trailing space absorbs the slack
     hstack_fit 6 14 13 tools (inset 6 bar) buttons;  // buttons ≥ label width, equal if possible (soft)
     // chips wrap inside the body; the flow decides tagbox.h from the measured sizes
-    tagbox.left == body.left + 14;  tagbox.top == body.top - 14;
+    tagbox.left == body.left + 14;  tagbox.top == body.top - 14;  tagbox.right == body.right - 14;
     flow_text 8 chip_w 8 12 tags tagbox chips;
-    body.h >= tagbox.h + 28;                       // the body must contain them…
-    weight 4 (body.h == tagbox.h + 28);            // …and prefers to hug them (a tagged soft constraint)
-    strength "strong" (space.h <= viewport.h / 3); // priorities: strong < required, so tiny viewports still solve
+    weight 4 (body.h == tagbox.h + 28);            // the body prefers to hug the chips (weight 4×)…
+    weak: space.h == 0;                            // …and the space prefers to vanish (weight 1×) — the hug
+                                                   // wins ~15:1; quadratic pulls only: active soft-inequality
+                                                   // bounds degenerate psolve's active set
   };
   chip b t = union [ frame_r (b.h/2) b >> colour surface_3, frame_r (b.h/2) b >> stroke 1 >> colour border,
                      text t 12 >> colour fg >> at b ];
@@ -239,6 +242,51 @@ in union [
   },
   {
     group: "solve",
+    id: "wrapfit",
+    name: "Shrink-to-fit wrapping (flow_fit)",
+    blurb: "flow_fit measures the chips (font metrics), bisects the largest font whose wrap fits the height budget, and leaves only positions to psolve. Resize to a sliver: it never goes infeasible.",
+    src: `// When content must not overflow, refuse to let it:  \`flow_fit\` greedily wraps the
+// chips on *measured* sizes (like flow_text), but first bisects the largest font size
+// ≤ 14 whose rows fit the height budget — line breaks are discrete, so this decided in
+// the evaluator and only positions are left to psolve.  \`F.size\` is exported through a
+// solved variable so the chips are drawn at exactly the chosen size.
+let
+  pad = 16;
+  tool_names = ["File", "Edit", "View", "Insert", "Format", "Tools", "Window", "Help", "Overflow", "More…"];
+  tools = fit_labels 6 14 13 (viewport.w - 2*pad - 12) tool_names;
+  tags = ["WebGPU", "F-Rep", "Curv", "psolve", "LP + QP", "WGSL", "kerning: AVATAR WAVE", "Latin-1: café · naïve",
+          "→ arrows ←", "≤ ≥ ≠ ≈", "★ ✓ ♥", "£ € ° ±", "flow_fit", "solver", "constraints", "bisection",
+          "font metrics", "soft goals", "QP", "2D only"];
+  tagh = max (70, min (150, viewport.h / 3));     // height budget for the tag area (a number)
+  chip_w = viewport.w - 2*pad - 2*14;
+  L = solve {
+    var root, bar, body, tagbox, desc, space : box;
+    var buttons : box[count tools];
+    var chips : box[count tags];
+    var fsz : num;
+    pin pad viewport root;
+    vstack 12 root [bar, body, desc, space];
+    bar.h == 44;  desc.h == 18;  space.h >= 0;
+    hstack_fit 6 14 13 tools (inset 6 bar) buttons;
+    // the tag area floats inside the body: left/top pinned, width/height from the wrap
+    tagbox.left == body.left + 14;  tagbox.top == body.top - 14;  tagbox.right == body.right - 14;
+    F = flow_fit 8 chip_w tagh 8 14 tags tagbox chips; F.cells; fsz == F.size;
+    weight 4 (body.h == tagbox.h + 28);            // the body prefers to hug the chips (tagbox.h
+                                                   // already respects the budget by flow_fit's choice)
+  };
+  chip s b t = union [ frame_r (b.h/2) b >> colour surface_3, frame_r (b.h/2) b >> stroke 1.2 >> colour border,
+                       text t s >> colour fg >> at b ];
+in union [
+  panel L.bar,
+  for (i in 0 ..< count tools) (if (i == 2) then button L.buttons.[i] tools.[i] else ghost_button L.buttons.[i] tools.[i]),
+  frame_r 12 (box (L.tagbox.x - 6, L.tagbox.top - tagh - 6, L.tagbox.w + 12, tagh + 12)) >> colour surface, // the budget area, faintly behind
+  for (i in 0 ..< count tags) chip L.fsz L.chips.[i] tags.[i],
+  text_left (strcat ["flow_fit · font ", round (10 * L.fsz) / 10, " · ", count tags, " chips · budget ", round tagh, "px · used ", round L.tagbox.h, "px"])
+    12 >> colour muted >> at L.desc,
+]`,
+  },
+  {
+    group: "solve",
     id: "tooltip",
     name: "Constrained tooltip",
     blurb: "Move the mouse: the tooltip wants to follow the cursor (weak) but must stay inside the viewport (required).",
@@ -249,7 +297,7 @@ let
   title = "tip.cx == mouse.x  (weak)";
   L = solve {
     var tip, arrow : box;
-    tip.w == text_width title 12 + 32;  tip.h == 54;   // sized by its label
+    tip.w == min (text_width title 12 + 32, viewport.w - 20);  tip.h == min (54, viewport.h - 20);   // sized by its label, bounded by the window
     arrow.size == (14, 14);
     weak: tip.cx == mouse.x;
     weak: tip.bottom == mouse.y + 18;                  // above the cursor (y up)

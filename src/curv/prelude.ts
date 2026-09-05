@@ -75,11 +75,24 @@ export const PRELUDE = `
   // b has exactly the label's intrinsic size (+ padding)
   hug_text pad s t b = [b.w == (text_size t s).[X] + 2*pad, b.h == (text_size t s).[Y] + 2*pad];
   // hstack whose items are at least as wide as their labels; the slack is shared equally (softly),
-  // so a toolbar keeps equal buttons while there is room and degrades to intrinsic widths when there is not
+  // so a toolbar keeps equal buttons while there is room and degrades to intrinsic widths when
+  // there is not.  The minimum-width bounds are *required*: below the total minimum the system
+  // goes infeasible — adapt the label set instead (fit_labels), psolve's active-set QP degenerates
+  // on tens of parallel softened inequalities.
   hstack_fit gap pad s labels b items = [
     hstack gap b items,
     for (i in 0..<count items) items.[i].w >= (text_size labels.[i] s).[X] + 2*pad,
     soft (same_w items) ];
+  // adaptation combinator: the longest prefix of labels (plus at least the first one) whose chips
+  // at font size s with the given gap/padding fit maxw (a number).  Decided with font metrics here,
+  // so the solver only sees the visible row:  buttons = fit_labels 6 14 13 (viewport.w - 44) names;
+  fit_labels gap pad s maxw labels = do
+    local out = []; local x = 0;
+    for (t in labels) (
+      local w = (text_size t s).[X] + 2 * pad;
+      if (count out == 0 || x + w + gap <= maxw) ( out := [...out, t]; x := x + w + gap; );
+    );
+  in out;
   // wrapping flow layout: items of known sizes (a list of (w,h)) are packed left-to-right into rows
   // no wider than maxw (a number), top-down from b's top-left corner; b.h becomes the total height.
   // Wrapping is decided here (greedily), so only positions are constraints.
@@ -94,6 +107,25 @@ export const PRELUDE = `
   in [out, b.h == y + rowh];
   // convenience: flow of text chips (labels at font size s, padding pad)
   flow_text gap maxw pad s labels b items = flow gap maxw b items [for (t in labels) text_size t s + 2*pad];
+  // wrapping flow that fits a budget: dynamically choose the largest font size ≤ s whose greedy
+  // wrap fits (maxw × maxh), then lay out like flow_text.  The wrap is computed here by bisection
+  // over the measured chip widths (font metrics; 8 steps ≈ 1% precision), so the result is a plain
+  // number again — use it for the font size of the chips and export it through a solved variable:
+  //     var fsz : num;  F = flow_fit 8 chip_w maxh 8 14 labels tagbox chips;  F.cells;  fsz == F.size;
+  //     …; in text tags.[i] L.fsz
+  flow_fit gap maxw maxh pad s labels b items = do
+    local lo = 0.5 * s; local hi = s;
+    for (i in 0..7) (
+      local m = (lo + hi) / 2;
+      local x = 0; local rows = 1;
+      for (t in labels) (
+        local w = (text_size t m).[X] + 2 * pad;
+        if (x > 0 && x + w > maxw) ( rows := rows + 1; x := w + gap; ) else x := x + w + gap;
+      );
+      local rowh = 1.25 * m + 2 * pad;
+      if (rows * rowh + (rows - 1) * gap <= maxh) ( lo := m; ) else ( hi := m; );
+    );
+  in { size: lo, cells: flow_text gap maxw pad lo labels b items };
 
   // ---- components built from boxes ----
   card b = frame_r 16 b >> colour surface;
