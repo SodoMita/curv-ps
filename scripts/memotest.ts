@@ -96,4 +96,33 @@ for (const [name, src, expectHits, expectTimeDep] of ccases) {
   if (!ok) fails++;
   console.log(`${ok ? "OK " : "ERR"} ${"node identity across frames".padEnd(30)} same=${a.shape === b.shape}`);
 }
+
+// ---- shared prelude: the prelude env is evaluated once per process and its vars map is shared read-only;
+// user assignments to prelude names must be visible in that frame only, and prelude bodies must resolve
+// builtins (time/mouse/viewport) of the frame evaluating them.
+console.log("\nshared prelude");
+const runS = (src: string, t = 1) => new Interp(atlas, { viewport: { x: -450, y: -300, w: 900 + t, h: 600 }, time: t, mouse: { x: 10 * t, y: 5, down: false } }).run(src);
+{
+  const a = runS(`do surface := "tampered"; in surface`); // same-frame visibility
+  const b = runS(`surface`);                                // later programs see the original
+  const ok = a.value === "tampered" && b.value === "#141a2a";
+  if (!ok) fails++;
+  console.log(`${ok ? "OK " : "ERR"} ${"prelude name mutation".padEnd(30)} ${JSON.stringify(a.value)} → ${JSON.stringify(b.value)}`);
+}
+{
+  // prelude combinator called by two different programs / times keeps memoising and stays correct
+  const src = `let b = box (0, 0, 100 + time, 50); in (solve { var c : box; pin 4 b c; }).c.w + viewport.w`;
+  const a = runS(src, 1), a2 = runS(src, 1), b = runS(src, 2);
+  const ok = a.value === a2.value && a2.value !== b.value && a2.traces[0].cacheKind === "block";
+  if (!ok) fails++;
+  console.log(`${ok ? "OK " : "ERR"} ${"combinator across programs".padEnd(30)} t=1 → ${a.value}/${a2.value}  t=2 → ${b.value}  memo=${a2.traces[0].cacheKind}`);
+}
+{
+  // prelude functions stored in lists / called from lambdas resolve through the shared env on every frame
+  const src = `union [for (i in 0..2) [card, panel, divider].[i] (box (10 + i*30, 0, 24, 12))]`;
+  const a = runS(src, 1), b = runS(src, 1), c = runS(src, 2);
+  const ok = a.shape !== null && b.shape !== null && c.shape !== null;
+  if (!ok) fails++;
+  console.log(`${ok ? "OK " : "ERR"} ${"prelude fns in lists/lambdas".padEnd(30)} shapes ok ×3`);
+}
 if (fails) process.exitCode = 1;

@@ -272,6 +272,23 @@ class ValueHasher {
 }
 
 // ---------- interpreter ----------
+/**
+ * The currently evaluating interpreter.  Closures dispatch their body evaluation through this
+ * instead of the instance that created them, which makes closures independent of their creator's
+ * per-frame state (`inputs`, `traces`, memo bookkeeping):  a prelude closure created once and a
+ * call-memoised closure returned across frames both execute against the *current* frame.
+ * `run()` sets it at entry (single-threaded synchronous evaluation; compile-time CPU fallbacks of
+ * SubCurv call functions after `run()` of the same frame, which is the right instance).
+ */
+let activeInterp: Interp | null = null;
+
+/** Prelude environment, evaluated once per process; its `parent` is re-pointed at each run's
+ *  builtins env (which carries the fresh time/mouse/viewport), so name resolution inside prelude
+ *  bodies always reaches the current frame.  Its vars map is never written after the first bind —
+ *  user assignments to prelude names land in a per-run shallow copy (see `run`).  Sharing keeps
+ *  prelude `Fn` identities stable across frames, so `fnHashMemo` and the call memo stay warm. */
+let sharedPrelude: Env | null = null;
+
 export class Interp {
   traces: SolveTrace[] = []; usesTime = false; usesMouse = false; usesViewport = false; params: ParamDesc[] = [];
   callMemo: CallMemoStats = { hits: 0, misses: 0, measured: 0, skipped: 0, hashMs: 0 };
@@ -537,10 +554,17 @@ export class Interp {
     // idempotent: App re-runs the same program with the same inputs when a camera-fit retry was needed
     this.traces.length = 0; this.params.length = 0; this.usesTime = this.usesMouse = this.usesViewport = false;
     this.callMemo = { hits: 0, misses: 0, measured: 0, skipped: 0, hashMs: 0 };
+    activeInterp = this;
     const base = this.builtins();
-    const preludeEnv = base.child();
-    const pre = (preludeAst ??= parse("{" + PRELUDE + "}"));
-    if (pre.k === "rec") this.bindDefs(pre.defs, preludeEnv);
+    if (!sharedPrelude) { // the prelude is bind-time pure (constants, colour strings, function defs)
+      const penv = new Env(new Map(), base);
+      const pre = (preludeAst ??= parse("{" + PRELUDE + "}"));
+      if (pre.k === "rec") this.bindDefs(pre.defs, penv);
+      sharedPrelude = penv;
+    }
+    sharedPrelude.parent = base; // prelude bodies resolve builtins of THIS run (time, mouse, viewport)
+    // per-run copy: user assignments to prelude names write here, never into the shared map
+    const preludeEnv = new Env(new Map(sharedPrelude.vars), sharedPrelude);
     const ast = parseCached(src);
     const value = this.eval(ast, preludeEnv.child());
     let node: SNode | null = null;
@@ -559,8 +583,9 @@ export class Interp {
   makeClosure(params: Pat[], body: Expr, env: Env, name: string): Fn {
     const mk = (i: number, e: Env): Fn => {
       const f: Fn = new Fn(name, (arg, line) => {
-        if (i + 1 < params.length) { const e2 = e.child(); this.bindPat(params[i], arg, e2, line); return mk(i + 1, e2); }
-        return this.applyMemo(f, arg, () => { const e2 = e.child(); this.bindPat(params[i], arg, e2, line); return this.eval(body, e2); });
+        const I = activeInterp ?? this; // see activeInterp: bodies evaluate against the current frame
+        if (i + 1 < params.length) { const e2 = e.child(); I.bindPat(params[i], arg, e2, line); return mk(i + 1, e2); }
+        return I.applyMemo(f, arg, () => { const e2 = e.child(); I.bindPat(params[i], arg, e2, line); return I.eval(body, e2); });
       });
       f.closure = { params: params.slice(i), body, env: e };
       return f;
@@ -930,14 +955,34 @@ export interface CompiledTree { code: string; d: string; c: string; params: Floa
  * compilation and the tree's structural key matches, the shader text is reused and only the
  * parameter buffer is regenerated (an order of magnitude cheaper than full codegen).
  */
+// Recent code by structural key, so hopping back to an earlier example (whose pipeline the renderer
+// also caches by code) skips codegen entirely and only walks for parameters.  Entries are keyed
+// strings + flags only, so they stay valid when the source moves.
+const codeLru = new Map<string, { d: string; c: string; code: string; usesTime: boolean }>();
+const CODE_LRU_MAX = 32;
+
 export function compileTree(node: SNode, atlas: Atlas, target: "wgsl" | "js", prev: CompiledTree | null = null, defaultColour: RGBA = DEFAULT_COLOUR): CompiledTree {
   const key = structKey(node, atlas);
   // (buffer length may legitimately differ: text / polygon blocks use parameterised offsets)
   if (prev && key !== null && prev.key === key) return { ...prev, params: collectParamsFast(node, atlas, defaultColour), reused: true };
+  if (key !== null) {
+    const lk = target + "|" + key;
+    const hit = codeLru.get(lk);
+    if (hit) {
+      codeLru.delete(lk); codeLru.set(lk, hit); // refresh
+      return { code: hit.code, d: hit.d, c: hit.c, params: collectParamsFast(node, atlas, defaultColour), key, reused: true, usesTime: hit.usesTime };
+    }
+  }
   const g: Gen = target === "wgsl" ? new WGSL() : new JS();
   const ctx: GenCtx = { atlas, zoom: { t: "f", s: target === "wgsl" ? "u.cam.z" : "zoom" }, time: { t: "f", s: target === "wgsl" ? "u.time" : "T" }, cull: true, defaultColour };
   const r = genShape(g, node, { t: "v2", s: "p0" }, ctx);
-  return { code: g.code(), d: r.d.s, c: r.c.s, params: new Float32Array(g.finalParams()), key, reused: false, usesTime: g.usesTime };
+  const out: CompiledTree = { code: g.code(), d: r.d.s, c: r.c.s, params: new Float32Array(g.finalParams()), key, reused: false, usesTime: g.usesTime };
+  if (key !== null) {
+    const lk = target + "|" + key;
+    codeLru.set(lk, { d: out.d, c: out.c, code: out.code, usesTime: g.usesTime });
+    if (codeLru.size > CODE_LRU_MAX) codeLru.delete(codeLru.keys().next().value!);
+  }
+  return out;
 }
 /** Only the parameter buffer of a tree, in codegen order, via the generic ParamsOnly backend (reference implementation). */
 export function collectParams(node: SNode, atlas: Atlas, defaultColour: RGBA = DEFAULT_COLOUR): Float32Array {
