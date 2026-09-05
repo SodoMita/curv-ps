@@ -1,69 +1,90 @@
-# Curv+solve — handoff (dev round 3)
+# Curv+solve — handoff (dev round 4)
 
 Browser playground for **Curv** (2D F-Rep, compiled to WGSL / JS) extended with
 `solve { }` constraint blocks solved by **psolve** (LP + convex QP, WebAssembly).
 
 Live build: `npm run build` → single-file `dist/index.html`.
-Headless check: `npx tsx scripts/selftest.ts [id | file.curv ...]` renders every example
-with the JS backend to `/tmp/t/<id>.png`. `npx tsx scripts/prof.ts` prints warm eval/codegen times.
+Headless checks (all use the JS backend, no browser needed):
+
+| command | what it does |
+|---|---|
+| `npx tsx scripts/selftest.ts [id \| file.curv …]` | evaluates every example, compiles both backends, renders `/tmp/t/<id>.png` |
+| `npx tsx scripts/paramcheck.ts` | **fast-path oracle**: params-only buffer must equal full codegen's, key must be stable across time/viewport |
+| `npx tsx scripts/prof.ts` | warm eval / codegen / params-only timings |
 
 ## What changed in this round
 
-1. **One coordinate system.** The separate "UI mode (px, y down, origin top-left)" is gone.
-   Everything — original Curv examples and constraint layouts — lives in ordinary Curv space:
-   y up, origin at the centre, arbitrary units. `solve { }` is just an expression that returns
-   plain numbers; those numbers feed the normal shape operators. This also fixes the
-   "preview upside down" report (text glyphs and `parent`-based layouts were drawn in y-down
-   space while the camera was y-up).
-   * `parent` (px) → **`viewport`**: the visible world rectangle as a box record
-     (`left/right/bottom/top/w/h/cx/cy/center/size/pos`). Programs that reference it are
-     "responsive" and re-solve when the canvas is resized or the camera pans/zooms.
-     `parent` remains as an alias.
-   * Box records are `{x, y, w, h}` with `(x, y)` = **bottom-left** corner (= a Curv bbox).
-     `top = y + h`, `bottom = y`. Prelude gained `box_at centre size`, `bbox_box shape`,
-     `fit_in box shape`.
-   * Camera: responsive programs start at *home* (1 unit = 1 px, centred on the origin);
-     other programs are fitted to their bbox once. Pan/zoom is always available; the
-     `fit`/`home` button resets.
-   * Text glyph SDF sampling and metrics flipped to y-up (`src/curv/shapes.ts`).
-   * Examples rewritten (`src/curv/examples.ts`): new **Packed circles** (constraints in
-     plain units, no viewport), the responsive ones use `viewport.top - pad` etc.,
-     **F-Rep + solve** now uses world units with an auto-fitted camera.
-2. **Pause / resume button** (and <kbd>space</kbd>) instead of clicking on the canvas.
-   Time is frozen while paused and continues from where it stopped.
-3. **Performance**
-   * Glyph atlas: brute-force SDF (≈2.4 s at startup) replaced by an exact Euclidean
-     distance transform (Felzenszwalb) — a few ms.
-   * Adaptive render resolution while animating / dragging (frame-time driven, 35–100 %),
-     with a full-resolution re-render once things settle. Shown as `NN% res` in the status line.
-   * AST cache: the prelude and the current source are parsed once, not every frame.
-   * Shader compile path no longer awaits `getCompilationInfo()` on the happy path.
-   * Edit debounce 150 → 100 ms.
-4. Background toggle (Curv-white default / dark), camera readout in the preview bar.
+1. **Codegen is skipped for animated / re-solved programs.**
+   * `structKey(node)` (`src/curv/shapes.ts`) is a string describing the *shape* of the generated code: node
+     kinds, tree layout, and the few numbers codegen branches on (`xform.sc == 1`, polygon vertex count,
+     `repeat.kind`, text alignment, bbox-culling decision). User shader functions (`make_shape`, `colour f`) make the key
+     `null` → full codegen as before.
+   * `ParamsOnly` (`src/gpu/gen.ts`) is a third `Gen` backend that emits no text and only records the parameter
+     buffer, walking exactly the same `genShape` path (callbacks of `if` / `loop` are invoked, `let` is identity).
+   * `compileTree(node, atlas, target, prev)` returns `{…prev, params, reused: true}` when `prev.key` matches.
+     `App.tsx` keeps the last result in `lastProg`. The status line shows `params N ms` instead of `codegen N ms`
+     when the shader was reused.
+   * The culling decision is a shared helper (`cullable`) so key and codegen cannot disagree;
+     `bboxOf` / `weight` are memoised per node (WeakMap), which alone removed the O(n·depth) cost from codegen.
+   * **Text is now a shader loop** (glyph count, cell origins and atlas UVs are parameters, 5 per glyph) and text /
+     polygon parameter blocks start at a *parameterised* offset (`dynBase`). Consequences: label content and length
+     never change the shader; text-heavy shaders are shorter; buffer length may differ between frames (fine — it
+     is uploaded whole).
+   * Numbers (dashboard, warm): eval 2.0 ms · full codegen 2.9 ms → structKey 0.5 ms + params 0.9 ms.
+2. **Constraint values + layout combinators.**
+   * A comparison whose operands contain solver variables now evaluates to a **`Cons` value** (or a list of them:
+     chains, lists and box records broadcast) instead of throwing. Inside `solve { }`, every `cons` statement
+     (`a == b;`, `weak: expr;`) and every expression statement whose value contains constraints adds them. So plain
+     functions generate constraints:
+     ```curv
+     fit_col b items = [ vstack gap b items, same_h items ];
+     L = solve { var cols : box[3]; hstack 12 body cols; weak: same_w cols; fit_col cols.[0] rows; };
+     ```
+   * Prelude combinators (`src/curv/prelude.ts`): `hstack vstack hsplit vsplit grid pin inside centre_in same_w same_h
+     same_size align_left/right/top/bottom/cx/cy size_of min_size max_size aspect`. `box (x,y,w,h)` and `inset d box`
+     accept solver expressions.
+   * New example **Layout combinators** (`stacks`); the **Dashboard** card grid is now one line (`grid gap cols main cards;`)
+     and produces the identical parameter buffer as the hand-written loop.
+3. **WebGPU timestamp queries** (`src/gpu/renderer.ts`): if the adapter has `timestamp-query`, each render pass is
+   timed (begin/end → resolve → single mappable readback, skipped while one is in flight). `stats.gpuMs` (lightly
+   smoothed) drives the adaptive-quality controller in `App.tsx` (slow > 11 ms GPU or > 34 ms pacing; fast < 5 ms);
+   without the feature the rAF-pacing heuristic from round 3 is used. Shown as `gpu N ms` in the status line.
 
 ## Layout of the code
 
 ```
 src/curv/parser.ts      lexer + parser (Curv syntax + solve/var/weak:/minimize statements)
-src/curv/interp.ts      tree-walking interpreter, builtins, solve { } → psolve Problem, compileTree
+src/curv/interp.ts      tree-walking interpreter, builtins, Cons values, solve { } → psolve Problem,
+                        compileTree (with structural-key reuse) / collectParams
 src/curv/subcurv.ts     SubCurv: compiles user dist/colour functions to shader code (inlining, loops)
-src/curv/shapes.ts      SNode F-Rep tree, bboxOf, genShape (shape → straight-line code)
-src/curv/prelude.ts     palette, box helpers, UI components — written in Curv
+src/curv/shapes.ts      SNode F-Rep tree, bboxOf (memoised), structKey, genShape (shape → straight-line code)
+src/curv/prelude.ts     palette, box helpers, layout combinators, UI components — written in Curv
 src/curv/examples.ts    example programs (group "solve" | "curv")
-src/gpu/gen.ts          code generators (WGSL, JS) with a parameter buffer for all numbers
-src/gpu/renderer.ts     WebGPU renderer (pipeline cache keyed by code) + CPU fallback
+src/gpu/gen.ts          code generators: WGSL, JS, ParamsOnly (parameter buffer only)
+src/gpu/renderer.ts     WebGPU renderer (pipeline cache keyed by code, timestamp queries) + CPU fallback
 src/gpu/atlas.ts        SDF glyph atlas (Canvas2D + EDT)
-src/psolve/*.ts         Lin/Quad affine expressions, presolve, bridge to psolve.wasm (b64 inline)
+src/psolve/*.ts         Lin/Quad affine expressions, Cons, presolve, bridge to psolve.wasm (b64 inline)
 psolve-src/             C bridge + build instructions for the wasm (unmodified psolve cores)
 src/App.tsx             UI: editor, preview (camera, pause, quality), solver + params panels
+scripts/                selftest, paramcheck, prof (headless, tsx)
 ```
+
+## Invariants to keep (things that will silently break otherwise)
+
+* Any new `SNode` kind or new codegen branch on a *value* must be reflected in `structKey`; anything else that varies
+  must go through `g.param(...)`. Run `scripts/paramcheck.ts` after touching `genShape`.
+* `ParamsOnly` must invoke every callback (`if` then+else, `loop` body once) so parameter order matches.
+* Variable-length parameter blocks must use `dynBase` (never bake `g.params.length` into code as a literal).
 
 ## Known gaps / next steps
 
-* Codegen still runs every frame for animated programs (~3–5 ms for the dashboard).
-  A structural hash of the SNode tree could skip codegen and only refill the parameter buffer.
-* Adaptive quality only measures rAF pacing; WebGPU timestamp queries would be more precise.
-* Layout components in the prelude are minimal; `hstack`/`vstack` generators that emit
-  constraints would make responsive examples shorter.
+* `ParamsOnly` still walks the whole tree through the generic `Gen` interface (~0.9 ms for the dashboard). A
+  dedicated `collectParams` walker over `SNode` — or caching `structKey` on the interpreter's shape values — could
+  make the per-frame cost eval-only. Eval itself (~2 ms) now dominates; the interpreter re-runs the whole
+  program every frame, so memoising `solve` results whose inputs did not change is the next big win.
+* Adaptive quality thresholds are heuristic; with timestamps available a proper controller targeting a frame budget
+  (e.g. 8 ms GPU) would be better than the multiplicative step.
+* Combinators are minimal: no wrapping flow layout, no intrinsic-size (`text_width`) aware `hstack`, no
+  priorities inside a combinator (all its constraints share the statement's strength).
 * `text` uses a single Inter atlas at one weight; no kerning, ASCII only.
 * Only 2D shapes are supported (no 3D ray-marching).

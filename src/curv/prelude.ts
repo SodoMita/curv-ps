@@ -21,6 +21,52 @@ export const PRELUDE = `
   // place a shape's bbox inside a box (centre it)
   fit_in b s = s >> translate (b.cx - (s.bbox.[0].[X] + s.bbox.[1].[X])/2, b.cy - (s.bbox.[0].[Y] + s.bbox.[1].[Y])/2);
 
+  // ---- layout combinators ----
+  // These return *constraint values* (a comparison on solver variables evaluates to a
+  // constraint instead of a boolean).  Use them as statements inside solve { }:
+  //     var cards : box[6];  grid 14 3 main cards;  weak: same_h [side, main];
+  // All boxes are y-up: the first item of a vstack is at the top.
+  same_w items = [for (i in 1..<count items) items.[i].w == items.[0].w];
+  same_h items = [for (i in 1..<count items) items.[i].h == items.[0].h];
+  same_size items = [same_w items, same_h items];
+  align_left items = [for (i in 1..<count items) items.[i].left == items.[0].left];
+  align_right items = [for (i in 1..<count items) items.[i].right == items.[0].right];
+  align_top items = [for (i in 1..<count items) items.[i].top == items.[0].top];
+  align_bottom items = [for (i in 1..<count items) items.[i].bottom == items.[0].bottom];
+  align_cx items = [for (i in 1..<count items) items.[i].cx == items.[0].cx];
+  align_cy items = [for (i in 1..<count items) items.[i].cy == items.[0].cy];
+  size_of sz b = [b.w == sz.[X], b.h == sz.[Y]];
+  min_size sz b = [b.w >= sz.[X], b.h >= sz.[Y]];
+  max_size sz b = [b.w <= sz.[X], b.h <= sz.[Y]];
+  aspect r b = b.w == r * b.h;
+  // inner fills outer with a margin (equalities) / stays inside it (inequalities) / shares its centre
+  pin pad outer inner = [inner.left == outer.left + pad, inner.right == outer.right - pad,
+                         inner.bottom == outer.bottom + pad, inner.top == outer.top - pad];
+  inside pad outer inner = [inner.left >= outer.left + pad, inner.right <= outer.right - pad,
+                            inner.bottom >= outer.bottom + pad, inner.top <= outer.top - pad];
+  centre_in outer inner = [inner.cx == outer.cx, inner.cy == outer.cy];
+  center_in = centre_in;
+  // items laid out left-to-right / top-to-bottom, filling box b; widths (heights) stay free
+  hstack gap b items = [
+    items.[0].left == b.left,  items.[count items - 1].right == b.right,
+    for (i in 1..<count items) items.[i].left == items.[i-1].right + gap,
+    for (it in items) [it.top == b.top, it.bottom == b.bottom] ];
+  vstack gap b items = [
+    items.[0].top == b.top,  items.[count items - 1].bottom == b.bottom,
+    for (i in 1..<count items) items.[i].top == items.[i-1].bottom - gap,
+    for (it in items) [it.left == b.left, it.right == b.right] ];
+  // hstack / vstack with equal-sized items
+  hsplit gap b items = [hstack gap b items, same_w items];
+  vsplit gap b items = [vstack gap b items, same_h items];
+  // equal cells, cols per row, filling b exactly (rows = ceil (n / cols))
+  grid gap cols b items = let n = count items; rows = ceil (n / cols); in [
+    same_size items,
+    for (i in 0..<n) [
+      items.[i].left == b.left + (i % cols) * (items.[0].w + gap),
+      items.[i].top == b.top - floor (i / cols) * (items.[0].h + gap) ],
+    b.left + cols * items.[0].w + (cols - 1) * gap == b.right,
+    b.top - rows * items.[0].h - (rows - 1) * gap == b.bottom ];
+
   // ---- components built from boxes ----
   card b = frame_r 16 b >> colour surface;
   card_c c b = frame_r 16 b >> colour c;

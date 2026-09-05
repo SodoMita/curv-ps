@@ -54,6 +54,8 @@ export class Quad {
 export type Rel = "=" | "<" | ">";
 export interface Constraint { lin: Lin; rel: Rel; weight: number; label?: string } // lin REL 0 ; weight=Infinity => hard
 export const STRENGTH: Record<string, number> = { required: Infinity, strong: 1e4, medium: 1e2, weak: 1 };
+/** A first-class constraint value: `a == b` evaluated on solver variables (outside a statement) yields one of these. */
+export class Cons { constructor(public lin: Lin, public rel: Rel, public line?: number) {} }
 
 export interface ConstraintResult extends SolveResult {
   values: number[]; // per user variable

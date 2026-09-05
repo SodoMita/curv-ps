@@ -209,6 +209,50 @@ export class JS extends Gen {
   brk() { this.emit("break;"); }
 }
 
+// Parameter-only backend: walks the very same codegen path as WGSL / JS but
+// emits no text at all — it only records the parameter buffer.  Used when the
+// structural key of a shape tree is unchanged between frames (animation,
+// re-solving, sliders): the cached shader is reused and only `P` is refilled.
+// Every method must consume its callbacks exactly like the real backends do so
+// that parameters are pushed in the same order.
+export class ParamsOnly extends Gen {
+  target = "wgsl" as const;
+  private static E: Record<Ty, E> = { f: { t: "f", s: "" }, v2: { t: "v2", s: "" }, v3: { t: "v3", s: "" }, v4: { t: "v4", s: "" }, b: { t: "b", s: "" } };
+  private e(t: Ty): E { return ParamsOnly.E[t]; }
+  private vt(comps: E[]): Ty { const n = comps.reduce((s, c) => s + DIM[c.t], 0); return vecTy(Math.min(4, Math.max(2, n))); }
+  emit() { /* nothing */ }
+  code() { return ""; }
+  num(): E { return this.e("f"); }
+  paramAt(): E { return this.e("f"); }
+  bool(): E { return this.e("b"); }
+  bcast(_e: E, t: Ty): E { return this.e(t); }
+  bin(_op: string, a: E, b: E): E { return this.e(a.t === "f" ? b.t : a.t); }
+  neg(a: E): E { return a; }
+  cmp(): E { return this.e("b"); }
+  logic(): E { return this.e("b"); }
+  not(): E { return this.e("b"); }
+  fn(name: string, args: E[]): E {
+    if (name === "length" || name === "dot") return this.e("f");
+    if (name === "cross" || name === "hsv") return this.e("v3");
+    if (name === "clamp") return this.e(args.find((a) => a.t !== "f")?.t ?? "f");
+    if (name === "smoothstep") return this.e(args[2].t);
+    if (name === "mix") return this.e(args[0].t === "f" ? args[1].t : args[0].t);
+    if (this.isUnary(name)) return this.e(args[0].t);
+    return this.e(args[0].t === "f" ? args[1]?.t ?? "f" : args[0].t);
+  }
+  vec(comps: E[]): E { return this.e(this.vt(comps)); }
+  idx(): E { return this.e("f"); }
+  sel(_c: E, a: E, b: E): E { return this.e(a.t === "f" ? b.t : a.t); }
+  tex(): E { return this.e("f"); }
+  let(e: E): E { return e; }
+  var(e: E): E { return e; }
+  assign() { /* nothing */ }
+  if(_c: E, then: () => void, els?: () => void) { then(); els?.(); }
+  loop(_count: E, body: (i: E) => void) { body(this.e("f")); }
+  brk() { /* nothing */ }
+  swz(_a: E, ids: number[]): E { return this.e(ids.length === 1 ? "f" : vecTy(ids.length)); }
+}
+
 // Runtime helpers for generated JS (vectors are plain arrays).
 export function makeJSRuntime(tex: (u: number, v: number) => number) {
   const isA = Array.isArray;

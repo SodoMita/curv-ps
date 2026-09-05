@@ -16,7 +16,7 @@ export interface Renderer {
   render(prog: Compiled, cam: Camera, bg: [number, number, number], time: number, scale?: number): Promise<void>;
   resize(scale?: number): void;
   destroy(): void;
-  stats: { compiles: number; lastCompileMs: number; cached: number };
+  stats: { compiles: number; lastCompileMs: number; cached: number; gpuMs: number; timestamps: boolean };
 }
 
 export async function createRenderer(canvas: HTMLCanvasElement, atlas: Atlas, mode: "auto" | "cpu" = "auto"): Promise<Renderer> {
@@ -56,7 +56,9 @@ async function createWebGPU(canvas: HTMLCanvasElement, atlas: Atlas): Promise<Re
   if (!("gpu" in navigator) || !navigator.gpu) return null;
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
   if (!adapter) return null;
-  const device = await adapter.requestDevice();
+  // optional GPU timestamps: exact per-frame render time for the adaptive-quality controller
+  const hasTs = adapter.features.has("timestamp-query");
+  const device = await adapter.requestDevice({ requiredFeatures: hasTs ? ["timestamp-query"] : [] });
   const ctx = canvas.getContext("webgpu");
   if (!ctx) return null;
   const format = navigator.gpu.getPreferredCanvasFormat();
@@ -92,7 +94,12 @@ async function createWebGPU(canvas: HTMLCanvasElement, atlas: Atlas): Promise<Re
 
   const cache = new Map<string, GPURenderPipeline>();
   const pending = new Map<string, Promise<GPURenderPipeline>>();
-  const stats = { compiles: 0, lastCompileMs: 0, cached: 0 };
+  const stats = { compiles: 0, lastCompileMs: 0, cached: 0, gpuMs: 0, timestamps: hasTs };
+  // timestamp query: begin/end of the render pass → resolve → copy to a mappable buffer (skipped while a readback is in flight)
+  const qs = hasTs ? device.createQuerySet({ type: "timestamp", count: 2 }) : null;
+  const qResolve = hasTs ? device.createBuffer({ size: 16, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC }) : null;
+  const qRead = hasTs ? device.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }) : null;
+  let qBusy = false;
   const getPipeline = (c: Compiled): Promise<GPURenderPipeline> => {
     const hit = cache.get(c.code); if (hit) return Promise.resolve(hit);
     const p0 = pending.get(c.code); if (p0) return p0;
@@ -141,9 +148,21 @@ async function createWebGPU(canvas: HTMLCanvasElement, atlas: Atlas): Promise<Re
       device.queue.writeBuffer(uniform, 0, ubuf);
       if (prog.params.length) device.queue.writeBuffer(paramBuf, 0, prog.params.buffer, prog.params.byteOffset, prog.params.byteLength);
       const enc = device.createCommandEncoder();
-      const pass = enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), loadOp: "clear", storeOp: "store", clearValue: { r: bg[0], g: bg[1], b: bg[2], a: 1 } }] });
+      const measure = qs !== null && !qBusy;
+      const pass = enc.beginRenderPass({
+        colorAttachments: [{ view: ctx.getCurrentTexture().createView(), loadOp: "clear", storeOp: "store", clearValue: { r: bg[0], g: bg[1], b: bg[2], a: 1 } }],
+        ...(measure ? { timestampWrites: { querySet: qs, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 } } : {}),
+      });
       pass.setPipeline(pipeline); pass.setBindGroup(0, bind); pass.draw(3); pass.end();
+      if (measure) { enc.resolveQuerySet(qs, 0, 2, qResolve!, 0); enc.copyBufferToBuffer(qResolve!, 0, qRead!, 0, 16); }
       device.queue.submit([enc.finish()]);
+      if (measure) {
+        qBusy = true;
+        qRead!.mapAsync(GPUMapMode.READ).then(() => {
+          const t = new BigInt64Array(qRead!.getMappedRange()); const ms = Number(t[1] - t[0]) / 1e6; qRead!.unmap();
+          if (ms >= 0 && ms < 1e4) stats.gpuMs = stats.gpuMs ? stats.gpuMs * 0.6 + ms * 0.4 : ms; // light smoothing
+        }).catch(() => { /* device lost / destroyed */ }).finally(() => { qBusy = false; });
+      }
     },
     destroy() { try { device.destroy(); } catch { /* ignore */ } },
   };
@@ -158,7 +177,7 @@ function createCPU(canvas: HTMLCanvasElement, atlas: Atlas): Renderer {
     return atlas.data[y * ATLAS_W + x] / 255;
   });
   const cache = new Map<string, PixelFn>();
-  const stats = { compiles: 0, lastCompileMs: 0, cached: 0 };
+  const stats = { compiles: 0, lastCompileMs: 0, cached: 0, gpuMs: 0, timestamps: false };
   const compile = (c: Compiled): PixelFn => {
     let f = cache.get(c.code); if (f) return f;
     const t0 = performance.now();

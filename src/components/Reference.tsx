@@ -11,6 +11,19 @@ const sections: { title: string; rows: [string, string][] }[] = [
       ["for (i in 0..n-1) { … }", "loops / if (c) { … } generate constraints; name = expr; binds locals"],
       ["L = solve { … };  L.a.w", "an ordinary expression: returns a record of plain numbers (+ L.solver.status / time_ms / engine) for any shape operator"],
       ["viewport.left/right/top/bottom/w/h/cx/cy", "the visible world rectangle as a box record; constraining against it makes a layout responsive (re-solved on resize/pan/zoom)"],
+      ["c = a.w == 2*b.w;  [c, b.h >= 40]", "a comparison on solver variables is a first-class constraint value (lists / boxes broadcast); any statement whose value holds constraints adds them, `weak:` etc. apply to the whole value"],
+      ["my_rule b items = [ … constraints … ];", "so ordinary functions are layout combinators; box (x,y,w,h) and inset d box accept solver expressions"],
+    ],
+  },
+  {
+    title: "layout combinators (prelude, return constraints)",
+    rows: [
+      ["hstack gap b items · vstack gap b items", "items fill box b left→right / top→bottom with `gap` between them (sizes along the axis stay free)"],
+      ["hsplit gap b items · vsplit gap b items", "hstack / vstack with equal-sized items"],
+      ["grid gap cols b items", "equal cells, `cols` per row, filling b exactly"],
+      ["pin pad outer inner · inside pad outer inner · centre_in outer inner", "inner fills outer minus a margin (==) · stays inside it (<=, >=) · shares its centre"],
+      ["same_w · same_h · same_size · align_left/right/top/bottom/cx/cy  items", "equalities between list items"],
+      ["size_of (w,h) b · min_size (w,h) b · max_size (w,h) b · aspect r b", "size constraints on one box"],
     ],
   },
   {

@@ -52,7 +52,15 @@ export function textMetrics(n: { text: string; size: number; align: "center" | "
   return { s, total, x0, baseY };
 }
 
+// Nodes are immutable and rebuilt on every evaluation, so a WeakMap memo is safe; without it
+// the per-subtree culling test makes bbox computation O(n · depth) during codegen.
+const bbMemo = new WeakMap<SNode, BBox | null>();
 export function bboxOf(n: SNode, atlas: Atlas): BBox | null {
+  let b = bbMemo.get(n);
+  if (b === undefined) { b = bboxRaw(n, atlas); bbMemo.set(n, b); }
+  return b;
+}
+function bboxRaw(n: SNode, atlas: Atlas): BBox | null {
   switch (n.k) {
     case "circle": return [-n.r, -n.r, n.r, n.r];
     case "rect": return [-n.w / 2, -n.h / 2, n.w / 2, n.h / 2];
@@ -97,14 +105,56 @@ export function bboxOf(n: SNode, atlas: Atlas): BBox | null {
 export function finiteBBox(b: BBox | null): BBox | null { return b && !isEmpty(b) && b.every(Number.isFinite) ? b : null; }
 
 /** rough primitive count, used to decide whether bbox culling is worth a branch */
+const wMemo = new WeakMap<SNode, number>();
 function weight(n: SNode): number {
+  let w = wMemo.get(n);
+  if (w === undefined) { w = weightRaw(n); wMemo.set(n, w); }
+  return w;
+}
+function weightRaw(n: SNode): number {
   switch (n.k) {
-    case "text": return n.text.length * 2;
+    case "text": return Math.max(4, n.text.length * 2); // always worth culling (texture reads)
     case "union": case "inter": case "sunion": case "sinter": return n.kids.reduce((s, k) => s + weight(k), 0);
     case "diff": case "sdiff": case "morph": return weight(n.a) + weight(n.b);
     case "custom": return 6; case "poly": return n.pts.length / 2; case "nothing": return 0;
     default: return "s" in n ? weight(n.s) + 0.5 : 1;
   }
+}
+
+/** Shared by codegen and the structural key: does `kidCulled` wrap this subtree in a bbox test? */
+const cullable = (s: SNode, atlas: Atlas, cull: boolean) => cull && weight(s) >= 4 && finiteBBox(bboxOf(s, atlas)) !== null;
+
+// ---------------------------------------------------------------- structural key
+/**
+ * A string that identifies the *shape* of the generated code: node kinds, tree layout and the
+ * few numbers that codegen branches on (text content, polygon size, unit scale, bbox
+ * culling).  Two trees with the same key compile to identical shader text and push their
+ * parameters in the same order, so the second one can reuse the first one's pipeline and
+ * only refill the parameter buffer (see `collectParams`).  Returns null when the tree contains
+ * user shader functions (`make_shape`, `colour f`), whose code depends on captured values.
+ */
+export function structKey(n: SNode, atlas: Atlas, cull = true): string | null {
+  const parts: string[] = [];
+  const walk = (n: SNode, cull: boolean): boolean => {
+    parts.push(n.k);
+    const kidC = (s: SNode) => { parts.push(cullable(s, atlas, cull) ? "[" : "("); const ok = walk(s, cull); parts.push(")"); return ok; };
+    const plain = (s: SNode) => { parts.push("("); const ok = walk(s, false); parts.push(")"); return ok; };
+    switch (n.k) {
+      case "circle": case "rect": case "seg": case "ellipse": case "nothing": case "everything": case "half": case "ngon": return true;
+      case "poly": parts.push(String(n.pts.length)); return true;
+      case "text": parts.push(n.align); return true; // content and length are parameters
+      case "union": case "inter": { let ok = true; for (const k of n.kids) ok = kidC(k) && ok; return ok; }
+      case "sunion": case "sinter": { let ok = true; for (const k of n.kids) ok = plain(k) && ok; return ok; }
+      case "diff": return kidC(n.a) && kidC(n.b);
+      case "sdiff": case "morph": return plain(n.a) && plain(n.b);
+      case "round": case "stroke": case "complement": case "lipschitz": case "stretch": case "repeat": case "swirl": if (n.k === "repeat") parts.push(n.kind); return plain(n.s);
+      case "shadow": { const ok = plain(n.s); parts.push("("); const ok2 = walk(n.s, cull); parts.push(")"); return ok && ok2; }
+      case "xform": parts.push(n.sc === 1 ? "1" : "s"); { parts.push("("); const ok = walk(n.s, cull); parts.push(")"); return ok; }
+      case "colour": case "opacity": case "grad": case "reflect": { parts.push("("); const ok = walk(n.s, cull); parts.push(")"); return ok; }
+      case "colourfn": case "custom": return false;
+    }
+  };
+  return walk(n, cull) ? parts.join("") : null;
 }
 
 // ---------------------------------------------------------------- codegen
@@ -128,6 +178,17 @@ function over(g: Gen, a: DC, b: DC, zoom: E): DC {
   const alpha = g.fn("min", [g.num(1), g.bin("/", at, g.fn("max", [cov(g, d, zoom), g.num(1e-5)]))]);
   return { d, c: g.let(g.vec([rgbSel, alpha])) };
 }
+/**
+ * Push a block of per-item parameters and return the (parameterised) index of its first element.
+ * The offset itself lives in the buffer, so a variable-length block earlier in the tree (a text
+ * label whose length changed) never bakes a different literal into the shader text.
+ */
+function dynBase(g: Gen, values: number[]): E {
+  const baseE = g.param(0); const slot = g.params.length - 1;
+  g.params[slot] = g.params.length;
+  for (const v of values) g.param(v);
+  return baseE;
+}
 function sdBox(g: Gen, p: E, hx: E, hy: E, r: E): E {
   const q = g.let(g.bin("+", g.bin("-", g.fn("abs", [p]), g.vec([hx, hy])), r));
   const qx = g.idx(q, 0), qy = g.idx(q, 1);
@@ -141,8 +202,8 @@ export function genShape(g: Gen, n: SNode, p: E, ctx: GenCtx): DC {
   const kid = (s: SNode, q: E = p, c: Partial<GenCtx> = {}) => genShape(g, s, q, { ...ctx, ...c });
   const kidCulled = (s: SNode, q: E): DC => {
     // in a coverage-only context, skip subtrees whose bbox the pixel is far outside
-    const bb = ctx.cull ? finiteBBox(bboxOf(s, ctx.atlas)) : null;
-    if (!bb || weight(s) < 4) return kid(s, q);
+    if (!cullable(s, ctx.atlas, ctx.cull)) return kid(s, q);
+    const bb = finiteBBox(bboxOf(s, ctx.atlas))!;
     const cx = g.param((bb[0] + bb[2]) / 2), cy = g.param((bb[1] + bb[3]) / 2), hx = g.param((bb[2] - bb[0]) / 2), hy = g.param((bb[3] - bb[1]) / 2);
     const bd = g.let(sdBox(g, g.bin("-", q, g.vec([cx, cy])), hx, hy, g.num(0)));
     const pad = g.bin("/", g.num(1.5), ctx.zoom);
@@ -178,9 +239,9 @@ export function genShape(g: Gen, n: SNode, p: E, ctx: GenCtx): DC {
     }
     case "poly": {
       const N = n.pts.length / 2; if (N < 3) return prim(g.num(1e30));
-      const base = g.params.length; for (const v of n.pts) g.param(v);
-      const at = (i: E, off: number) => g.paramAt(g.bin("+", g.bin("*", i, g.num(2)), g.num(base + off)));
-      const v0 = g.vec([g.paramAt(g.num(base)), g.paramAt(g.num(base + 1))]);
+      const baseE = dynBase(g, n.pts);
+      const at = (i: E, off: number) => g.paramAt(g.bin("+", g.bin("+", baseE, g.bin("*", i, g.num(2))), g.num(off)));
+      const v0 = g.vec([g.paramAt(baseE), g.paramAt(g.bin("+", baseE, g.num(1)))]);
       const dv = g.var(g.fn("dot", [g.bin("-", p, v0), g.bin("-", p, v0)])); const sv = g.var(g.num(1));
       g.loop(g.num(N), (i) => {
         const j = g.let(g.bin("%", g.bin("+", i, g.num(N - 1)), g.num(N)));
@@ -195,33 +256,37 @@ export function genShape(g: Gen, n: SNode, p: E, ctx: GenCtx): DC {
       return prim(g.bin("*", sv, g.fn("sqrt", [dv])));
     }
     case "text": {
+      // One shader loop over the glyphs.  Glyph count, cell origins and atlas UVs are all
+      // parameters (5 per glyph, after a dynamic base offset), so the generated code does not
+      // depend on the label's content or length: animated / solved labels never recompile.
       const m = textMetrics(n, ctx.atlas);
-      const sE = g.param(m.s); let x = m.x0; let acc: DC | null = null;
-      const pad = g.let(g.bin("/", g.num(1.5), ctx.zoom));
+      const glyphs: number[][] = []; let x = m.x0;
       for (const ch of n.text) {
-        const code = ch.charCodeAt(0); const adv = advanceOf(ctx.atlas, code) * m.s;
+        const code = ch.charCodeAt(0);
         if (code !== 32) {
           const [cc, cr] = ctx.atlas.cell(code);
-          const u0 = cc / ATLAS_COLS, v0 = cr / ATLAS_ROWS, u1 = (cc + 1) / ATLAS_COLS, v1 = (cr + 1) / ATLAS_ROWS;
-          // cell origin = bottom-left corner in y-up world space; atlas rows run top-down so v is flipped below
-          const qx = x - GLYPH_PAD * m.s, qy = m.baseY - (CELL - BASELINE) * m.s, qs = CELL * m.s;
-          const org = V(g, qx, qy); const qsE = g.param(qs);
-          const lp = g.let(g.bin("-", p, org));
-          const bd = g.let(sdBox(g, g.bin("-", lp, g.bin("*", qsE, g.num(0.5))), g.bin("*", qsE, g.num(0.5)), g.bin("*", qsE, g.num(0.5)), g.num(0)));
-          const dv = g.var(g.bin("+", bd, pad));
-          g.if(g.cmp("<", bd, pad), () => {
-            const q = g.fn("clamp", [g.bin("/", lp, g.fn("max", [qsE, g.num(1e-6)])), g.num(0), g.num(1)]);
-            const uv = g.fn("mix", [g.vec([g.num(u0), g.num(v1)]), g.vec([g.num(u1), g.num(v0)]), q]);
-            const t = g.tex(uv);
-            const dg = g.bin("*", g.bin("*", g.bin("-", g.num(0.5), t), g.num(2 * 8)), sE);
-            g.assign(dv, g.fn("max", [dg, bd]));
-          });
-          const dc: DC = { d: dv, c: white };
-          acc = acc ? { d: g.let(g.fn("min", [acc.d, dc.d])), c: white } : dc;
+          // cell origin = bottom-left corner in y-up world space; atlas rows run top-down so v is flipped
+          glyphs.push([x - GLYPH_PAD * m.s, cc / ATLAS_COLS, (cr + 1) / ATLAS_ROWS, (cc + 1) / ATLAS_COLS, cr / ATLAS_ROWS]);
         }
-        x += adv;
+        x += advanceOf(ctx.atlas, code) * m.s;
       }
-      return acc ?? prim(g.num(1e30));
+      const sE = g.param(m.s), qyE = g.param(m.baseY - (CELL - BASELINE) * m.s), qsE = g.let(g.fn("max", [g.param(CELL * m.s), g.num(1e-6)]));
+      const nE = g.param(glyphs.length), baseE = dynBase(g, glyphs.flat());
+      const pad = g.let(g.bin("/", g.num(1.5), ctx.zoom));
+      const half = g.let(g.bin("*", qsE, g.num(0.5)));
+      const dv = g.var(g.num(1e30));
+      g.loop(nE, (i) => {
+        const at = (off: number) => g.paramAt(g.bin("+", g.bin("+", baseE, g.bin("*", i, g.num(5))), g.num(off)));
+        const lp = g.let(g.bin("-", p, g.vec([at(0), qyE])));
+        const bd = g.let(sdBox(g, g.bin("-", lp, half), half, half, g.num(0)));
+        g.if(g.cmp("<", bd, pad), () => {
+          const q = g.fn("clamp", [g.bin("/", lp, qsE), g.num(0), g.num(1)]);
+          const uv = g.fn("mix", [g.vec([at(1), at(2)]), g.vec([at(3), at(4)]), q]);
+          const dg = g.bin("*", g.bin("*", g.bin("-", g.num(0.5), g.tex(uv)), g.num(2 * 8)), sE);
+          g.assign(dv, g.fn("min", [dv, g.fn("max", [dg, bd])]));
+        }, () => g.assign(dv, g.fn("min", [dv, g.bin("+", bd, pad)])));
+      });
+      return { d: dv, c: white };
     }
     case "union": {
       if (n.kids.length === 0) return prim(g.num(1e30));

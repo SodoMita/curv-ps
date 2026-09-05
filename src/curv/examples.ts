@@ -89,15 +89,9 @@ let
     // sidebar prefers 200 but may compress
     weak: side.w == 200;   side.w >= 96;   side.w <= 220;
 
-    // 3-column grid of equal cards inside main, filled top-down
-    for (i in 0..n-1) {
-      c = i % cols;  r = floor (i / cols);
-      cards.[i].w == cards.[0].w;   cards.[i].h == cards.[0].h;
-      cards.[i].x == main.x + c * (cards.[0].w + gap);
-      cards.[i].top == main.top - r * (cards.[0].h + gap);
-    }
-    cards.[cols-1].right == main.right;
-    cards.[n-1].bottom == main.bottom;
+    // 3-column grid of equal cards filling main (a prelude combinator: it
+    // returns constraints, see the "Layout combinators" example)
+    grid gap cols main cards;
   };
   titles = ["Revenue", "Sessions", "Latency", "Errors", "Signups", "Churn"];
   values = ["$48.2k", "128k", "42 ms", "0.3%", "1,204", "1.9%"];
@@ -122,6 +116,49 @@ in union [
       progress (box (b.x + 16, b.y + 18, b.w - 32, 6)) ratios.[i] colours.[i],
     ]
 ] where cards = L.cards`,
+  },
+  {
+    group: "solve",
+    id: "stacks",
+    name: "Layout combinators",
+    blurb: "hstack / vstack / grid / pin are ordinary prelude functions that *return constraints*: a comparison on solver variables is a first-class value, so layouts compose.",
+    src: `// Comparisons on solver variables evaluate to constraint values, so plain
+// functions can generate constraints.  The prelude ships a small set of
+// AutoLayout-style combinators; \`fit_col\` below is a user-defined one.
+let
+  pad = 16; gap = 12;
+  fit_col b items = [ vstack gap b items, same_h items ];          // your own combinator
+  L = solve {
+    var root, head, body, foot : box;
+    var cols : box[3];  var rows : box[4];  var cells : box[6];
+
+    pin pad viewport root;                 // root = viewport minus a margin
+    vstack gap root [head, body, foot];    // top-to-bottom (y up: head is at the top)
+    head.h == 52;  foot.h == 30;
+
+    hstack gap body cols;                  // left-to-right, widths still free…
+    weak: same_w cols;                     // …prefer equal columns
+    cols.[0].w >= 120;  cols.[2].w <= 220; // but bounded
+
+    fit_col (inset 10 cols.[0]) rows;      // 4 equal rows in the first column
+    grid 8 2 (inset 10 cols.[1]) cells;    // 2 x 3 grid in the second
+
+    var logo : box;  size_of (36, 36) logo;
+    logo.left == head.left + 12;  logo.cy == head.cy;
+  };
+  hue i = sRGB.HSV (0.55 + i * 0.06, 0.6, 0.95);
+in union [
+  panel L.head, panel L.foot,
+  avatar L.logo "C+",
+  text_left "vstack gap root [head, body, foot]" 14 >> colour fg >> translate (L.logo.right + 12, L.head.cy - 5),
+  for (c in L.cols) card c,
+  for (i in 0..3) union [ frame_r 6 L.rows.[i] >> colour surface_3,
+                          text (strcat ["row ", i]) 12 >> colour fg_dim >> at L.rows.[i] ],
+  for (i in 0..5) frame_r 6 L.cells.[i] >> colour (hue i),
+  text "cols.[2]" 13 >> colour muted >> at L.cols.[2],
+  text (strcat ["cols ", round L.cols.[0].w, " / ", round L.cols.[1].w, " / ", round L.cols.[2].w]) 12
+    >> colour muted >> at L.foot,
+]`,
   },
   {
     group: "solve",

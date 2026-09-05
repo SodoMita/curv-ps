@@ -4,7 +4,7 @@ import { SolverPanel } from "./components/SolverPanel";
 import { Reference } from "./components/Reference";
 import { ParamsPanel } from "./components/ParamsPanel";
 import { EXAMPLES } from "./curv/examples";
-import { Interp, compileTree, type SolveTrace, type ParamDesc } from "./curv/interp";
+import { Interp, compileTree, type CompiledTree, type SolveTrace, type ParamDesc } from "./curv/interp";
 import { CurvError } from "./curv/parser";
 import { bboxOf, finiteBBox, type SNode } from "./curv/shapes";
 import { buildAtlas, type Atlas } from "./gpu/atlas";
@@ -26,7 +26,7 @@ export default function App() {
   const [traces, setTraces] = useState<SolveTrace[]>([]);
   const [params, setParams] = useState<ParamDesc[]>([]);
   const [paramValues, setParamValues] = useState<ParamValues>({});
-  const [stats, setStats] = useState({ evalMs: 0, genMs: 0, fps: 0, compileMs: 0, lines: 0, compiles: 0, quality: 1 });
+  const [stats, setStats] = useState({ evalMs: 0, genMs: 0, fps: 0, compileMs: 0, lines: 0, compiles: 0, quality: 1, reused: false, gpuMs: 0, timestamps: false });
   const [status, setStatus] = useState<"loading" | "ready" | "failed">("loading");
   const [rendererInfo, setRendererInfo] = useState<{ kind: string; info?: string } | null>(null);
   const [previewPct, setPreviewPct] = useState(100);
@@ -61,6 +61,7 @@ export default function App() {
   const codeRef = useRef("");
   const quality = useRef(1); // adaptive render scale while animating
   const settle = useRef<number | null>(null);
+  const lastProg = useRef<CompiledTree | null>(null); // structural-key cache: same tree shape → reuse shader, refill params only
 
   useEffect(() => { srcRef.current = src; }, [src]);
   useEffect(() => { debugRef.current = debugBoxes; dirty.current = true; }, [debugBoxes]);
@@ -152,7 +153,8 @@ export default function App() {
         }
       }
       const t1 = performance.now();
-      const prog = compileTree(node, at, r.kind === "webgpu" ? "wgsl" : "js");
+      const prog = compileTree(node, at, r.kind === "webgpu" ? "wgsl" : "js", lastProg.current);
+      lastProg.current = prog;
       const t2 = performance.now();
       dynamic.current = { time: res.usesTime, mouse: res.usesMouse, viewport: res.usesViewport };
       const animating = res.usesTime && !pausedRef.current;
@@ -170,7 +172,7 @@ export default function App() {
       if (force || !animating || tStart - lastUi.current > 250) {
         lastUi.current = tStart;
         setTraces(res.traces); setParams(res.params); setError(null); setAnimated(res.usesTime); setResponsive(res.usesViewport);
-        setStats((s) => ({ ...s, evalMs: t1 - tStart, genMs: t2 - t1, compileMs: r.stats.lastCompileMs, lines: prog.code.split("\n").length, compiles: r.stats.compiles, quality: q }));
+        setStats((s) => ({ ...s, evalMs: t1 - tStart, genMs: t2 - t1, compileMs: r.stats.lastCompileMs, lines: prog.code.split("\n").length, compiles: r.stats.compiles, quality: q, reused: prog.reused, gpuMs: r.stats.gpuMs, timestamps: r.stats.timestamps }));
       }
     } catch (e) {
       const err = e as CurvError;
@@ -190,10 +192,11 @@ export default function App() {
       if (dirty.current || animating) {
         const t = performance.now();
         const f = frames.current;
-        if (animating && f.last) { // adaptive quality from measured frame pacing
-          const dt = t - f.last;
-          if (dt > 24 && quality.current > 0.35) quality.current = Math.max(0.35, quality.current * 0.85);
-          else if (dt < 13 && quality.current < 1) quality.current = Math.min(1, quality.current * 1.08);
+        if (animating && f.last) { // adaptive quality: GPU timestamps when available, otherwise rAF pacing
+          const dt = t - f.last, gpu = renderer.current?.stats.gpuMs ?? 0;
+          const slow = gpu > 0 ? gpu > 11 || dt > 34 : dt > 24, fast = gpu > 0 ? gpu < 5 && dt < 20 : dt < 13;
+          if (slow && quality.current > 0.35) quality.current = Math.max(0.35, quality.current * 0.85);
+          else if (fast && quality.current < 1) quality.current = Math.min(1, quality.current * 1.08);
         }
         f.last = animating ? t : 0;
         const wasDirty = dirty.current; dirty.current = false;
@@ -297,7 +300,7 @@ export default function App() {
             <Editor value={src} onChange={setSrc} errorLine={error?.line} />
           </div>
           <div className={cn("shrink-0 border-t border-line px-4 py-2 font-mono text-[11.5px]", error ? "bg-rose-500/10 text-rose-300" : "text-muted")}>
-            {error ? <><span className="font-semibold">error</span>{error.line ? ` (line ${error.line})` : ""}: {error.message}</> : <>✓ {src.split("\n").length} lines · eval {stats.evalMs.toFixed(1)} ms · codegen {stats.genMs.toFixed(1)} ms · shader {stats.lines} lines{stats.compiles ? ` · ${stats.compiles} compile${stats.compiles > 1 ? "s" : ""} (last ${stats.compileMs.toFixed(0)} ms)` : ""}{stats.fps > 0 ? ` · ${stats.fps.toFixed(0)} fps` : ""}{stats.quality < 1 ? ` · ${Math.round(stats.quality * 100)}% res` : ""}</>}
+            {error ? <><span className="font-semibold">error</span>{error.line ? ` (line ${error.line})` : ""}: {error.message}</> : <>✓ {src.split("\n").length} lines · eval {stats.evalMs.toFixed(1)} ms · {stats.reused ? <span title="Shape tree structure unchanged: shader reused, only the parameter buffer was refilled">params {stats.genMs.toFixed(1)} ms</span> : <>codegen {stats.genMs.toFixed(1)} ms</>} · shader {stats.lines} lines{stats.compiles ? ` · ${stats.compiles} compile${stats.compiles > 1 ? "s" : ""} (last ${stats.compileMs.toFixed(0)} ms)` : ""}{stats.fps > 0 ? ` · ${stats.fps.toFixed(0)} fps` : ""}{stats.timestamps && stats.gpuMs > 0 ? <span title="GPU render-pass time (WebGPU timestamp query)">{` · gpu ${stats.gpuMs.toFixed(1)} ms`}</span> : ""}{stats.quality < 1 ? ` · ${Math.round(stats.quality * 100)}% res` : ""}</>}
           </div>
         </section>
 

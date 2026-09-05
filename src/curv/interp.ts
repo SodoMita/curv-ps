@@ -2,11 +2,11 @@
 // an F-Rep tree (shapes.ts); user functions inside make_shape are compiled to
 // shader code by subcurv.ts; `solve { ... }` blocks compile to a psolve problem.
 import { parse, CurvError, type Expr, type Def, type Pat, type ListItem, type Stmt } from "./parser";
-import { Lin, Quad, Problem, STRENGTH, type Rel } from "../psolve/constraints";
-import { Shape, type SNode, type RGBA, type BBox, type ShaderFn, type GenCtx, genShape, bboxOf } from "./shapes";
+import { Lin, Quad, Cons, Problem, STRENGTH, type Rel } from "../psolve/constraints";
+import { Shape, type SNode, type RGBA, type BBox, type ShaderFn, type GenCtx, genShape, bboxOf, structKey } from "./shapes";
 import { measureText, type Atlas } from "../gpu/atlas";
 import { PRELUDE } from "./prelude";
-import { JS, WGSL, makeJSRuntime, type Gen, type E } from "../gpu/gen";
+import { JS, WGSL, ParamsOnly, makeJSRuntime, type Gen, type E } from "../gpu/gen";
 import { SC, compileFnAt, type CV } from "./subcurv";
 
 export class Rec { constructor(public f: Map<string, Value> = new Map()) {} get(k: string) { return this.f.get(k); } }
@@ -16,7 +16,7 @@ export class Fn {
   fields?: Map<string, Value>;
   constructor(public name: string, public call: (arg: Value, line?: number) => Value) {}
 }
-export type Value = number | string | boolean | null | Value[] | Rec | Fn | Shape | Lin | Quad;
+export type Value = number | string | boolean | null | Value[] | Rec | Fn | Shape | Lin | Quad | Cons;
 
 export interface SolveTrace {
   line: number; engine: string; status: string; ok: boolean; timeMs: number; iterations: number;
@@ -48,7 +48,7 @@ export function typeName(v: Value): string {
   if (v === null) return "null"; if (isNum(v)) return "number"; if (typeof v === "string") return "string";
   if (typeof v === "boolean") return "bool"; if (isList(v)) return "list"; if (v instanceof Rec) return "record";
   if (v instanceof Fn) return "function"; if (v instanceof Shape) return "shape"; if (v instanceof Lin) return "linear expression";
-  return "quadratic expression";
+  if (v instanceof Cons) return "constraint"; return "quadratic expression";
 }
 export function show(v: Value, depth = 0): string {
   if (v === null) return "null"; if (isNum(v)) return Number.isInteger(v) ? String(v) : v.toFixed(3).replace(/\.?0+$/, "");
@@ -56,7 +56,7 @@ export function show(v: Value, depth = 0): string {
   if (isList(v)) return depth > 2 ? "[…]" : "[" + v.map((x) => show(x, depth + 1)).join(", ") + "]";
   if (v instanceof Rec) return depth > 2 ? "{…}" : "{" + [...v.f].map(([k, x]) => `${k}: ${show(x, depth + 1)}`).join(", ") + "}";
   if (v instanceof Fn) return `<function ${v.name}>`; if (v instanceof Shape) return "<shape>";
-  if (v instanceof Lin) return "<linear expr>"; return "<quadratic expr>";
+  if (v instanceof Lin) return "<linear expr>"; if (v instanceof Cons) return `<constraint ${v.rel === "=" ? "==" : v.rel === "<" ? "<=" : ">="}>`; return "<quadratic expr>";
 }
 
 export function arith(op: string, a: Value, b: Value, line?: number): Value {
@@ -108,6 +108,24 @@ export function colour(v: Value, line?: number): RGBA {
   }
   if (isList(v) && (v.length === 3 || v.length === 4) && v.every(isNum)) return [v[0], v[1], v[2], v.length === 4 ? v[3] : 1] as RGBA;
   throw err(`Expected a colour ("#rrggbb", (r,g,b) or a named colour), got ${show(v)}`, line);
+}
+/** Does a value contain a solver variable anywhere (Lin, or list / box record of them)? */
+function hasLin(v: Value): boolean {
+  if (v instanceof Lin) return true;
+  if (isList(v)) return v.some(hasLin);
+  if (v instanceof Rec) { for (const k of ["x", "y", "w", "h"]) if (v.f.has(k) && hasLin(v.get(k)!)) return true; }
+  return false;
+}
+/** Build constraint values for `a OP b`, broadcasting over lists (element-wise) and box records (x, y, w, h). */
+function mkCons(a: Value, b: Value, op: string, line: number | undefined, out: Value[]): Value[] {
+  if (isList(a) && isList(b)) { if (a.length !== b.length) throw err("Constraint vector length mismatch", line); a.forEach((x, i) => mkCons(x, b[i], op, line, out)); return out; }
+  if (isList(a)) { a.forEach((x) => mkCons(x, b, op, line, out)); return out; }
+  if (isList(b)) { b.forEach((x) => mkCons(a, x, op, line, out)); return out; }
+  if (a instanceof Rec && b instanceof Rec) { for (const k of ["x", "y", "w", "h"]) if (a.f.has(k) && b.f.has(k)) mkCons(a.get(k)!, b.get(k)!, op, line, out); return out; }
+  if (!isAff(a) || !isAff(b)) throw err(`Constraints must be linear in solver variables (got ${typeName(a)} ${op} ${typeName(b)})`, line);
+  const rel: Rel = op === "==" ? "=" : op === "<=" || op === "<" ? "<" : op === ">=" || op === ">" ? ">" : (() => { throw err("'!=' is not a convex constraint", line); })();
+  out.push(new Cons(toLin(a).sub(toLin(b)), rel, line));
+  return out;
 }
 function boxOf(v: Value, line?: number): { x: number; y: number; w: number; h: number } {
   const r = rec(v, line); const g = (k: string) => num(r.get(k) ?? 0, `box field ${k}`, line);
@@ -311,8 +329,11 @@ export class Interp {
     b("frame", fn1("frame", (v, l) => { const bx = boxOf(v, l); return S({ k: "xform", tx: bx.x + bx.w / 2, ty: bx.y + bx.h / 2, rot: 0, sc: 1, s: { k: "rect", w: bx.w, h: bx.h, r: 0 } }); }));
     b("frame_r", fn2("frame_r", (r, v, l) => { const bx = boxOf(v, l); return S({ k: "xform", tx: bx.x + bx.w / 2, ty: bx.y + bx.h / 2, rot: 0, sc: 1, s: { k: "rect", w: bx.w, h: bx.h, r: num(r, "corner radius", l) } }); }));
     b("at", fn2("at", (v, s, l) => { const bx = boxOf(v, l); return S({ k: "xform", tx: bx.x + bx.w / 2, ty: bx.y + bx.h / 2, rot: 0, sc: 1, s: shape(s, l) }); }));
-    b("box", fn1("box", (v, l) => { if (isList(v) && v.length === 3) throw err("'box [w,h,d]' is a 3D shape – use rect [w,h] in 2D", l); if (isList(v) && v.length === 2) return S(rectOf(v, l)); if (!isList(v) || v.length !== 4) throw err("box expects (x,y,w,h)", l); const [x, y, w, h] = v.map((n) => num(n, "number", l)); return makeBoxRec(x, y, w, h); }));
-    b("inset", fn2("inset", (d, v, l) => { const bx = boxOf(v, l); const k = num(d, "inset", l); return makeBoxRec(bx.x + k, bx.y + k, bx.w - 2 * k, bx.h - 2 * k); }));
+    // box (x,y,w,h) and inset accept solver variables too, so they can be used inside solve { }
+    const aff = (v: Value, what: string, l?: number): number | Lin => { if (isAff(v)) return v; throw err(`Expected ${what} (number or solver expression), got ${typeName(v)}`, l); };
+    const affBox = (v: Value, l?: number) => { const r = rec(v, l); const g = (k: string) => aff(r.get(k) ?? 0, `box field ${k}`, l); return { x: g("x"), y: g("y"), w: g("w"), h: g("h") }; };
+    b("box", fn1("box", (v, l) => { if (isList(v) && v.length === 3) throw err("'box [w,h,d]' is a 3D shape – use rect [w,h] in 2D", l); if (isList(v) && v.length === 2) return S(rectOf(v, l)); if (!isList(v) || v.length !== 4) throw err("box expects (x,y,w,h)", l); const [x, y, w, h] = v.map((n) => aff(n, "number", l)); return makeBoxRec(x, y, w, h); }));
+    b("inset", fn2("inset", (d, v, l) => { const bx = affBox(v, l); const k = aff(d, "inset", l); const A = (a: Value, b2: Value) => arith("+", a, b2, l) as number | Lin, M = (a: Value, b2: Value) => arith("*", a, b2, l) as number | Lin; return makeBoxRec(A(bx.x, k), A(bx.y, k), A(bx.w, M(k, -2)), A(bx.h, M(k, -2))); }));
     // --- shape operators
     b("union", fn1("union", (v, l) => S({ k: "union", kids: shapes(v, l) })));
     b("intersection", fn1("intersection", (v, l) => S({ k: "inter", kids: shapes(v, l) })));
@@ -488,9 +509,16 @@ export class Interp {
       }
       case "cmp": {
         const vals = e.args.map((a) => this.eval(a, env));
+        if (vals.some(hasLin)) {
+          // a comparison on solver variables is a *constraint value* (or a list of them for
+          // boxes / lists / chains); solve { } statements collect these, so ordinary functions
+          // (prelude hstack / vstack / grid …) can generate constraints
+          const out: Value[] = [];
+          for (let i = 0; i < e.ops.length; i++) mkCons(vals[i], vals[i + 1], e.ops[i], e.line, out);
+          return out.length === 1 ? out[0] : out;
+        }
         for (let i = 0; i < e.ops.length; i++) {
           const a = vals[i], b = vals[i + 1], op = e.ops[i];
-          if (a instanceof Lin || b instanceof Lin) throw err("Constraints on solver variables are only allowed as statements inside solve { }", e.line);
           let r: boolean;
           if (op === "==") r = equalV(a, b); else if (op === "!=") r = !equalV(a, b);
           else { const x = num(a, "number", e.line), y = num(b, "number", e.line); r = op === "<" ? x < y : op === "<=" ? x <= y : op === ">" ? x > y : x >= y; }
@@ -544,17 +572,19 @@ export class Interp {
       if (type === "box") return makeBoxRec(Lin.v(prob.newVar(name + ".x")), Lin.v(prob.newVar(name + ".y")), Lin.v(prob.newVar(name + ".w")), Lin.v(prob.newVar(name + ".h")));
       throw err(`Unknown variable type '${type}' (use num, point, box, or type[n])`, line);
     };
-    const addCons = (a: Value, b: Value, op: string, weight: number, label: string, ln: number) => {
-      if (isList(a) && isList(b)) { if (a.length !== b.length) throw err("Constraint vector length mismatch", ln); a.forEach((x, i) => addCons(x, b[i], op, weight, label, ln)); return; }
-      if (isList(a)) { a.forEach((x) => addCons(x, b, op, weight, label, ln)); return; }
-      if (isList(b)) { b.forEach((x) => addCons(a, x, op, weight, label, ln)); return; }
-      if (a instanceof Rec && b instanceof Rec) { for (const k of ["x", "y", "w", "h"]) if (a.f.has(k) && b.f.has(k)) addCons(a.get(k)!, b.get(k)!, op, weight, label + "." + k, ln); return; }
-      if (!isAff(a) || !isAff(b)) throw err(`Constraints must be linear in solver variables (got ${typeName(a)} ${op} ${typeName(b)})`, ln);
-      const lin = toLin(a).sub(toLin(b));
-      const rel: Rel = op === "==" ? "=" : op === "<=" || op === "<" ? "<" : op === ">=" || op === ">" ? ">" : (() => { throw err("'!=' is not a convex constraint", ln); })();
-      if (lin.isConst()) { const v = lin.c; const ok = rel === "=" ? Math.abs(v) < 1e-9 : rel === "<" ? v <= 1e-9 : v >= -1e-9; if (!ok && weight === Infinity) throw err(`Constraint on line ${ln} is constant and false`, ln); return; }
-      prob.addConstraint({ lin, rel, weight, label }); nCons++;
+    /** Add whatever constraints a value holds: a Cons, (nested) lists of them, or a plain boolean (a constraint that folded to a constant). */
+    const addValue = (v: Value, weight: number, label: string, ln: number, strict: boolean) => {
+      if (v instanceof Cons) {
+        const { lin, rel } = v;
+        if (lin.isConst()) { const c = lin.c; const ok = rel === "=" ? Math.abs(c) < 1e-9 : rel === "<" ? c <= 1e-9 : c >= -1e-9; if (!ok && weight === Infinity) throw err(`Constraint on line ${v.line ?? ln} is constant and false`, v.line ?? ln); return; }
+        prob.addConstraint({ lin, rel, weight, label: v.line && v.line !== ln ? `${label} (from line ${v.line})` : label }); nCons++; return;
+      }
+      if (isList(v)) { for (const x of v) addValue(x, weight, label, ln, strict); return; }
+      if (v === true || v === null) return;
+      if (v === false) { if (weight === Infinity) throw err(`Constraint on line ${ln} is constant and false`, ln); return; }
+      if (strict) throw err(`Expected a constraint (a == b, a <= b, a >= b on solver variables), got ${typeName(v)}`, ln);
     };
+    const hasCons = (v: Value): boolean => v instanceof Cons || (isList(v) && v.some(hasCons));
     const exec = (ss: Stmt[], env: Env) => {
       for (const s of ss) {
         switch (s.k) {
@@ -566,11 +596,11 @@ export class Interp {
           case "def": case "local": this.bindDefs([s.def], env); break;
           case "assign": { const o = env.owner(s.name); if (!o) throw err(`Unknown variable '${s.name}'`, s.line); o.vars.set(s.name, this.eval(s.e, env)); break; }
           case "cons": {
-            if (s.e.k !== "cmp") throw err("Expected a constraint like a == b, a <= b or a >= b", s.line);
+            // `a == b;` or `weak: expr;` — expr may be any expression producing constraint values
+            // (a comparison, or a call such as `hstack 12 main cards`)
             const w = s.weight ? num(this.eval(s.weight, env), "weight", s.line) : 1;
             const weight = s.strength === "required" ? Infinity : STRENGTH[s.strength] * w;
-            const vals = s.e.args.map((a) => this.eval(a, env));
-            for (let i = 0; i < s.e.ops.length; i++) addCons(vals[i], vals[i + 1], s.e.ops[i], weight, `${s.strength} line ${s.line}`, s.line);
+            addValue(this.eval(s.e, env), weight, `${s.strength} line ${s.line}`, s.line, true);
             break;
           }
           case "obj": {
@@ -581,7 +611,7 @@ export class Interp {
           case "for": { const l = this.eval(s.iter, env); if (!isList(l)) throw err("for expects a list", s.line); for (const x of l) { const e2 = env.child(); this.bindPat(s.pat, x, e2, s.line); exec(s.body, e2); } break; }
           case "while": throw err("while is not allowed inside solve { }", s.line);
           case "if": if (truthy(this.eval(s.cond, env), s.line)) exec(s.body, env.child()); else if (s.else) exec(s.else, env.child()); break;
-          case "expr": this.eval(s.e, env); break;
+          case "expr": { const v = this.eval(s.e, env); if (hasCons(v)) addValue(v, Infinity, `required line ${s.line}`, s.line, false); break; } // e.g. `grid gap 3 main cards;`
         }
       }
     };
@@ -619,11 +649,26 @@ function showSolved(v: Value): string {
   return show(v);
 }
 
-/** Compile a whole program (shape tree) for a backend. */
-export function compileTree(node: SNode, atlas: Atlas, target: "wgsl" | "js", defaultColour: RGBA = DEFAULT_COLOUR) {
+export interface CompiledTree { code: string; d: string; c: string; params: Float32Array; key: string | null; reused: boolean }
+
+/**
+ * Compile a whole program (shape tree) for a backend.  If `prev` is the result of a previous
+ * compilation and the tree's structural key matches, the shader text is reused and only the
+ * parameter buffer is regenerated (an order of magnitude cheaper than full codegen).
+ */
+export function compileTree(node: SNode, atlas: Atlas, target: "wgsl" | "js", prev: CompiledTree | null = null, defaultColour: RGBA = DEFAULT_COLOUR): CompiledTree {
+  const key = structKey(node, atlas);
+  // (buffer length may legitimately differ: text / polygon blocks use parameterised offsets)
+  if (prev && key !== null && prev.key === key) return { ...prev, params: collectParams(node, atlas, defaultColour), reused: true };
   const g: Gen = target === "wgsl" ? new WGSL() : new JS();
   const ctx: GenCtx = { atlas, zoom: { t: "f", s: target === "wgsl" ? "u.cam.z" : "zoom" }, time: { t: "f", s: target === "wgsl" ? "u.time" : "T" }, cull: true, defaultColour };
   const r = genShape(g, node, { t: "v2", s: "p0" }, ctx);
-  return { code: g.code(), d: r.d.s, c: r.c.s, params: new Float32Array(g.params) };
+  return { code: g.code(), d: r.d.s, c: r.c.s, params: new Float32Array(g.params), key, reused: false };
+}
+/** Only the parameter buffer of a tree, in codegen order (see ParamsOnly). */
+export function collectParams(node: SNode, atlas: Atlas, defaultColour: RGBA = DEFAULT_COLOUR): Float32Array {
+  const g = new ParamsOnly();
+  genShape(g, node, { t: "v2", s: "" }, { atlas, zoom: { t: "f", s: "" }, time: { t: "f", s: "" }, cull: true, defaultColour });
+  return new Float32Array(g.params);
 }
 export { Shape, DEFAULT_COLOUR };
