@@ -137,12 +137,43 @@ export function textGlyphs(n: { text: string; size: number; align: "center" | "l
  * order and with the same cull-flag propagation.  `scripts/paramcheck.ts` compares the two on every
  * example — run it after touching either function.
  */
+/** Parameter segment of one subtree: its numbers in order, and the positions (relative to the segment) of deferred-block slots. */
+interface ParamSeg { nums: number[]; blocks: { at: number; values: number[] }[] }
+const wpMemo: [WeakMap<SNode, ParamSeg | null>, WeakMap<SNode, ParamSeg | null>] = [new WeakMap(), new WeakMap()];
 export function walkParams(root: SNode, atlas: Atlas, cull = true): number[] | null {
-  const out: number[] = []; const blocks: { slot: number; values: number[] }[] = [];
+  const seg = walkSeg(root, atlas, cull);
+  if (!seg) return null;
+  const out = seg.nums.slice();
+  for (const b of seg.blocks) { out[b.at] = out.length; for (const v of b.values) out.push(Number.isFinite(v) ? v : 0); }
+  return out;
+}
+/**
+ * Memoised per subtree and cull flag: the segment of a subtree only depends on the subtree (its
+ * bboxes are memoised too), so shared subtrees and trees that survive across frames through the
+ * call memo are walked once.  Subtrees that are small (< 24 numbers) are not memoised individually
+ * — copying them out of a parent's segment is cheaper than a WeakMap lookup per node.
+ */
+function walkSeg(root: SNode, atlas: Atlas, cull: boolean): ParamSeg | null {
+  const memo = wpMemo[cull ? 1 : 0];
+  const hit = memo.get(root);
+  if (hit !== undefined) return hit;
+  const out: number[] = []; const blocks: { at: number; values: number[] }[] = [];
   const P = (v: number) => { out.push(Number.isFinite(v) ? v : v > 0 ? 3e38 : v < 0 ? -3e38 : 0); };
-  const block = (values: number[]) => { out.push(0); blocks.push({ slot: out.length - 1, values }); };
+  const block = (values: number[]) => { out.push(0); blocks.push({ at: out.length - 1, values }); };
   let ok = true;
   const walk = (n: SNode, cull: boolean): void => {
+    if (n !== root) { // nested subtree: reuse / create its own segment when it is big enough to be worth it
+      const m = wpMemo[cull ? 1 : 0];
+      let s = m.get(n);
+      if (s === undefined && weight(n) >= 8) { s = walkSeg(n, atlas, cull); }
+      if (s !== undefined) {
+        if (s === null) { ok = false; return; }
+        const base = out.length;
+        for (let i = 0; i < s.nums.length; i++) out.push(s.nums[i]);
+        for (const b of s.blocks) blocks.push({ at: base + b.at, values: b.values });
+        return;
+      }
+    }
     const kidC = (s: SNode) => {
       if (cullable(s, atlas, cull)) { const bb = finiteBBox(bboxOf(s, atlas))!; P((bb[0] + bb[2]) / 2); P((bb[1] + bb[3]) / 2); P((bb[2] - bb[0]) / 2); P((bb[3] - bb[1]) / 2); }
       walk(s, cull);
@@ -179,9 +210,9 @@ export function walkParams(root: SNode, atlas: Atlas, cull = true): number[] | n
     }
   };
   walk(root, cull);
-  if (!ok) return null;
-  for (const b of blocks) { out[b.slot] = out.length; for (const v of b.values) out.push(Number.isFinite(v) ? v : 0); }
-  return out;
+  const seg: ParamSeg | null = ok ? { nums: out, blocks } : null;
+  memo.set(root, seg);
+  return seg;
 }
 
 /** rough primitive count, used to decide whether bbox culling is worth a branch */

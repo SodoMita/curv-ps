@@ -292,6 +292,8 @@ export class Interp {
       const r = genShape(sc.g, node, sc.g.let(p2), { ...sc.ctx, cull: false });
       return sc.dyn(which === "dist" ? r.d : sc.g.swz(r.c, [0, 1, 2]));
     };
+    // hashable by content (plain nodes do not read host state), so a function receiving `s.dist` can still be memoised
+    const h = nodeHash(node); if (h !== null) f.key = which + ":" + h;
     return f;
   }
   cpuCompile(node: SNode) {
