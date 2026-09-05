@@ -30,7 +30,7 @@ export default function App() {
   const [traces, setTraces] = useState<SolveTrace[]>([]);
   const [params, setParams] = useState<ParamDesc[]>([]);
   const [paramValues, setParamValues] = useState<ParamValues>({});
-  const [stats, setStats] = useState({ evalMs: 0, genMs: 0, fps: 0, compileMs: 0, lines: 0, compiles: 0, quality: 1, reused: false, gpuMs: 0, timestamps: false, memoHits: 0, memoCalls: 0 });
+  const [stats, setStats] = useState({ evalMs: 0, genMs: 0, fps: 0, compileMs: 0, lines: 0, compiles: 0, quality: 1, reused: false, gpuMs: 0, timestamps: false, memoHits: 0, memoCalls: 0, staticSkip: false });
   const [status, setStatus] = useState<"loading" | "ready" | "failed">("loading");
   const [rendererInfo, setRendererInfo] = useState<{ kind: string; info?: string } | null>(null);
   const [previewPct, setPreviewPct] = useState(100);
@@ -51,6 +51,9 @@ export default function App() {
   const dirty = useRef(true);
   const dynamic = useRef({ time: false, mouse: false, viewport: false });
   const shaderTimeOnly = useRef(false); // time is read only inside compiled shader code: animate by re-rendering, no re-evaluation
+  // last static frame: a program that read no time/mouse/viewport whose src + parametric values + debug flag
+  // are unchanged has no possible way to produce a different tree — evaluation and codegen are skipped wholesale
+  const staticCache = useRef<{ fp: string } | null>(null);
   const mousePx = useRef({ x: -1e6, y: -1e6, down: false });
   const clock = useRef({ t0: performance.now(), pausedAt: 0 });
   const pausedRef = useRef(false);
@@ -133,30 +136,62 @@ export default function App() {
     const tStart = performance.now();
     const W = cv.clientWidth, H = cv.clientHeight;
     const time = now();
+    const paint = (prog: CompiledTree, q: number, updateCode: boolean) => {
+      if (!rendering.current) {
+        rendering.current = true;
+        r.render(prog, cam.current, BG[bgRef.current], time, q)
+          .then(() => {
+            rendering.current = false;
+            if (updateCode && prog.code !== codeRef.current) { codeRef.current = prog.code; setCode(prog.code); }
+          })
+          .catch((e: Error) => { rendering.current = false; setError({ message: e.message }); });
+      } else dirty.current = true; // shader still compiling: try again next frame
+      if (q < 1) { // re-render at full quality once things settle (only useful while not animating through the CPU)
+        if (settle.current) clearTimeout(settle.current);
+        settle.current = window.setTimeout(() => { if (!(dynamic.current.time && !pausedRef.current)) dirty.current = true; }, 180);
+      }
+    };
+    // everything below except the camera is a program input; the camera/screen size are render uniforms only
+    const fp = srcRef.current + "\u0001" + JSON.stringify(paramRef.current) + "\u0001" + debugRef.current;
+    const sk = staticCache.current, prog0 = lastProg.current;
+    if (sk && sk.fp === fp && prog0 && !needFit.current) {
+      // static program, unchanged inputs: re-render the existing program, nothing else to do
+      cpuMs.current = 0;
+      paint(prog0, drag.current ? quality.current : 1, prog0.code !== codeRef.current);
+      if (force || tStart - lastUi.current > 250) {
+        lastUi.current = tStart;
+        setStats((st) => ({ ...st, evalMs: performance.now() - tStart, genMs: 0, quality: drag.current ? quality.current : 1, reused: true, gpuMs: r.stats.gpuMs, timestamps: r.stats.timestamps, memoHits: 0, memoCalls: 0, staticSkip: true }));
+      }
+      return;
+    }
     const inputs = { viewport: viewportOf(W, H, cam.current), time, mouse: worldMouse(), params: paramRef.current };
     const it = new Interp(at, inputs);
+    staticCache.current = null; // re-evaluating: the cache describes the last successful run, refreshed below
     try {
-      const res = it.run(srcRef.current);
-      let node: SNode = res.shape ?? { k: "nothing" };
-      if (debugRef.current) {
-        const kids: SNode[] = [node];
-        const th = 1 / cam.current.zoom;
-        for (const t of res.traces) for (const b of t.boxes)
-          kids.push({ k: "xform", tx: b.x + b.w / 2, ty: b.y + b.h / 2, rot: 0, sc: 1, s: { k: "colour", c: [0.96, 0.45, 0.71, 0.9], s: { k: "stroke", w: th, s: { k: "rect", w: b.w, h: b.h, r: 0 } } } });
-        node = { k: "union", kids };
-      }
+      let res = it.run(srcRef.current);
       // camera: responsive programs start at 1 unit = 1 px around the origin, everything else is fitted once
       if (needFit.current) {
         needFit.current = false;
-        if (res.usesViewport) {
-          const c = cam.current;
-          if (c.cx !== 0 || c.cy !== 0 || c.zoom !== 1) { setCam({ ...HOME }); return; } // re-evaluate with the home viewport
-        } else {
-          const bb = finiteBBox(bboxOf(node, at)) ?? [-10, -10, 10, 10];
+        if (res.usesViewport && (cam.current.cx !== 0 || cam.current.cy !== 0 || cam.current.zoom !== 1)) {
+          const c = { ...HOME };
+          cam.current = c; setCamView(c); // re-evaluate once with the home viewport (run() is idempotent)
+          inputs.viewport = { x: -W / 2, y: -H / 2, w: W, h: H };
+          res = it.run(srcRef.current);
+        } else if (!res.usesViewport) {
+          const raw = res.shape ?? { k: "nothing" as const };
+          const bb = finiteBBox(bboxOf(raw, at)) ?? [-10, -10, 10, 10];
           const zoom = 0.85 * Math.min(W / Math.max(bb[2] - bb[0], 1e-6), H / Math.max(bb[3] - bb[1], 1e-6));
-          setCam({ cx: (bb[0] + bb[2]) / 2, cy: (bb[1] + bb[3]) / 2, zoom: Number.isFinite(zoom) && zoom > 0 ? zoom : 1 });
-          dirty.current = false; // the tree does not depend on the camera: just draw it
+          const c = { cx: (bb[0] + bb[2]) / 2, cy: (bb[1] + bb[3]) / 2, zoom: Number.isFinite(zoom) && zoom > 0 ? zoom : 1 };
+          cam.current = c; setCamView(c);
         }
+      }
+      let node: SNode = res.shape ?? { k: "nothing" };
+      if (debugRef.current) {
+        const kids: SNode[] = [node];
+        const th = 1.5; // constant world units: the overlay must not change when the camera zooms (else the skip cache would be invalid)
+        for (const t of res.traces) for (const b of t.boxes)
+          kids.push({ k: "xform", tx: b.x + b.w / 2, ty: b.y + b.h / 2, rot: 0, sc: 1, s: { k: "colour", c: [0.96, 0.45, 0.71, 0.9], s: { k: "stroke", w: th, s: { k: "rect", w: b.w, h: b.h, r: 0 } } } });
+        node = { k: "union", kids };
       }
       const t1 = performance.now();
       const prog = compileTree(node, at, r.kind === "webgpu" ? "wgsl" : "js", lastProg.current);
@@ -166,30 +201,23 @@ export default function App() {
       const usesTime = res.usesTime || prog.usesTime; // evaluator-side time, or time read inside compiled shader code
       dynamic.current = { time: usesTime, mouse: res.usesMouse, viewport: res.usesViewport };
       shaderTimeOnly.current = prog.usesTime && !res.usesTime;
+      if (!usesTime && !res.usesMouse && !res.usesViewport) staticCache.current = { fp };
       const animating = usesTime && !pausedRef.current;
       const q = animating || drag.current ? quality.current : 1;
-      if (!rendering.current) {
-        rendering.current = true;
-        r.render(prog, cam.current, BG[bgRef.current], time, q)
-          .then(() => { rendering.current = false; if (prog.code !== codeRef.current) { codeRef.current = prog.code; setCode(prog.code); } })
-          .catch((e: Error) => { rendering.current = false; setError({ message: e.message }); });
-      } else dirty.current = true; // shader still compiling: try again next frame
-      if (q < 1) { // re-render at full quality once things settle
-        if (settle.current) clearTimeout(settle.current);
-        settle.current = window.setTimeout(() => { if (!(dynamic.current.time && !pausedRef.current)) dirty.current = true; }, 180);
-      }
+      paint(prog, q, true);
       if (force || !animating || tStart - lastUi.current > 250) {
         lastUi.current = tStart;
         setTraces(res.traces); setParams(res.params); setError(null); setAnimated(usesTime); setResponsive(res.usesViewport);
-        setStats((s) => ({ ...s, evalMs: t1 - tStart, genMs: t2 - t1, compileMs: r.stats.lastCompileMs, lines: prog.code.split("\n").length, compiles: r.stats.compiles, quality: q, reused: prog.reused, gpuMs: r.stats.gpuMs, timestamps: r.stats.timestamps, memoHits: res.callMemo.hits, memoCalls: res.callMemo.hits + res.callMemo.misses }));
+        setStats((s) => ({ ...s, evalMs: t1 - tStart, genMs: t2 - t1, compileMs: r.stats.lastCompileMs, lines: prog.code.split("\n").length, compiles: r.stats.compiles, quality: q, reused: prog.reused, gpuMs: r.stats.gpuMs, timestamps: r.stats.timestamps, memoHits: res.callMemo.hits, memoCalls: res.callMemo.hits + res.callMemo.misses, staticSkip: false }));
       }
     } catch (e) {
       const err = e as CurvError;
       setError({ message: err.message, line: err instanceof CurvError ? err.line : undefined });
       setTraces(it.traces); setParams(it.params);
       dynamic.current = { time: false, mouse: false, viewport: it.usesViewport };
+      shaderTimeOnly.current = false;
     }
-  }, [worldMouse, setCam]);
+  }, [worldMouse]);
 
   // ---- frame loop (only does work when something changed or the program animates)
   useEffect(() => {
@@ -323,7 +351,7 @@ export default function App() {
             <Editor value={src} onChange={setSrc} errorLine={error?.line} />
           </div>
           <div className={cn("shrink-0 border-t border-line px-4 py-2 font-mono text-[11.5px]", error ? "bg-rose-500/10 text-rose-300" : "text-muted")}>
-            {error ? <><span className="font-semibold">error</span>{error.line ? ` (line ${error.line})` : ""}: {error.message}</> : <>✓ {src.split("\n").length} lines · eval {stats.evalMs.toFixed(1)} ms{stats.memoCalls > 0 ? <span title="Calls of pure user functions answered from the call memo (same function, same arguments and free variables as an earlier evaluation) / calls that were expensive enough to be memoised">{` (${stats.memoHits}/${stats.memoCalls} memo)`}</span> : ""} · {stats.reused ? <span title="Shape tree structure unchanged: shader reused, only the parameter buffer was refilled">params {stats.genMs.toFixed(1)} ms</span> : <>codegen {stats.genMs.toFixed(1)} ms</>} · shader {stats.lines} lines{stats.compiles ? ` · ${stats.compiles} compile${stats.compiles > 1 ? "s" : ""} (last ${stats.compileMs.toFixed(0)} ms)` : ""}{stats.fps > 0 ? ` · ${stats.fps.toFixed(0)} fps` : ""}{stats.timestamps && stats.gpuMs > 0 ? <span title="GPU render-pass time (WebGPU timestamp query)">{` · gpu ${stats.gpuMs.toFixed(1)} ms`}</span> : ""}{stats.quality < 1 ? ` · ${Math.round(stats.quality * 100)}% res` : ""}</>}
+            {error ? <><span className="font-semibold">error</span>{error.line ? ` (line ${error.line})` : ""}: {error.message}</> : <>✓ {src.split("\n").length} lines · eval {stats.evalMs.toFixed(1)} ms{stats.staticSkip ? <span className="text-emerald-300/90" title="The program read no time/mouse/viewport on its last evaluation and its src and parametric inputs are unchanged: the tree cannot differ, so evaluation and codegen were skipped entirely (the camera is a render uniform)"> · static</span> : ""}{stats.memoCalls > 0 ? <span title="Calls of pure user functions answered from the call memo (same function, same arguments and free variables as an earlier evaluation) / calls that were expensive enough to be memoised">{` (${stats.memoHits}/${stats.memoCalls} memo)`}</span> : ""} · {stats.reused ? <span title="Shape tree structure unchanged: shader reused, only the parameter buffer was refilled">params {stats.genMs.toFixed(1)} ms</span> : <>codegen {stats.genMs.toFixed(1)} ms</>} · shader {stats.lines} lines{stats.compiles ? ` · ${stats.compiles} compile${stats.compiles > 1 ? "s" : ""} (last ${stats.compileMs.toFixed(0)} ms)` : ""}{stats.fps > 0 ? ` · ${stats.fps.toFixed(0)} fps` : ""}{stats.timestamps && stats.gpuMs > 0 ? <span title="GPU render-pass time (WebGPU timestamp query)">{` · gpu ${stats.gpuMs.toFixed(1)} ms`}</span> : ""}{stats.quality < 1 ? ` · ${Math.round(stats.quality * 100)}% res` : ""}</>}
           </div>
         </section>
 

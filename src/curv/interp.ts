@@ -186,7 +186,7 @@ const CALL_CACHE_MAX = 4096;
 /** Profile of a function body: how expensive an un-memoised call is, and whether we decided to memoise it. */
 interface CallStat { n: number; ms: number; first: number; mode: "measure" | "memo" | "skip"; why?: string }
 const callStats = new Map<number, CallStat>();
-const CALL_MEMO_MIN_MS = 0.025;  // average un-memoised call cost (ms, first cold call excluded) above which memoising pays for the hashing
+const CALL_MEMO_MIN_MS = 0.008;  // floor under which even free memos make no sense; the effective threshold is max(this, 2 × warm-measured hash cost of a representative call)
 const CALL_MEMO_SAMPLES = 4;     // calls measured before deciding
 const CALL_HASH_LIMIT = 4000;    // parts; bigger arguments are not worth hashing per call
 export function resetSolveCache() { solveCache.clear(); blockCache.clear(); callCache.clear(); callCacheSize = 0; callStats.clear(); }
@@ -534,6 +534,9 @@ export class Interp {
   }
 
   run(src: string): EvalResult {
+    // idempotent: App re-runs the same program with the same inputs when a camera-fit retry was needed
+    this.traces.length = 0; this.params.length = 0; this.usesTime = this.usesMouse = this.usesViewport = false;
+    this.callMemo = { hits: 0, misses: 0, measured: 0, skipped: 0, hashMs: 0 };
     const base = this.builtins();
     const preludeEnv = base.child();
     const pre = (preludeAst ??= parse("{" + PRELUDE + "}"));
@@ -594,9 +597,17 @@ export class Interp {
     if (st.mode === "measure") {
       const t0 = performance.now(); const v = run(); const dt = performance.now() - t0; st.ms += dt; if (st.n++ === 0) st.first = dt;
       this.callMemo.measured++;
-      if (st.n >= CALL_MEMO_SAMPLES) { // decide on the warm calls (the first one pays for cold memos / JIT)
+      if (st.n >= CALL_MEMO_SAMPLES) { // decide from the warm calls (the first one pays for cold memos / JIT)
         const avg = (st.ms - st.first) / (st.n - 1);
-        if (avg >= CALL_MEMO_MIN_MS) st.mode = "memo"; else { st.mode = "skip"; st.why = `cheap (${(avg * 1000).toFixed(0)} µs)`; }
+        // … and the *warm* cost of hashing this call: the first hash primes fnHashMemo for the current
+        // frame's fresh closure graph, the second approximates what a memo hit actually pays per call.
+        // Memoising wins when the body clearly costs more than key computation.
+        let hashMs = -1;
+        try { const h1 = new ValueHasher(CALL_HASH_LIMIT); h1.fn(f); h1.value(arg); const th = performance.now(); const h2 = new ValueHasher(CALL_HASH_LIMIT); h2.fn(f); h2.value(arg); hashMs = performance.now() - th; }
+        catch (e) { if (!(e instanceof Unhashable)) throw e; }
+        if (hashMs < 0) { st.mode = "skip"; st.why = "unhashable inputs"; }
+        else if (avg >= Math.max(CALL_MEMO_MIN_MS, hashMs * 2)) st.mode = "memo";
+        else { st.mode = "skip"; st.why = `cheap (${(avg * 1000).toFixed(0)} µs ≈ ${hashMs > 0 ? (avg / hashMs).toFixed(1) : "?"}×hash)`; }
       }
       return v;
     }

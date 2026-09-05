@@ -74,8 +74,9 @@ const sections: { title: string; rows: [string, string][] }[] = [
     rows: [
       ["solve { … }  → memoised", "a block whose free variables (incl. shapes, closures, time/mouse/viewport) have the same values as before is not re-evaluated at all"],
       ["solve { … }  → cached", "re-evaluated, but the numeric problem was seen before: presolve + psolve skipped"],
-      ["f x  (pure user functions)", "calls costing more than ~25 µs are memoised on (function, free variables, argument); results are immutable so the same tree is reused — `x := outer`, `parametric` and `print` disable it. The status line shows hits/calls"],
-      ["shader", "a tree with the same structure only refills its parameter buffer (no recompile); resolution adapts to the GPU + CPU budget"],
+      ["f x  (pure user functions)", "calls dearer than twice their key hash (~≥25 µs warm, adaptive) are memoised on (function, free variables, argument); results are immutable so the same tree is reused — `x := outer`, `parametric` and `print` disable it. The status line shows hits/calls"],
+      ["whole program → static", "a program that read no time/mouse/viewport and whose src and parametric inputs are unchanged is not re-evaluated at all — pan/zoom of a static scene only re-renders (status line: 'static')"],
+      ["shader", "a tree with the same structure only refills its parameter buffer (no recompile); programs animated only inside shader code ([x,y,z,t]) just get a new time uniform; resolution adapts to the GPU + CPU budget"],
     ],
   },
 ];
