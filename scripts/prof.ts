@@ -1,6 +1,6 @@
 import { createCanvas } from "@napi-rs/canvas";
 import { loadPsolve } from "../src/psolve/psolve";
-import { Interp, compileTree } from "../src/curv/interp";
+import { Interp, compileTree, blockCacheStats } from "../src/curv/interp";
 import { EXAMPLES } from "../src/curv/examples";
 import { buildAtlas } from "../src/gpu/atlas";
 (globalThis as any).document = { createElement: (t: string) => createCanvas(1, 1) as any };
@@ -14,7 +14,7 @@ for (const id of ["dashboard", "chart", "split", "stacks", "toolbar"]) {
     const it = new Interp(atlas, { viewport: { x: -450, y: -300, w: 900, h: 600 }, time: i * 0.1, mouse: { x: 300, y: 200, down: false } });
     const r = it.run(ex.src);
     const t1 = performance.now();
-    if (i === N - 1) cachedInfo = r.traces.map((t) => (t.cached ? "solve cached" : `solve ${t.engine}`)).join(", ");
+    if (i === N - 1) cachedInfo = r.traces.map((t) => (t.cached ? `solve cached(${t.cacheKind})` : `solve ${t.engine}`)).join(", ") + (blockCacheStats.lastReason ? ` [not memoisable: ${blockCacheStats.lastReason}]` : "");
     compileTree(r.shape!, atlas, "wgsl");
     const t2 = performance.now();
     prev = compileTree(r.shape!, atlas, "wgsl", prev); // fast path (structural key hit after the first frame)

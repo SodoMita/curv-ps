@@ -20,7 +20,9 @@ export function SolverPanel({ traces, evalMs, fps }: { traces: SolveTrace[]; eva
               <span className="rounded bg-accent/15 px-1.5 py-0.5 font-mono text-[10px] text-violet-200">{t.engine}</span>
               <span className="font-mono text-muted">{t.nVars} vars · {t.nCons} constraints · {t.eliminated} eliminated by presolve</span>
               {t.cached
-                ? <span className="rounded bg-cyan-400/15 px-1.5 py-0.5 font-mono text-[10px] text-cyan-200" title="The numeric problem is identical to the last evaluation: presolve and psolve were skipped">cached</span>
+                ? t.cacheKind === "block"
+                  ? <span className="rounded bg-emerald-400/15 px-1.5 py-0.5 font-mono text-[10px] text-emerald-200" title="None of the block's inputs (free variables) changed since the last evaluation: the block was not re-evaluated at all — no constraints built, no presolve, no psolve">memoised</span>
+                  : <span className="rounded bg-cyan-400/15 px-1.5 py-0.5 font-mono text-[10px] text-cyan-200" title="The block was re-evaluated but its numeric problem (fingerprint) is identical to the last one: presolve and psolve were skipped">cached</span>
                 : <span className="font-mono text-muted">{t.iterations} it · {t.timeMs.toFixed(2)} ms</span>}
               {Number.isFinite(t.objective) && t.engine !== "presolve" && <span className="font-mono text-muted">obj {t.objective.toFixed(3)}</span>}
             </div>

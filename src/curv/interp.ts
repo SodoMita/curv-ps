@@ -3,23 +3,29 @@
 // shader code by subcurv.ts; `solve { ... }` blocks compile to a psolve problem.
 import { parse, CurvError, type Expr, type Def, type Pat, type ListItem, type Stmt } from "./parser";
 import { Lin, Quad, Cons, Problem, STRENGTH, type Rel, type ConstraintResult } from "../psolve/constraints";
-import { Shape, type SNode, type RGBA, type BBox, type ShaderFn, type GenCtx, genShape, bboxOf, structKey } from "./shapes";
+import { Shape, type SNode, type RGBA, type BBox, type ShaderFn, type GenCtx, genShape, bboxOf, structKey, walkParams } from "./shapes";
 import { measureText, type Atlas } from "../gpu/atlas";
 import { PRELUDE } from "./prelude";
 import { JS, WGSL, ParamsOnly, makeJSRuntime, type Gen, type E } from "../gpu/gen";
 import { SC, compileFnAt, type CV } from "./subcurv";
+import { freeVarsOfBlock, freeVarsOfFn, astId } from "./freevars";
 
 export class Rec { constructor(public f: Map<string, Value> = new Map()) {} get(k: string) { return this.f.get(k); } }
 export class Fn {
   closure?: { params: Pat[]; body: Expr; env: Env };
   sc?: (sc: SC, arg: CV, line?: number) => CV;
   fields?: Map<string, Value>;
+  /** builtins get a stable key (their name) so they can take part in solve-block cache keys; closures are hashed structurally */
+  key?: string;
   constructor(public name: string, public call: (arg: Value, line?: number) => Value) {}
 }
 export type Value = number | string | boolean | null | Value[] | Rec | Fn | Shape | Lin | Quad | Cons;
 
 export interface SolveTrace {
   line: number; engine: string; status: string; ok: boolean; timeMs: number; iterations: number; cached: boolean;
+  /** how a cached result was recognised: "block" = the block's free variables were unchanged (nothing re-evaluated),
+   *  "problem" = constraints were rebuilt but the numeric problem's fingerprint matched (presolve + psolve skipped) */
+  cacheKind?: "block" | "problem";
   nVars: number; nCons: number; eliminated: number; objective: number; violations: { label: string; amount: number }[];
   values: { name: string; value: string }[];
   boxes: { x: number; y: number; w: number; h: number }[];
@@ -161,7 +167,63 @@ function parseCached(src: string): Expr {
 // ---------- solve cache: the interpreter re-runs the whole program every frame; a solve { } block
 // whose numeric problem (fingerprint) did not change since the last evaluation reuses its result.
 const solveCache = new Map<number, { fp: string; res: ConstraintResult }>();
-export function resetSolveCache() { solveCache.clear(); }
+// Whole-block memo: keyed by the block's AST identity plus the values of its free variables.  A hit
+// skips *everything* (constraint construction included) and returns the previous result record.
+interface BlockHit { key: string; out: Rec; trace: SolveTrace; flags: { time: boolean; mouse: boolean; viewport: boolean } }
+// keyed by the block's AST identity, with a small LRU per block so a block evaluated several times per frame
+// with different inputs (inside a `for`, or a function called twice) keeps all of its results
+const blockCache = new Map<number, BlockHit[]>();
+const BLOCK_LRU = 8;
+export function resetSolveCache() { solveCache.clear(); blockCache.clear(); }
+/** Most recent key-computation stats (for scripts / debugging): why a block could not be memoised. */
+export const blockCacheStats = { lastReason: "" as string };
+
+const HASH_LIMIT = 20000; // parts; bigger inputs fall back to the fingerprint cache
+class Unhashable extends Error { constructor(public why: string) { super(why); } }
+/**
+ * Serialise a value for a solve-block cache key.  Numbers, strings, booleans, null, lists, records,
+ * affine expressions and constraint values are hashed by content; builtins by name; closures by
+ * body identity plus (recursively) the values of their free variables in their captured
+ * environment.  Shapes and anonymous host functions are not hashable (→ fingerprint cache).
+ */
+class ValueHasher {
+  parts: (string | number)[] = [];
+  private inProgress = new Set<Fn>();
+  private fnMemo = new Map<Fn, string>();
+  private tick = 0;
+  push(x: string | number) { this.parts.push(x); if (++this.tick > HASH_LIMIT) throw new Unhashable("input too large"); }
+  value(v: Value): void {
+    if (v === null) { this.push("_"); return; }
+    switch (typeof v) {
+      case "number": this.push(v); return;
+      case "string": this.push("s" + v.length + ":" + v); return;
+      case "boolean": this.push(v ? "T" : "F"); return;
+    }
+    if (isList(v)) { this.push("[" + v.length); for (const x of v) this.value(x); return; }
+    if (v instanceof Rec) { this.push("{" + v.f.size); for (const [k, x] of v.f) { this.push(k); this.value(x); } return; }
+    if (v instanceof Lin) { this.lin(v); return; }
+    if (v instanceof Cons) { this.push("C" + v.rel + (v.weight ?? "")); this.lin(v.lin); return; }
+    if (v instanceof Quad) { this.push("Q" + v.q.size); this.lin(v.lin); for (const [, [i, j, c]] of v.q) this.push(i + "," + j + "=" + c); return; }
+    if (v instanceof Fn) { this.fn(v); return; }
+    throw new Unhashable("shape value"); // Shape: nodes are rebuilt every evaluation, no cheap identity
+  }
+  private lin(l: Lin) { this.push("L" + l.t.size + ":" + l.c); for (const [k, c] of l.t) this.push(k + "=" + c); }
+  private fn(f: Fn) {
+    const memo = this.fnMemo.get(f);
+    if (memo !== undefined) { this.push(memo); return; }
+    if (!f.closure) { if (f.key === undefined) throw new Unhashable(`function ${f.name}`); this.push("B" + f.key); return; }
+    const id = "F" + astId(f.closure.body) + "/" + f.closure.params.length;
+    if (this.inProgress.has(f)) { this.push(id + "~"); return; } // recursive function: body identity is enough for the cycle
+    this.inProgress.add(f);
+    const start = this.parts.length;
+    this.push(id + "(");
+    const info = freeVarsOfFn(f.closure.params, f.closure.body);
+    for (const name of info.free) { const v = f.closure.env.lookup(name); if (v !== undefined) { this.push(name); this.value(v); } }
+    this.push(")");
+    this.inProgress.delete(f);
+    this.fnMemo.set(f, this.parts.slice(start).join("\u0001"));
+  }
+}
 
 // ---------- interpreter ----------
 export class Interp {
@@ -220,7 +282,7 @@ export class Interp {
   // ---- builtins -------------------------------------------------------------
   builtins(): Env {
     const env = new Env();
-    const b = (name: string, v: Value) => { env.vars.set(name, v); return v; };
+    const b = (name: string, v: Value) => { env.vars.set(name, v); if (v instanceof Fn && v.key === undefined) { v.key = name; if (v.fields) for (const [k, x] of v.fields) if (x instanceof Fn && x.key === undefined) x.key = name + "." + k; } return v; };
     const scUnary = (f: Fn, gname: string) => { f.sc = (sc, a, l) => { if (sc.allStatic([a])) return sc.static(f.call(sc.staticValue(a, l), l)); return sc.dyn(sc.g.fn(gname, [sc.toE(a, l)])); }; return f; };
     const scList = (f: Fn, n: number, build: (sc: SC, xs: E[]) => E) => {
       f.sc = (sc, a, l) => { if (sc.allStatic([a])) return sc.static(f.call(sc.staticValue(a, l), l)); const items = sc.items(a, l); if (!items || items.length !== n) throw err(`${f.name} expects a list of ${n}`, l); return sc.dyn(build(sc, items.map((x) => sc.toE(x, l)))); }; return f;
@@ -580,7 +642,50 @@ export class Interp {
   }
 
   // ---------- solve { } ----------
+  /** Cache key of a solve block: AST identity + hashed values of its free variables (null when not memoisable). */
+  private blockKey(stmts: Stmt[], outer: Env): string | null {
+    const info = freeVarsOfBlock(stmts);
+    if (!info.pure) { blockCacheStats.lastReason = "assigns to an outer variable"; return null; }
+    const h = new ValueHasher();
+    h.push("S" + astId(stmts));
+    try {
+      for (const name of info.free) {
+        const v = outer.lookup(name);
+        if (v === undefined) continue; // over-approximated name (or an unknown identifier that will raise on evaluation)
+        h.push(name); h.value(v);
+      }
+    } catch (e) { if (e instanceof Unhashable) { blockCacheStats.lastReason = e.why; return null; } throw e; }
+    blockCacheStats.lastReason = "";
+    return h.parts.join("\u0001");
+  }
+
   solve(stmts: Stmt[], outer: Env, line: number): Value {
+    const key = this.blockKey(stmts, outer);
+    const id = astId(stmts);
+    if (key !== null) {
+      const slots = blockCache.get(id);
+      const i = slots ? slots.findIndex((h) => h.key === key) : -1;
+      if (slots && i >= 0) {
+        // nothing inside the block can have changed: reuse the result record (immutable) and the trace
+        const hit = slots[i];
+        if (i > 0) { slots.splice(i, 1); slots.unshift(hit); }
+        this.usesTime ||= hit.flags.time; this.usesMouse ||= hit.flags.mouse; this.usesViewport ||= hit.flags.viewport;
+        this.traces.push({ ...hit.trace, cached: true, cacheKind: "block", timeMs: 0 });
+        return hit.out;
+      }
+    }
+    const out = this.solveUncached(stmts, outer, line);
+    if (key !== null) {
+      if (blockCache.size > 256) blockCache.clear();
+      let slots = blockCache.get(id);
+      if (!slots) { slots = []; blockCache.set(id, slots); }
+      slots.unshift({ key, out, trace: this.traces[this.traces.length - 1], flags: { time: this.usesTime, mouse: this.usesMouse, viewport: this.usesViewport } });
+      if (slots.length > BLOCK_LRU) slots.length = BLOCK_LRU;
+    }
+    return out;
+  }
+
+  private solveUncached(stmts: Stmt[], outer: Env, line: number): Rec {
     const prob = new Problem(); const env = outer.child();
     const declared: { name: string; value: Value }[] = [];
     let nCons = 0;
@@ -663,7 +768,7 @@ export class Interp {
       else shown.push({ name: d.name, value: showSolved(v) });
     }
     out.f.set("solver", new Rec(new Map<string, Value>([["status", res.statusText], ["ok", res.ok], ["engine", res.engine], ["objective", res.objective], ["iterations", res.iterations], ["time_ms", res.timeMs]])));
-    this.traces.push({ line, engine: res.reducedVars === 0 ? "presolve" : res.engine, status: res.statusText, ok: res.ok, timeMs: cached ? 0 : res.timeMs, iterations: res.iterations, cached, nVars: prob.names.length, nCons, eliminated: res.eliminated ?? 0, objective: res.objective, violations: res.violations, values: shown, boxes });
+    this.traces.push({ line, engine: res.reducedVars === 0 ? "presolve" : res.engine, status: res.statusText, ok: res.ok, timeMs: cached ? 0 : res.timeMs, iterations: res.iterations, cached, cacheKind: cached ? "problem" : undefined, nVars: prob.names.length, nCons, eliminated: res.eliminated ?? 0, objective: res.objective, violations: res.violations, values: shown, boxes });
     if (!res.ok) throw err(`solve on line ${line} failed: ${res.statusText} (${res.engine})`, line);
     return out;
   }
@@ -686,16 +791,21 @@ export interface CompiledTree { code: string; d: string; c: string; params: Floa
 export function compileTree(node: SNode, atlas: Atlas, target: "wgsl" | "js", prev: CompiledTree | null = null, defaultColour: RGBA = DEFAULT_COLOUR): CompiledTree {
   const key = structKey(node, atlas);
   // (buffer length may legitimately differ: text / polygon blocks use parameterised offsets)
-  if (prev && key !== null && prev.key === key) return { ...prev, params: collectParams(node, atlas, defaultColour), reused: true };
+  if (prev && key !== null && prev.key === key) return { ...prev, params: collectParamsFast(node, atlas, defaultColour), reused: true };
   const g: Gen = target === "wgsl" ? new WGSL() : new JS();
   const ctx: GenCtx = { atlas, zoom: { t: "f", s: target === "wgsl" ? "u.cam.z" : "zoom" }, time: { t: "f", s: target === "wgsl" ? "u.time" : "T" }, cull: true, defaultColour };
   const r = genShape(g, node, { t: "v2", s: "p0" }, ctx);
   return { code: g.code(), d: r.d.s, c: r.c.s, params: new Float32Array(g.finalParams()), key, reused: false };
 }
-/** Only the parameter buffer of a tree, in codegen order (see ParamsOnly). */
+/** Only the parameter buffer of a tree, in codegen order, via the generic ParamsOnly backend (reference implementation). */
 export function collectParams(node: SNode, atlas: Atlas, defaultColour: RGBA = DEFAULT_COLOUR): Float32Array {
   const g = new ParamsOnly();
   genShape(g, node, { t: "v2", s: "" }, { atlas, zoom: { t: "f", s: "" }, time: { t: "f", s: "" }, cull: true, defaultColour });
   return new Float32Array(g.finalParams());
+}
+/** Same buffer through the dedicated tree walk (`walkParams`); falls back to the generic backend for trees with user shader functions. */
+export function collectParamsFast(node: SNode, atlas: Atlas, defaultColour: RGBA = DEFAULT_COLOUR): Float32Array {
+  const p = walkParams(node, atlas);
+  return p ? new Float32Array(p) : collectParams(node, atlas, defaultColour);
 }
 export { Shape, DEFAULT_COLOUR };

@@ -44,12 +44,18 @@ const interB = (a: BBox | null, b: BBox | null): BBox | null => (!a ? b : !b ? a
 const ptsB = (pts: [number, number][]): BBox => pts.reduce<BBox>((b, [x, y]) => [Math.min(b[0], x), Math.min(b[1], y), Math.max(b[2], x), Math.max(b[3], y)], [...EMPTY] as BBox);
 const cornersOf = (b: BBox): [number, number][] => [[b[0], b[1]], [b[2], b[1]], [b[0], b[3]], [b[2], b[3]]];
 
-export function textMetrics(n: { text: string; size: number; align: "center" | "left" }, atlas: Atlas) {
+interface TextMetrics { s: number; total: number; x0: number; baseY: number }
+// bbox, codegen and the parameter walk all need the metrics of a text node; memoised per node (nodes are immutable)
+const tmMemo = new WeakMap<object, TextMetrics>();
+export function textMetrics(n: { text: string; size: number; align: "center" | "left" }, atlas: Atlas): TextMetrics {
+  let m = tmMemo.get(n);
+  if (m) return m;
   const s = n.size / FONT_PX; let total = 0;
   for (let i = 0; i < n.text.length; i++) total += penAdvance(atlas, n.text, i) * s; // advances include kerning
   // y-up world: the baseline sits below the centre for centred text; the origin is the baseline start for left text
   const x0 = n.align === "center" ? -total / 2 : 0; const baseY = n.align === "center" ? -n.size * 0.36 : 0;
-  return { s, total, x0, baseY };
+  m = { s, total, x0, baseY }; tmMemo.set(n, m);
+  return m;
 }
 
 // Nodes are immutable and rebuilt on every evaluation, so a WeakMap memo is safe; without it
@@ -103,6 +109,80 @@ function bboxRaw(n: SNode, atlas: Atlas): BBox | null {
   }
 }
 export function finiteBBox(b: BBox | null): BBox | null { return b && !isEmpty(b) && b.every(Number.isFinite) ? b : null; }
+
+/** Per-glyph parameter rows [cell x, u0, v0, u1, v1] of a text node (spaces produce no glyph). Shared by codegen and walkParams. */
+export function textGlyphs(n: { text: string; size: number; align: "center" | "left" }, atlas: Atlas, m = textMetrics(n, atlas)): number[][] {
+  const glyphs: number[][] = []; let x = m.x0;
+  for (let i = 0; i < n.text.length; i++) {
+    const code = n.text.charCodeAt(i);
+    if (code !== 32 && code !== 160) {
+      const [cc, cr] = atlas.cell(code);
+      // cell origin = bottom-left corner in y-up world space; atlas rows run top-down so v is flipped
+      glyphs.push([x - GLYPH_PAD * m.s, cc / ATLAS_COLS, (cr + 1) / ATLAS_ROWS, (cc + 1) / ATLAS_COLS, cr / ATLAS_ROWS]);
+    }
+    x += penAdvance(atlas, n.text, i) * m.s;
+  }
+  return glyphs;
+}
+
+// ---------------------------------------------------------------- parameter walk (fast path)
+/**
+ * The parameter buffer of a tree without generating any code: a direct walk that pushes numbers in
+ * exactly the order `genShape`'s `g.param(...)` calls would (scalars first, dynamic blocks appended
+ * and base slots patched — the same layout as `Gen.finalParams()`).  ~3–5× cheaper than driving the
+ * generic ParamsOnly backend.  Returns null for trees that contain user shader functions (their
+ * parameters come from SubCurv compilation), which is exactly when `structKey` is null too.
+ *
+ * INVARIANT: every `g.param` / `dynBlock` in genShape must have a matching push here, in the same
+ * order and with the same cull-flag propagation.  `scripts/paramcheck.ts` compares the two on every
+ * example — run it after touching either function.
+ */
+export function walkParams(root: SNode, atlas: Atlas, cull = true): number[] | null {
+  const out: number[] = []; const blocks: { slot: number; values: number[] }[] = [];
+  const P = (v: number) => { out.push(Number.isFinite(v) ? v : v > 0 ? 3e38 : v < 0 ? -3e38 : 0); };
+  const block = (values: number[]) => { out.push(0); blocks.push({ slot: out.length - 1, values }); };
+  let ok = true;
+  const walk = (n: SNode, cull: boolean): void => {
+    const kidC = (s: SNode) => {
+      if (cullable(s, atlas, cull)) { const bb = finiteBBox(bboxOf(s, atlas))!; P((bb[0] + bb[2]) / 2); P((bb[1] + bb[3]) / 2); P((bb[2] - bb[0]) / 2); P((bb[3] - bb[1]) / 2); }
+      walk(s, cull);
+    };
+    switch (n.k) {
+      case "circle": P(n.r); return;
+      case "rect": P(n.w / 2); P(n.h / 2); P(Math.min(n.r, n.w / 2, n.h / 2)); return;
+      case "seg": P(n.x1); P(n.y1); P(n.x2); P(n.y2); P(n.th / 2); return;
+      case "ellipse": P(n.a / 2); P(n.b / 2); return;
+      case "nothing": case "everything": return;
+      case "half": P(n.nx); P(n.ny); P(n.d); return;
+      case "ngon": { const an = Math.PI / n.n, R = n.r / Math.cos(an); P(Math.cos(an)); P(Math.sin(an)); P(an); P(R); P(R); return; }
+      case "poly": if (n.pts.length / 2 < 3) return; block(n.pts); return;
+      case "text": { const m = textMetrics(n, atlas); const glyphs = textGlyphs(n, atlas, m); P(m.s); P(m.baseY - (CELL - BASELINE) * m.s); P(CELL * m.s); P(glyphs.length); block(glyphs.flat()); return; }
+      case "union": case "inter": for (const k of n.kids) kidC(k); return;
+      case "diff": kidC(n.a); kidC(n.b); return;
+      case "sunion": case "sinter": if (n.kids.length === 0) return; P(n.s); for (const k of n.kids) walk(k, false); return;
+      case "sdiff": P(n.s); walk(n.a, false); walk(n.b, false); return;
+      case "morph": P(n.t); walk(n.a, false); walk(n.b, false); return;
+      case "round": walk(n.s, false); P(n.r); return;
+      case "stroke": walk(n.s, false); P(n.w / 2); return;
+      case "complement": walk(n.s, false); return;
+      case "lipschitz": walk(n.s, false); P(n.lip); return;
+      case "colour": walk(n.s, cull); P(n.c[0]); P(n.c[1]); P(n.c[2]); P(n.c[3]); return;
+      case "opacity": walk(n.s, cull); P(n.a); return;
+      case "grad": walk(n.s, cull); P(n.x0); P(n.y0); P(n.x1); P(n.y1); P(n.c1[0]); P(n.c1[1]); P(n.c1[2]); P(n.c2[0]); P(n.c2[1]); P(n.c2[2]); P(n.c1[3]); return;
+      case "shadow": P(n.dx); P(n.dy); walk(n.s, false); P(Math.max(0.5, n.blur)); P(n.a); walk(n.s, cull); return;
+      case "xform": P(n.tx); P(n.ty); P(Math.cos(n.rot)); P(Math.sin(n.rot)); P(n.sc || 1); walk(n.s, cull); return;
+      case "stretch": { const m = Math.min(Math.abs(n.sx), Math.abs(n.sy)) || 1; P(n.sx); P(n.sy); P(m); walk(n.s, false); P(m); return; }
+      case "reflect": P(n.nx); P(n.ny); walk(n.s, cull); return;
+      case "repeat": P(n.a); P(n.b); walk(n.s, false); return;
+      case "swirl": P(n.d / 2); P(n.strength); walk(n.s, false); P(1 + Math.abs(n.strength)); return;
+      case "colourfn": case "custom": ok = false; return;
+    }
+  };
+  walk(root, cull);
+  if (!ok) return null;
+  for (const b of blocks) { out[b.slot] = out.length; for (const v of b.values) out.push(Number.isFinite(v) ? v : 0); }
+  return out;
+}
 
 /** rough primitive count, used to decide whether bbox culling is worth a branch */
 const wMemo = new WeakMap<SNode, number>();
@@ -255,16 +335,7 @@ export function genShape(g: Gen, n: SNode, p: E, ctx: GenCtx): DC {
       // parameters (5 per glyph, after a dynamic base offset), so the generated code does not
       // depend on the label's content or length: animated / solved labels never recompile.
       const m = textMetrics(n, ctx.atlas);
-      const glyphs: number[][] = []; let x = m.x0;
-      for (let i = 0; i < n.text.length; i++) {
-        const code = n.text.charCodeAt(i);
-        if (code !== 32 && code !== 160) {
-          const [cc, cr] = ctx.atlas.cell(code);
-          // cell origin = bottom-left corner in y-up world space; atlas rows run top-down so v is flipped
-          glyphs.push([x - GLYPH_PAD * m.s, cc / ATLAS_COLS, (cr + 1) / ATLAS_ROWS, (cc + 1) / ATLAS_COLS, cr / ATLAS_ROWS]);
-        }
-        x += penAdvance(ctx.atlas, n.text, i) * m.s;
-      }
+      const glyphs = textGlyphs(n, ctx.atlas, m);
       const sE = g.param(m.s), qyE = g.param(m.baseY - (CELL - BASELINE) * m.s), qsE = g.let(g.fn("max", [g.param(CELL * m.s), g.num(1e-6)]));
       const nE = g.param(glyphs.length), baseE = dynBase(g, glyphs.flat());
       const pad = g.let(g.bin("/", g.num(1.5), ctx.zoom));

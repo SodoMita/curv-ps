@@ -15,13 +15,15 @@ let
 in union [ card L.side, for (c in L.cards) card c ]
 ```
 
-Highlights: shaders are reused across frames (only a parameter buffer is refilled), unchanged `solve` blocks are
-served from a fingerprint cache, layout combinators (`hstack`, `grid`, `flow`, `hstack_fit`, …) are plain Curv
+Highlights: shaders are reused across frames (only a parameter buffer is refilled by a dedicated tree walk), a `solve`
+block whose inputs (free variables, tracked through closures) did not change is not re-evaluated at all, unchanged
+numeric problems are additionally served from a fingerprint cache, layout combinators (`hstack`, `grid`, `flow`, `hstack_fit`, …) are plain Curv
 functions that return constraint values, and text is an SDF atlas (ASCII + Latin-1 + symbols, kerned).
 
 * `npm install && npm run dev` — development server
 * `npm run build` — single-file `dist/index.html`
 * `npx tsx scripts/selftest.ts` — headless render of every example
-* `npx tsx scripts/paramcheck.ts` — verifies the codegen fast path
+* `npx tsx scripts/paramcheck.ts` — verifies the codegen fast path and solve-block memoisation
+* `npx tsx scripts/memotest.ts` — dependency-tracking tests for solve-block memoisation
 
 See [HANDOFF.md](HANDOFF.md) for the architecture, invariants and the current state of development.

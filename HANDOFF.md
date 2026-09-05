@@ -1,4 +1,4 @@
-# Curv+solve — handoff (dev round 5)
+# Curv+solve — handoff (dev round 6)
 
 Browser playground for **Curv** (2D F-Rep, compiled to WGSL / JS) extended with
 `solve { }` constraint blocks solved by **psolve** (LP + convex QP, WebAssembly).
@@ -9,58 +9,52 @@ Headless checks (all use the JS backend, no browser needed):
 | command | what it does |
 |---|---|
 | `npx tsx scripts/selftest.ts [id \| file.curv …]` | evaluates every example, compiles both backends, renders `/tmp/t/<id>.png` |
-| `npx tsx scripts/paramcheck.ts` | **fast-path oracle**: params-only buffer must equal full codegen's, key must be stable *and the shader text identical* across time/viewport |
-| `npx tsx scripts/prof.ts` | warm eval / codegen / params-only timings + whether each `solve` hit the cache |
+| `npx tsx scripts/paramcheck.ts` | **fast-path oracle**: `walkParams` buffer == ParamsOnly buffer == full codegen's; key stable and shader text identical across time/viewport; **memoised evaluations produce the same buffer as cold ones** (`memo=` column) |
+| `npx tsx scripts/memotest.ts` | solve-block memoisation dependency tests (indirect `time` through closures, shadowing, records, comprehensions, impure blocks …) |
+| `npx tsx scripts/prof.ts` | warm eval / codegen / params-only timings + whether each `solve` was `cached(block)`, `cached(problem)` or solved |
 
-All three were green at the end of this round (`paramcheck` exits 1 on any failure — check its exit code, not just its output).
+All four were green at the end of this round (`paramcheck` and `memotest` exit 1 on any failure — check the exit code).
 
 ## What changed in this round
 
-1. **Solve memoisation** (`src/curv/interp.ts`, `src/psolve/constraints.ts`).
-   `Problem.fingerprint()` serialises the numeric problem (every coefficient, relation, weight, objective).
-   `Interp.solve` keeps a module-level `Map<line, {fp, res}>`; an unchanged block skips presolve + psolve
-   (`SolveTrace.cached`, shown as a **cached** badge in the solver panel; `resetSolveCache()` exists for scripts).
-   Constraint *construction* is still re-run every frame — see next steps.
-2. **Constraint priorities inside combinators.** `Cons` carries an optional `weight`; the builtins
-   `strength "weak"|"medium"|"strong"|"required" c`, `weight k c` (k × weak, or k × the existing tag) and `soft c`
-   (= weak) tag a constraint value or any nested list of them. In `addValue` an explicit tag **wins over the
-   statement's strength** (so `hstack_fit` can return `[hstack…, soft (same_w items)]` and be added by a plain
-   statement). Trace labels reflect the effective strength (`weak ×4 line 23`).
-   (`weak`/`strong`/… are statement keywords in the parser, hence the function is called `strength`.)
-3. **Prelude combinators** (`src/curv/prelude.ts`): `text_size t s` builtin → `(w, h)`; `fit_text` / `hug_text
-   pad s t b`; `hstack_fit gap pad s labels b items` (≥ label widths, equal widths only soft); `flow gap maxw b
-   items sizes` — a **wrapping flow layout** written as a Curv `do` loop: line breaks are decided greedily from
-   the numeric sizes, only positions become constraints, `b.h == total height`; `flow_text …` measures labels
-   for you. New example **Toolbar & wrapping tags** (`toolbar`).
-4. **Glyph atlas** (`src/gpu/atlas.ts`): character set is now ASCII + Latin-1 + `–—‘’“”•…€£→←↑↓↔×÷≤≥≠≈∞√°±✓✗★☆♥`
-   (221 glyphs, 14 rows; `GLYPHS`, `atlas.index`), and **kerning**: `atlas.kern(a, b)` measures the pair on the
-   retained canvas lazily (`measureText("AV") − adv(A) − adv(V)`), `penAdvance()` is used by `textMetrics`,
-   glyph placement and `text_width`/`text_size`. Unknown characters render as a space.
-5. **Adaptive resolution is a budget controller** (`src/App.tsx`): with GPU timestamps, each frame moves the render
-   scale 35 % of the way towards `q·sqrt(GPU_BUDGET_MS / gpuMs)` (budget 8 ms, dead band 70–115 %, floor 0.3);
-   without timestamps the old rAF-pacing heuristic remains.
-6. **Bugs fixed**
-   * `dynBase` wrote glyph / polygon blocks *inline*, so a label whose length changed shifted every later
-     parameter index while the shader was reused (wrong values after animated labels). Blocks are now deferred:
-     `Gen.dynBlock()` reserves a base slot, `Gen.finalParams()` appends all blocks after the scalars and patches
-     the slots. **Always read the buffer through `finalParams()`**, never `g.params`. `paramcheck` now catches
-     this (`codeSame`).
-   * Lexer: `"..."` was listed after `".."` in `OPS`, so list spread `[...xs, y]` never lexed.
-   * `min`/`max` on the CPU path passed `Math.max` to `reduce` directly → `Math.max(acc, x, index, array)` = `NaN`
-     (`progress`, `flow`, anything using `max(a, b)` outside a shader was broken).
-   * **psolve QP false INFEASIBLE**: a soft equality modelled as two rows + error variable became degenerate whenever
-     its target coincided with an active hard bound. Soft *equalities* now go straight into the objective
-     (`w·(lin)²` → Q, c; no rows, no variable); only soft inequalities keep an error variable (one-sided). Smaller
-     QPs, and the toolbar example (which hit this) solves.
+1. **Whole-block `solve { }` memoisation** (`src/curv/freevars.ts`, `Interp.solve`).
+   `freeVarsOfBlock(stmts)` is a static free-variable analysis of the block (memoised on the AST node; mirrors
+   `bindDefs` order: function defs visible everywhere, value defs only after their own definition, `local x = x + 1`
+   reads the outer `x`, list comprehensions / lambdas / nested `let`/`do`/`solve` scoped). `Interp.blockKey` hashes
+   `astId(stmts)` + the values of those names looked up in the enclosing env (`ValueHasher`): numbers, strings,
+   booleans, null, lists, records, `Lin`/`Quad`/`Cons` by content; **builtins by `Fn.key`** (set by the `b()` helper in
+   `builtins()`, incl. `sRGB.HSV` style fields); **closures by body identity + recursively the values of *their* free
+   variables in their captured env** (so `f x = x + time` used inside a block correctly invalidates it). Shapes and
+   anonymous host functions (partial applications such as `weight 4`) are unhashable → the block falls back to the
+   round-5 fingerprint cache; a block that assigns to an outer variable (`pure: false`) is never memoised.
+   A hit returns the previous result record (immutable), re-pushes the trace with `cacheKind: "block"` and re-applies
+   the `usesTime/Mouse/Viewport` flags recorded at the original evaluation. The cache is keyed by `astId(stmts)` with a
+   small LRU (8) per block, so `f 10; f 20` inside one frame keeps both results. `blockCacheStats.lastReason` says why the
+   last block could not be memoised. Panel badge: **memoised** (block) vs **cached** (fingerprint).
+   Effect (`prof.ts`, warm, ms): toolbar eval 2.1 → 0.6, stacks 0.9 → 0.4, dashboard 2.0 → 1.4 (the rest is shape
+   construction outside the block).
+2. **Dedicated parameter walk** (`walkParams` in `src/curv/shapes.ts`, used by `collectParamsFast` →
+   `compileTree`'s reuse path). A direct `SNode` walk pushing numbers in exactly `genShape`'s `g.param` order, with
+   the same cull-flag propagation and the same deferred-block layout as `Gen.finalParams()`. Returns null for trees with
+   user shader functions (exactly the trees whose `structKey` is null). 3–5× cheaper than driving `ParamsOnly`
+   (dashboard 1.1 → 0.27 ms, toolbar 1.7 → 0.48 ms). `ParamsOnly` + `collectParams` stay as the reference
+   implementation and `paramcheck` compares all three.
+3. **Text metrics memoised per node** (`textMetrics`, WeakMap) and glyph rows factored into `textGlyphs()` so bbox,
+   codegen and the walk share one computation.
+4. **Quality controller budgets CPU time too** (`src/App.tsx`): the GPU render-pass budget is
+   `clamp(FRAME_BUDGET_MS(13) − cpuMs, 2.5, 8)` where `cpuMs` = eval + params/codegen of the last frame, so a
+   program with an expensive CPU side gets a lower render scale instead of missing vsync.
 
 ## Layout of the code
 
 ```
 src/curv/parser.ts      lexer + parser (Curv syntax + solve/var/weak:/minimize statements)
-src/curv/interp.ts      tree-walking interpreter, builtins, Cons values + strength tags, solve { } → psolve Problem
-                        (fingerprint cache), compileTree (structural-key reuse) / collectParams
+src/curv/freevars.ts    static free-variable analysis (blocks + closure bodies), astId
+src/curv/interp.ts      tree-walking interpreter, builtins (Fn.key), Cons values + strength tags,
+                        solve { } → block memo (ValueHasher) → fingerprint cache → psolve Problem,
+                        compileTree (structural-key reuse) / collectParams (reference) / collectParamsFast
 src/curv/subcurv.ts     SubCurv: compiles user dist/colour functions to shader code (inlining, loops)
-src/curv/shapes.ts      SNode F-Rep tree, bboxOf (memoised), structKey, genShape (shape → straight-line code)
+src/curv/shapes.ts      SNode F-Rep tree, bboxOf (memoised), textMetrics/textGlyphs, structKey, genShape, walkParams
 src/curv/prelude.ts     palette, box helpers, layout combinators (incl. flow / hstack_fit), UI components — in Curv
 src/curv/examples.ts    example programs (group "solve" | "curv")
 src/gpu/gen.ts          code generators: WGSL, JS, ParamsOnly; dynBlock/finalParams parameter layout
@@ -68,17 +62,30 @@ src/gpu/renderer.ts     WebGPU renderer (pipeline cache keyed by code, timestamp
 src/gpu/atlas.ts        SDF glyph atlas (Canvas2D + EDT), GLYPHS charset, kerning
 src/psolve/*.ts         Lin/Quad affine expressions, Cons, presolve, QP/LP assembly, bridge to psolve.wasm (b64 inline)
 psolve-src/             C bridge + build instructions for the wasm (unmodified psolve cores)
-src/App.tsx             UI: editor, preview (camera, pause, quality controller), solver + params panels
-scripts/                selftest, paramcheck, prof (headless, tsx)
+src/App.tsx             UI: editor, preview (camera, pause, CPU-aware quality controller), solver + params panels
+scripts/                selftest, paramcheck, memotest, prof (headless, tsx)
 ```
 
 ## Invariants to keep (things that will silently break otherwise)
 
+* **`walkParams` must mirror `genShape` exactly**: every `g.param` / `dynBlock` needs a matching push in the same
+  order, and `cull` must be propagated the same way (`kid(…, {cull:false})` ⇒ `walk(s, false)`; `colour`, `opacity`,
+  `grad`, `reflect`, `xform`, the second `shadow` child inherit). Watch argument-evaluation order (`stretch` pushes
+  `m` *before* its child and again after). Run `scripts/paramcheck.ts` after touching either and check its exit code.
 * Any new `SNode` kind or new codegen branch on a *value* must be reflected in `structKey`; anything else that varies
-  must go through `g.param(...)`. Run `scripts/paramcheck.ts` after touching `genShape` and check its exit code.
+  must go through `g.param(...)`.
 * `ParamsOnly` must invoke every callback (`if` then+else, `loop` body once) so parameter order matches.
 * Variable-length parameter blocks must use `g.dynBlock` (via `dynBase`) and the buffer must be read with
   `finalParams()`; never bake `g.params.length` into code as a literal.
+* **Free-variable analysis must never under-approximate**: a name that *might* be read from the enclosing env must be
+  reported free (extra names are harmless). New `Expr`/`Stmt` kinds need a case in `freevars.ts`; new binding
+  constructs must follow the evaluator's binding order. Any new evaluator side effect reachable from inside a block
+  (like `:=` on an outer variable) must set `pure = false`. Add a case to `scripts/memotest.ts`.
+* **New builtins must be registered through `b(name, …)`** so they get an `Fn.key`; a builtin `Fn` without a key makes
+  every block that mentions it unhashable (silent fallback to the fingerprint cache — `prof.ts` shows `cached(problem)`
+  instead of `cached(block)`). Builtins that read mutable host state other than `time`/`mouse`/`viewport`/params
+  would break memoisation — there are none today (`text_size` depends only on the constant atlas).
+* The result record of a memoised block is shared between frames: records/lists must stay immutable in the evaluator.
 * Keep `OPS` in the lexer sorted longest-prefix-first for operators that share a prefix.
 * Soft equalities must not be modelled as inequality pairs (psolve's active-set QP degenerates); keep them in the
   objective. If you add a new relation type, add it to `Problem.fingerprint()` too.
@@ -86,15 +93,19 @@ scripts/                selftest, paramcheck, prof (headless, tsx)
 
 ## Known gaps / next steps
 
-* Eval (~1–3 ms) still dominates the per-frame cost of animated programs: the interpreter rebuilds every `Lin`
-  and every constraint each frame even when the solve is then served from the cache. Memoising a whole
-  `solve { }` block by the values of its free variables (static free-variable analysis of the block + hashable
-  inputs) would make cached frames eval-only; the `Problem.fingerprint()` cache is the safe fallback.
-* `ParamsOnly` still walks the whole tree through the generic `Gen` interface (~0.8–2 ms). A dedicated
-  `SNode` walker producing the same order (scalars first, dynamic blocks appended) would be faster.
-* `flow` needs a *numeric* maximum width (wrapping is discrete); a solver-aware flow would need integer
-  programming. `hstack_fit` gives all items the same font size / padding.
-* Kerning is measured pairwise from the canvas font (Inter if installed, otherwise the fallback font), so text
-  metrics can differ slightly between machines; the atlas has one weight, no ligatures, no combining marks.
-* The quality controller targets GPU time only; CPU-side eval + params time is not budgeted.
+* The block cache is keyed by `astId(stmts)` with an 8-entry LRU per block (a block evaluated several times per frame
+  keeps all results); the older *fingerprint* cache is still keyed by source line (one slot per line), so a
+  non-memoisable block evaluated twice per frame with different inputs re-solves every time.
+* Shape values are unhashable, so a block reading `s.bbox` of a shape built outside it is only fingerprint-cached.
+  A cheap content hash of an `SNode` (kind + numbers, memoised in a WeakMap like `bboxOf`) would close that gap.
+* Eval of the *rest* of the program (prelude UI components, `bboxOf` for `at`/`fit_in`, record construction) now
+  dominates cached frames (dashboard ≈ 1.4 ms). Candidates: memoise `box`/`makeBoxRec` records, avoid `shapeRec`
+  allocation for `.bbox`, and a per-frame memo for pure prelude calls with hashable arguments (same `ValueHasher`).
+* `structKey` is recomputed every frame (~0.3–0.5 ms on big trees) before the walk; it could be derived
+  incrementally or memoised per subtree like `bboxOf`.
+* `flow` needs a *numeric* maximum width (wrapping is discrete); `hstack_fit` gives all items the same font size /
+  padding.
+* Kerning is measured pairwise from the canvas font, so metrics can differ slightly between machines; the atlas has
+  one weight, no ligatures, no combining marks.
+* The GPU budget is derived from the *previous* frame's CPU time; a sudden CPU spike is corrected one frame late.
 * Only 2D shapes are supported (no 3D ray-marching).
