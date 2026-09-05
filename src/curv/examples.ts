@@ -198,6 +198,47 @@ in union [
   },
   {
     group: "solve",
+    id: "toolbar",
+    name: "Toolbar & wrapping tags",
+    blurb: "hstack_fit sizes a toolbar from its labels; flow_text wraps chips of intrinsic size into rows; soft / strength tag priorities inside combinators. Resize the preview to see it reflow.",
+    src: `// Intrinsic sizes + wrapping.  hstack_fit keeps the toolbar's buttons equal
+// while there is room and falls back to label widths when there is not (the
+// equality is tagged \`soft\` inside the combinator).  flow_text decides the
+// line breaks from the measured chip sizes, so only positions are solved.
+let
+  pad = 16; gap = 10;
+  tools = ["File", "Edit", "View", "Insert", "Format", "Tools", "Window", "Help"];
+  tags  = ["WebGPU", "F-Rep", "Curv", "psolve", "LP + QP", "WGSL", "kerning: AVATAR WAVE", "Latin-1: café · naïve · Ærø",
+           "→ arrows ←", "≤ ≥ ≠ ≈ ∞", "★ ✓ ♥", "£ € ° ±", "Constraint values", "hstack_fit", "flow_text", "soft", "strength", "weight"];
+  chip_w = viewport.w - 2*pad - 2*14;      // width available to the chip flow (a number)
+  L = solve {
+    var root, bar, body, tagbox, footer, space : box;
+    var buttons : box[count tools];
+    var chips : box[count tags];
+    pin pad viewport root;
+    vstack gap root [bar, body, footer, space];    // top-down; heights still free…
+    bar.h == 44;  footer.h == 28;  space.h >= 0;   // …the trailing space absorbs the slack
+    hstack_fit 6 14 13 tools (inset 6 bar) buttons;  // buttons ≥ label width, equal if possible (soft)
+    // chips wrap inside the body; the flow decides tagbox.h from the measured sizes
+    tagbox.left == body.left + 14;  tagbox.top == body.top - 14;
+    flow_text 8 chip_w 8 12 tags tagbox chips;
+    body.h >= tagbox.h + 28;                       // the body must contain them…
+    weight 4 (body.h == tagbox.h + 28);            // …and prefers to hug them (a tagged soft constraint)
+    strength "strong" (space.h <= viewport.h / 3); // priorities: strong < required, so tiny viewports still solve
+  };
+  chip b t = union [ frame_r (b.h/2) b >> colour surface_3, frame_r (b.h/2) b >> stroke 1 >> colour border,
+                     text t 12 >> colour fg >> at b ];
+in union [
+  panel L.bar,
+  for (i in 0 ..< count tools) (if (i == 2) then button L.buttons.[i] tools.[i] else ghost_button L.buttons.[i] tools.[i]),
+  card L.body,
+  for (i in 0 ..< count tags) chip L.chips.[i] tags.[i],
+  text (strcat ["flow_text 8 ", round chip_w, " · body.h = ", round L.body.h, " · ", count tags, " chips in ",
+                round ((L.tagbox.h + 8) / (12*1.25 + 16 + 8)), " rows"]) 12 >> colour muted >> at L.footer,
+]`,
+  },
+  {
+    group: "solve",
     id: "tooltip",
     name: "Constrained tooltip",
     blurb: "Move the mouse: the tooltip wants to follow the cursor (weak) but must stay inside the viewport (required).",

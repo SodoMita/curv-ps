@@ -67,6 +67,34 @@ export const PRELUDE = `
     b.left + cols * items.[0].w + (cols - 1) * gap == b.right,
     b.top - rows * items.[0].h - (rows - 1) * gap == b.bottom ];
 
+  // ---- intrinsic sizes & priorities ----
+  // Constraint values can carry their own strength:  soft c · strength "medium" c · weight 3 c
+  // (an explicit tag wins over the strength of the statement that adds it).
+  // b is large enough for label t at font size s, with pad on every side
+  fit_text pad s t b = [b.w >= (text_size t s).[X] + 2*pad, b.h >= (text_size t s).[Y] + 2*pad];
+  // b has exactly the label's intrinsic size (+ padding)
+  hug_text pad s t b = [b.w == (text_size t s).[X] + 2*pad, b.h == (text_size t s).[Y] + 2*pad];
+  // hstack whose items are at least as wide as their labels; the slack is shared equally (softly),
+  // so a toolbar keeps equal buttons while there is room and degrades to intrinsic widths when there is not
+  hstack_fit gap pad s labels b items = [
+    hstack gap b items,
+    for (i in 0..<count items) items.[i].w >= (text_size labels.[i] s).[X] + 2*pad,
+    soft (same_w items) ];
+  // wrapping flow layout: items of known sizes (a list of (w,h)) are packed left-to-right into rows
+  // no wider than maxw (a number), top-down from b's top-left corner; b.h becomes the total height.
+  // Wrapping is decided here (greedily), so only positions are constraints.
+  flow gap maxw b items sizes = do
+    local x = 0; local y = 0; local rowh = 0; local out = [];
+    for (i in 0 ..< count items) (
+      local w = sizes.[i].[X]; local h = sizes.[i].[Y];
+      if (x > 0 && x + w > maxw) ( x := 0; y := y + rowh + gap; rowh := 0; );
+      out := [...out, items.[i].left == b.left + x, items.[i].top == b.top - y, items.[i].w == w, items.[i].h == h];
+      x := x + w + gap; rowh := max [rowh, h];
+    );
+  in [out, b.h == y + rowh];
+  // convenience: flow of text chips (labels at font size s, padding pad)
+  flow_text gap maxw pad s labels b items = flow gap maxw b items [for (t in labels) text_size t s + 2*pad];
+
   // ---- components built from boxes ----
   card b = frame_r 16 b >> colour surface;
   card_c c b = frame_r 16 b >> colour c;

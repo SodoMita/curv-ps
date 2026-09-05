@@ -18,6 +18,8 @@ const BG: Record<"light" | "dark", [number, number, number]> = { light: [0.965, 
 type ParamValues = Record<string, number | boolean | number[]>;
 const HOME: Camera = { cx: 0, cy: 0, zoom: 1 };
 const DEBOUNCE_MS = 100;
+const GPU_BUDGET_MS = 8;   // render-pass budget the adaptive-resolution controller aims for while animating
+const MIN_QUALITY = 0.3;   // lowest render scale (0.3 → 9 % of the pixels)
 
 export default function App() {
   const [exampleId, setExampleId] = useState(EXAMPLES[0].id);
@@ -193,10 +195,18 @@ export default function App() {
         const t = performance.now();
         const f = frames.current;
         if (animating && f.last) { // adaptive quality: GPU timestamps when available, otherwise rAF pacing
-          const dt = t - f.last, gpu = renderer.current?.stats.gpuMs ?? 0;
-          const slow = gpu > 0 ? gpu > 11 || dt > 34 : dt > 24, fast = gpu > 0 ? gpu < 5 && dt < 20 : dt < 13;
-          if (slow && quality.current > 0.35) quality.current = Math.max(0.35, quality.current * 0.85);
-          else if (fast && quality.current < 1) quality.current = Math.min(1, quality.current * 1.08);
+          const dt = t - f.last, gpu = renderer.current?.stats.gpuMs ?? 0, q = quality.current;
+          if (gpu > 0) {
+            // Budget controller: render-pass cost scales with pixel count (∝ q²), so the scale that
+            // would hit the budget exactly is q·sqrt(budget / gpu).  Move part of the way there each
+            // frame, with a dead band around the budget so a stable program does not oscillate.
+            const target = q * Math.sqrt(GPU_BUDGET_MS / Math.max(gpu, 0.1));
+            const inBand = gpu > GPU_BUDGET_MS * 0.7 && gpu < GPU_BUDGET_MS * 1.15;
+            if (!inBand || dt > 34) quality.current = Math.min(1, Math.max(MIN_QUALITY, q + (Math.min(target, dt > 34 ? q * 0.9 : 1) - q) * 0.35));
+          } else { // no timestamp-query feature: rAF pacing heuristic
+            if (dt > 24 && q > MIN_QUALITY) quality.current = Math.max(MIN_QUALITY, q * 0.85);
+            else if (dt < 13 && q < 1) quality.current = Math.min(1, q * 1.08);
+          }
         }
         f.last = animating ? t : 0;
         const wasDirty = dirty.current; dirty.current = false;

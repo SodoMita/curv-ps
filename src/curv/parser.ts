@@ -13,7 +13,7 @@ const KEYWORDS = new Set([
   "let", "in", "where", "if", "then", "else", "for", "by", "solve", "var", "do", "local", "while", "until", "parametric", "include",
   "minimize", "maximize", "weak", "medium", "strong", "required", "true", "false", "null",
 ]);
-const OPS = [">>", "<<", "==", "!=", "<=", ">=", "&&", "||", "->", "..<", "..", ".[", "...", ":=", "::",
+const OPS = [">>", "<<", "==", "!=", "<=", ">=", "&&", "||", "->", "...", "..<", "..", ".[", ":=", "::",
   "+", "-", "*", "/", "^", "%", "<", ">", "=", "(", ")", "[", "]", "{", "}", ",", ";", ":", ".", "!", "@", "#"];
 
 export class CurvError extends Error {

@@ -1,14 +1,26 @@
-// Signed-distance glyph atlas built once with Canvas2D.  Each ASCII glyph
-// (32..126) lives in a CELL×CELL cell; the texture stores 0.5 - dist/SPREAD.
-export const ATLAS_COLS = 16, ATLAS_ROWS = 6, CELL = 64, FONT_PX = 40, SPREAD = 8;
-export const ATLAS_W = ATLAS_COLS * CELL, ATLAS_H = ATLAS_ROWS * CELL;
+// Signed-distance glyph atlas built once with Canvas2D.  Every glyph of GLYPHS
+// (ASCII, Latin-1 and a few typographic extras) lives in a CELL×CELL cell; the
+// texture stores 0.5 - dist/SPREAD.  Kerning pairs are measured lazily.
+export const ATLAS_COLS = 16, CELL = 64, FONT_PX = 40, SPREAD = 8;
 export const GLYPH_PAD = 10, BASELINE = 44; // glyph origin inside the cell
 export const FONT_FAMILY = "Inter, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
 
+/** Character set: printable ASCII, Latin-1 supplement, and common typographic / arrow / math glyphs. */
+export const GLYPHS: string = (() => {
+  let s = ""; for (let c = 32; c < 127; c++) s += String.fromCharCode(c);
+  for (let c = 160; c < 256; c++) s += String.fromCharCode(c);
+  return s + "–—‘’“”•…€£→←↑↓↔×÷≤≥≠≈∞√°±✓✗★☆♥";
+})();
+export const ATLAS_ROWS = Math.ceil(GLYPHS.length / ATLAS_COLS);
+export const ATLAS_W = ATLAS_COLS * CELL, ATLAS_H = ATLAS_ROWS * CELL;
+
 export interface Atlas {
   data: Uint8Array<ArrayBuffer>; // ATLAS_W*ATLAS_H single channel (r8unorm)
-  advance: Float32Array;     // per char code 0..127, in FONT_PX units
+  advance: Float32Array;         // per glyph *index*, in FONT_PX units
+  index: Map<number, number>;    // char code → glyph index (unknown codes fall back to space)
   cell(code: number): [number, number]; // cell column,row
+  /** Kerning adjustment between two char codes (FONT_PX units, usually ≤ 0); measured on demand. */
+  kern(a: number, b: number): number;
 }
 
 let cached: Atlas | null = null;
@@ -19,18 +31,19 @@ export function buildAtlas(): Atlas {
   const ctx = cv.getContext("2d", { willReadFrequently: true })!;
   ctx.fillStyle = "#000"; ctx.fillRect(0, 0, ATLAS_W, ATLAS_H);
   ctx.fillStyle = "#fff"; ctx.font = `500 ${FONT_PX}px ${FONT_FAMILY}`; ctx.textBaseline = "alphabetic";
-  const advance = new Float32Array(128);
-  for (let code = 32; code < 127; code++) {
-    const i = code - 32, cx = (i % ATLAS_COLS) * CELL, cy = Math.floor(i / ATLAS_COLS) * CELL;
-    const ch = String.fromCharCode(code);
-    advance[code] = ctx.measureText(ch).width;
+  const n = GLYPHS.length;
+  const advance = new Float32Array(n); const index = new Map<number, number>();
+  for (let i = 0; i < n; i++) {
+    const ch = GLYPHS[i]; const cx = (i % ATLAS_COLS) * CELL, cy = Math.floor(i / ATLAS_COLS) * CELL;
+    index.set(ch.charCodeAt(0), i);
+    advance[i] = ctx.measureText(ch).width;
     ctx.fillText(ch, cx + GLYPH_PAD, cy + BASELINE);
   }
   const img = ctx.getImageData(0, 0, ATLAS_W, ATLAS_H).data;
   const inside = new Uint8Array(ATLAS_W * ATLAS_H);
   for (let p = 0; p < inside.length; p++) inside[p] = img[p * 4] > 127 ? 1 : 0;
   // exact Euclidean distance transform (Felzenszwalb & Huttenlocher), two passes
-  // (outside / inside), clamped to SPREAD.  ~10 ms instead of seconds.
+  // (outside / inside), clamped to SPREAD.  ~20 ms instead of seconds.
   const dOut = edt(inside, ATLAS_W, ATLAS_H, 0), dIn = edt(inside, ATLAS_W, ATLAS_H, 1);
   const data = new Uint8Array(new ArrayBuffer(ATLAS_W * ATLAS_H));
   const R = SPREAD;
@@ -39,15 +52,32 @@ export function buildAtlas(): Atlas {
     const sd = inside[p] ? -(Math.sqrt(dOut[p]) - 0.5) : Math.sqrt(dIn[p]) - 0.5;
     data[p] = Math.max(0, Math.min(255, Math.round((0.5 - Math.max(-R, Math.min(R, sd)) / (2 * R)) * 255)));
   }
-  cached = { data, advance, cell: (code) => { const i = Math.max(0, Math.min(94, code - 32)); return [i % ATLAS_COLS, Math.floor(i / ATLAS_COLS)]; } };
+  // kerning: the canvas applies the font's kerning table to a pair, so pair width − single widths is the adjustment
+  const kerns = new Map<number, number>();
+  const kern = (a: number, b: number) => {
+    const ia = index.get(a), ib = index.get(b);
+    if (ia === undefined || ib === undefined) return 0;
+    const key = ia * 4096 + ib; let k = kerns.get(key);
+    if (k === undefined) {
+      const w = ctx.measureText(GLYPHS[ia] + GLYPHS[ib]).width - advance[ia] - advance[ib];
+      k = Math.abs(w) < 0.05 || !Number.isFinite(w) ? 0 : w; kerns.set(key, k);
+    }
+    return k;
+  };
+  cached = { data, advance, index, kern, cell: (code) => { const i = index.get(code) ?? 0; return [i % ATLAS_COLS, Math.floor(i / ATLAS_COLS)]; } };
   return cached;
 }
 
-export function measureText(atlas: Atlas, text: string, size: number): number {
-  let w = 0; for (const ch of text) { const c = ch.charCodeAt(0); w += (advanceOf(atlas, c)) * (size / FONT_PX); }
-  return w;
+export function advanceOf(atlas: Atlas, code: number) { return atlas.advance[atlas.index.get(code) ?? 0]; }
+/** Pen advance for the character at position i of `text` (advance + kerning with the next character), in FONT_PX units. */
+export function penAdvance(atlas: Atlas, text: string, i: number) {
+  const c = text.charCodeAt(i);
+  return advanceOf(atlas, c) + (i + 1 < text.length ? atlas.kern(c, text.charCodeAt(i + 1)) : 0);
 }
-export function advanceOf(atlas: Atlas, code: number) { return code >= 32 && code < 127 ? atlas.advance[code] : atlas.advance[32]; }
+export function measureText(atlas: Atlas, text: string, size: number): number {
+  let w = 0; for (let i = 0; i < text.length; i++) w += penAdvance(atlas, text, i);
+  return w * (size / FONT_PX);
+}
 
 /** Squared distance from every pixel to the nearest pixel whose `inside` value equals `target`. */
 function edt(inside: Uint8Array, W: number, H: number, target: number): Float32Array {

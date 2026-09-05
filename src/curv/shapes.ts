@@ -2,7 +2,7 @@
 // compilation of the tree into straight-line shader code (WGSL or JS) through
 // the Gen backends.  All numbers that may vary between evaluations are emitted
 // as parameters so re-solving / animating never triggers a shader recompile.
-import { type Atlas, CELL, FONT_PX, GLYPH_PAD, BASELINE, ATLAS_COLS, ATLAS_ROWS, advanceOf } from "../gpu/atlas";
+import { type Atlas, CELL, FONT_PX, GLYPH_PAD, BASELINE, ATLAS_COLS, ATLAS_ROWS, penAdvance } from "../gpu/atlas";
 import { type Gen, type E, GenError } from "../gpu/gen";
 
 export type RGBA = [number, number, number, number];
@@ -46,7 +46,7 @@ const cornersOf = (b: BBox): [number, number][] => [[b[0], b[1]], [b[2], b[1]], 
 
 export function textMetrics(n: { text: string; size: number; align: "center" | "left" }, atlas: Atlas) {
   const s = n.size / FONT_PX; let total = 0;
-  for (const ch of n.text) total += advanceOf(atlas, ch.charCodeAt(0)) * s;
+  for (let i = 0; i < n.text.length; i++) total += penAdvance(atlas, n.text, i) * s; // advances include kerning
   // y-up world: the baseline sits below the centre for centred text; the origin is the baseline start for left text
   const x0 = n.align === "center" ? -total / 2 : 0; const baseY = n.align === "center" ? -n.size * 0.36 : 0;
   return { s, total, x0, baseY };
@@ -183,12 +183,7 @@ function over(g: Gen, a: DC, b: DC, zoom: E): DC {
  * The offset itself lives in the buffer, so a variable-length block earlier in the tree (a text
  * label whose length changed) never bakes a different literal into the shader text.
  */
-function dynBase(g: Gen, values: number[]): E {
-  const baseE = g.param(0); const slot = g.params.length - 1;
-  g.params[slot] = g.params.length;
-  for (const v of values) g.param(v);
-  return baseE;
-}
+function dynBase(g: Gen, values: number[]): E { return g.dynBlock(values); }
 function sdBox(g: Gen, p: E, hx: E, hy: E, r: E): E {
   const q = g.let(g.bin("+", g.bin("-", g.fn("abs", [p]), g.vec([hx, hy])), r));
   const qx = g.idx(q, 0), qy = g.idx(q, 1);
@@ -261,14 +256,14 @@ export function genShape(g: Gen, n: SNode, p: E, ctx: GenCtx): DC {
       // depend on the label's content or length: animated / solved labels never recompile.
       const m = textMetrics(n, ctx.atlas);
       const glyphs: number[][] = []; let x = m.x0;
-      for (const ch of n.text) {
-        const code = ch.charCodeAt(0);
-        if (code !== 32) {
+      for (let i = 0; i < n.text.length; i++) {
+        const code = n.text.charCodeAt(i);
+        if (code !== 32 && code !== 160) {
           const [cc, cr] = ctx.atlas.cell(code);
           // cell origin = bottom-left corner in y-up world space; atlas rows run top-down so v is flipped
           glyphs.push([x - GLYPH_PAD * m.s, cc / ATLAS_COLS, (cr + 1) / ATLAS_ROWS, (cc + 1) / ATLAS_COLS, cr / ATLAS_ROWS]);
         }
-        x += advanceOf(ctx.atlas, code) * m.s;
+        x += penAdvance(ctx.atlas, n.text, i) * m.s;
       }
       const sE = g.param(m.s), qyE = g.param(m.baseY - (CELL - BASELINE) * m.s), qsE = g.let(g.fn("max", [g.param(CELL * m.s), g.num(1e-6)]));
       const nE = g.param(glyphs.length), baseE = dynBase(g, glyphs.flat());

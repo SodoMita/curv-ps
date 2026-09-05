@@ -24,6 +24,17 @@ export abstract class Gen {
   code() { return this.lines.join("\n"); }
 
   param(v: number): E { const i = this.params.length; this.params.push(Number.isFinite(v) ? v : v > 0 ? 3e38 : v < 0 ? -3e38 : 0); return { t: "f", s: `P[${i}]` }; }
+  /** Variable-length blocks (glyphs, polygon vertices) are appended *after* all scalar parameters by
+   *  `finalParams()`, so a label that changes length never shifts the index of anything else; the
+   *  block's start offset is itself a scalar parameter (the returned E). */
+  private blocks: { slot: number; values: number[] }[] = [];
+  dynBlock(values: number[]): E { const e = this.param(0); this.blocks.push({ slot: this.params.length - 1, values }); return e; }
+  /** The complete parameter buffer: scalars first, then every dynamic block, with base slots patched. */
+  finalParams(): number[] {
+    const out = this.params.slice();
+    for (const b of this.blocks) { out[b.slot] = out.length; for (const v of b.values) out.push(Number.isFinite(v) ? v : 0); }
+    return out;
+  }
   paramVec(vs: number[]): E { return this.vec(vs.map((v) => this.param(v))); }
   abstract paramAt(i: E): E;
   abstract num(v: number): E;

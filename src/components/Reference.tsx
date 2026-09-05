@@ -24,6 +24,10 @@ const sections: { title: string; rows: [string, string][] }[] = [
       ["pin pad outer inner · inside pad outer inner · centre_in outer inner", "inner fills outer minus a margin (==) · stays inside it (<=, >=) · shares its centre"],
       ["same_w · same_h · same_size · align_left/right/top/bottom/cx/cy  items", "equalities between list items"],
       ["size_of (w,h) b · min_size (w,h) b · max_size (w,h) b · aspect r b", "size constraints on one box"],
+      ["fit_text pad s t b · hug_text pad s t b", "b is at least (exactly) as big as label t at font size s, plus padding"],
+      ["hstack_fit gap pad s labels b items", "hstack whose items are ≥ their label widths; equal widths are only a `soft` preference"],
+      ["flow gap maxw b items sizes · flow_text gap maxw pad s labels b items", "wrapping flow: items of known (w,h) packed into rows ≤ maxw (a number) from b's top-left; b.h == total height"],
+      ["soft c · strength \"medium\" c · weight 3 c", "tag constraint values with their own priority (wins over the statement's strength); weight multiplies weak"],
     ],
   },
   {
@@ -44,7 +48,7 @@ const sections: { title: string; rows: [string, string][] }[] = [
     rows: [
       ["circle d · rect (w,h) · rrect (w,h) r · ellipse (w,h)", "centred primitives"],
       ["line (p1,p2) th · half_plane n · nothing", ""],
-      ["text \"hi\" 14 · text_left \"hi\" 14 · text_width \"hi\" 14", "SDF glyphs; text_width is a number you can constrain on"],
+      ["text \"hi\" 14 · text_left \"hi\" 14 · text_width \"hi\" 14 · text_size \"hi\" 14", "SDF glyphs (ASCII + Latin-1 + →←≤≥★✓…, kerned); text_width / text_size (w,h) are numbers you can constrain on"],
       ["box (x,y,w,h) · box_at c sz · inset d b · bbox_box s", "box records (x,y = bottom-left corner)"],
       ["frame b · frame_r r b · at b shape · fit_in b shape", "turn a box into a rect / place a shape at a box"],
       ["union [..] · intersection [..] · difference [a,b]", "CSG; union composes colours painter-style"],

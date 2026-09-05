@@ -55,7 +55,11 @@ export type Rel = "=" | "<" | ">";
 export interface Constraint { lin: Lin; rel: Rel; weight: number; label?: string } // lin REL 0 ; weight=Infinity => hard
 export const STRENGTH: Record<string, number> = { required: Infinity, strong: 1e4, medium: 1e2, weak: 1 };
 /** A first-class constraint value: `a == b` evaluated on solver variables (outside a statement) yields one of these. */
-export class Cons { constructor(public lin: Lin, public rel: Rel, public line?: number) {} }
+export class Cons {
+  /** `weight` is an explicit strength attached with `strength "weak" c` / `weight w c`; undefined = inherit the statement's. */
+  constructor(public lin: Lin, public rel: Rel, public line?: number, public weight?: number) {}
+  withWeight(w: number) { return new Cons(this.lin, this.rel, this.line, w); }
+}
 
 export interface ConstraintResult extends SolveResult {
   values: number[]; // per user variable
@@ -70,6 +74,24 @@ export class Problem {
   newVar(name: string): VarId { this.names.push(name); return this.names.length - 1; }
   addConstraint(c: Constraint) { this.constraints.push(c); }
   minimize(q: Quad) { this.objective = this.objective.add(q); }
+
+  /**
+   * A string that identifies the numeric problem exactly (variables, every coefficient, relation,
+   * weight and the objective).  Two problems with the same fingerprint have the same solution, so
+   * the interpreter can skip presolve + psolve when a re-evaluated `solve { }` block is unchanged.
+   */
+  fingerprint(): string {
+    const parts: (string | number)[] = [this.names.length];
+    for (const c of this.constraints) {
+      parts.push(c.rel, c.weight, c.lin.c);
+      for (const [k, v] of c.lin.t) parts.push(k, v);
+      parts.push("|");
+    }
+    parts.push("#", this.objective.lin.c);
+    for (const [k, v] of this.objective.lin.t) parts.push(k, v);
+    for (const [, [i, j, c]] of this.objective.q) parts.push(i, j, c);
+    return parts.join(",");
+  }
 
   /**
    * Presolve: eliminate hard equalities by Gaussian elimination so psolve
@@ -152,8 +174,12 @@ export class Problem {
       res = solveLP({ n: nv, m: hard.length, c, colptr, row, val, rel, b, l, u, maximize: false });
       x = res.x;
     } else {
-      // ---- QP path: variables = user vars + one error var per soft constraint
-      const n = nv + soft.length;
+      // ---- QP path: variables = user vars + one error var per soft *inequality*.
+      // Soft equalities need no rows at all: w·(lin)² goes straight into the objective.  (Modelling
+      // them as two inequality rows with an error variable made the active set degenerate whenever the
+      // target coincided with an active hard bound, and psolve's active-set QP then reported INFEASIBLE.)
+      const softEq = soft.filter((s) => s.rel === "="), softIneq = soft.filter((s) => s.rel !== "=");
+      const n = nv + softIneq.length;
       const Q = new Array(n * n).fill(0), c = new Array(n).fill(0);
       const A: number[] = [], b: number[] = [];
       const pushRow = (lin: Lin, extra?: [number, number]) => {
@@ -162,14 +188,17 @@ export class Problem {
       };
       for (const [, [i, j, k]] of objective.q) { if (i === j) Q[i * n + i] += 2 * k; else { Q[j * n + i] += k; Q[i * n + j] += k; } }
       for (const [k, v] of objective.lin.t) c[k] += v;
+      for (const s of softEq) { // + w·(c + Σ t_i x_i)²  =  ½ xᵀ(2w t tᵀ)x + (2w c t)ᵀx + const
+        const t = [...s.lin.t]; const w = s.weight;
+        for (const [i, ti] of t) { c[i] += 2 * w * s.lin.c * ti; for (const [j, tj] of t) Q[i * n + j] += 2 * w * ti * tj; }
+      }
       for (const h of hard) {
         if (h.rel === "<" || h.rel === "=") pushRow(h.lin);
         if (h.rel === ">" || h.rel === "=") pushRow(h.lin.scale(-1));
       }
-      soft.forEach((s, si) => {
+      softIneq.forEach((s, si) => { // one-sided penalty: lin REL 0 relaxed by e ≥ 0, cost w·e²
         const e = nv + si; Q[e * n + e] += 2 * s.weight;
-        if (s.rel === "=") { pushRow(s.lin, [e, -1]); pushRow(s.lin.scale(-1), [e, 1]); }
-        else { pushRow(s.rel === "<" ? s.lin : s.lin.scale(-1), [e, -1]); pushRow(new Lin(0), [e, -1]); }
+        pushRow(s.rel === "<" ? s.lin : s.lin.scale(-1), [e, -1]); pushRow(new Lin(0), [e, -1]);
       });
       // tiny ridge on user vars keeps under-determined layouts unique and well-conditioned
       for (let i = 0; i < nv; i++) Q[i * n + i] += 1e-7;

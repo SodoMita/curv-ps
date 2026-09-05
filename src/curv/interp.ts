@@ -2,7 +2,7 @@
 // an F-Rep tree (shapes.ts); user functions inside make_shape are compiled to
 // shader code by subcurv.ts; `solve { ... }` blocks compile to a psolve problem.
 import { parse, CurvError, type Expr, type Def, type Pat, type ListItem, type Stmt } from "./parser";
-import { Lin, Quad, Cons, Problem, STRENGTH, type Rel } from "../psolve/constraints";
+import { Lin, Quad, Cons, Problem, STRENGTH, type Rel, type ConstraintResult } from "../psolve/constraints";
 import { Shape, type SNode, type RGBA, type BBox, type ShaderFn, type GenCtx, genShape, bboxOf, structKey } from "./shapes";
 import { measureText, type Atlas } from "../gpu/atlas";
 import { PRELUDE } from "./prelude";
@@ -19,7 +19,7 @@ export class Fn {
 export type Value = number | string | boolean | null | Value[] | Rec | Fn | Shape | Lin | Quad | Cons;
 
 export interface SolveTrace {
-  line: number; engine: string; status: string; ok: boolean; timeMs: number; iterations: number;
+  line: number; engine: string; status: string; ok: boolean; timeMs: number; iterations: number; cached: boolean;
   nVars: number; nCons: number; eliminated: number; objective: number; violations: { label: string; amount: number }[];
   values: { name: string; value: string }[];
   boxes: { x: number; y: number; w: number; h: number }[];
@@ -158,6 +158,11 @@ function parseCached(src: string): Expr {
   const ast = parse(src); lastSrc = src; lastAst = ast; return ast;
 }
 
+// ---------- solve cache: the interpreter re-runs the whole program every frame; a solve { } block
+// whose numeric problem (fingerprint) did not change since the last evaluation reuses its result.
+const solveCache = new Map<number, { fp: string; res: ConstraintResult }>();
+export function resetSolveCache() { solveCache.clear(); }
+
 // ---------- interpreter ----------
 export class Interp {
   traces: SolveTrace[] = []; usesTime = false; usesMouse = false; usesViewport = false; params: ParamDesc[] = [];
@@ -188,7 +193,7 @@ export class Interp {
       const r = genShape(g, node, { t: "v2", s: "p0" }, ctx);
       const body = `const p0 = [x, y];\n${g.code()}\nreturn [${r.d.s}, ${r.c.s}];`;
       const fn = new Function("P", "R", "x", "y", "T", body) as (P: number[], R: unknown, x: number, y: number, T: number) => [number, number[]];
-      const R = makeJSRuntime(() => 0.5); const P = g.params;
+      const R = makeJSRuntime(() => 0.5); const P = g.finalParams();
       c = { dist: (x, y, t) => fn(P, R, x, y, t)[0], colour: (x, y, t) => fn(P, R, x, y, t)[1].slice(0, 3) };
       this.cpuFns.set(node, c);
     }
@@ -231,7 +236,7 @@ export class Interp {
     };
     for (const [n, [f, gname]] of Object.entries(M)) b(n, scUnary(fn1(n, (a, l) => mapNum(f, a, l)), gname));
     const reduceF = (name: string, f: (a: number, c: number) => number, init: number, gname: string) => {
-      const fn = fn1(name, (a, l) => { const xs = isList(a) ? a : [a]; if (xs.some(isList)) return xs.reduce<Value>((acc, x) => (isList(acc) ? acc.map((v, i) => f(num(v), num((x as Value[])[i]))) : x), xs[0]); return xs.map((x) => num(x, "number", l)).reduce(f, init); });
+      const fn = fn1(name, (a, l) => { const xs = isList(a) ? a : [a]; if (xs.some(isList)) return xs.reduce<Value>((acc, x) => (isList(acc) ? acc.map((v, i) => f(num(v), num((x as Value[])[i]))) : x), xs[0]); return xs.map((x) => num(x, "number", l)).reduce((acc, x) => f(acc, x), init); }); // (never hand `f` to reduce directly: Math.max(acc, x, index, array) is NaN)
       fn.sc = (sc, a, l) => { if (sc.allStatic([a])) return sc.static(fn.call(sc.staticValue(a, l), l)); const items = sc.items(a, l); if (!items) return a; let acc = sc.toE(items[0], l); for (let i = 1; i < items.length; i++) acc = gname === "+" ? sc.g.bin("+", acc, sc.toE(items[i], l)) : sc.g.fn(gname, [acc, sc.toE(items[i], l)]); return sc.dyn(acc); };
       return b(name, fn);
     };
@@ -266,6 +271,19 @@ export class Interp {
     b("repr", fn1("repr", (a) => show(a)));
     b("fields", fn1("fields", (a, l) => [...rec(a, l).f.keys()]));
     b("text_width", fn2("text_width", (t, s, l) => measureText(this.atlas, typeof t === "string" ? t : show(t), num(s, "font size", l))));
+    // intrinsic size of a label as (w, h): h is the font's line height (ascent + descent ≈ 1.25 em)
+    b("text_size", fn2("text_size", (t, s, l) => { const sz = num(s, "font size", l); return [measureText(this.atlas, typeof t === "string" ? t : show(t), sz), sz * 1.25]; }));
+    // --- constraint strengths: tag constraint values so a combinator can mix priorities
+    //     strength "weak" (same_w items)   ·   weight 5 (a == b)   ·   soft c  (= strength "weak")
+    const tagCons = (v: Value, f: (c: Cons) => Cons, l?: number): Value => {
+      if (v instanceof Cons) return f(v);
+      if (isList(v)) return v.map((x) => tagCons(x, f, l));
+      if (typeof v === "boolean" || v === null) return v; // a constraint that folded to a constant
+      throw err(`Expected a constraint (or a list of constraints), got ${typeName(v)}`, l);
+    };
+    b("strength", fn2("strength", (sName, c, l) => { if (typeof sName !== "string" || !(sName in STRENGTH)) throw err('strength expects "weak", "medium", "strong" or "required"', l); const w = STRENGTH[sName]; return tagCons(c, (k) => k.withWeight(w), l); }));
+    b("weight", fn2("weight", (w, c, l) => { const k = num(w, "weight", l); if (!(k > 0)) throw err("weight must be positive", l); return tagCons(c, (x) => x.withWeight((x.weight === undefined || x.weight === Infinity ? STRENGTH.weak : x.weight) * k), l); }));
+    b("soft", fn1("soft", (c, l) => tagCons(c, (k) => k.withWeight(STRENGTH.weak), l)));
     b("print", fn1("print", (a) => { console.log("[curv]", show(a)); return null; }));
     b("error", fn1("error", (a, l) => { throw err(typeof a === "string" ? a : show(a), l); }));
     // --- colours
@@ -576,6 +594,11 @@ export class Interp {
     const addValue = (v: Value, weight: number, label: string, ln: number, strict: boolean) => {
       if (v instanceof Cons) {
         const { lin, rel } = v;
+        if (v.weight !== undefined) { // explicit `strength`/`weight` tag inside a combinator wins over the statement's
+          weight = v.weight;
+          const nm = weight === Infinity ? "required" : weight >= STRENGTH.strong ? "strong" : weight >= STRENGTH.medium ? "medium" : "weak";
+          label = label.replace(/^\w+/, nm + (weight !== Infinity && ![STRENGTH.strong, STRENGTH.medium, STRENGTH.weak].includes(weight) ? ` ×${+weight.toPrecision(3)}` : ""));
+        }
         if (lin.isConst()) { const c = lin.c; const ok = rel === "=" ? Math.abs(c) < 1e-9 : rel === "<" ? c <= 1e-9 : c >= -1e-9; if (!ok && weight === Infinity) throw err(`Constraint on line ${v.line ?? ln} is constant and false`, v.line ?? ln); return; }
         prob.addConstraint({ lin, rel, weight, label: v.line && v.line !== ln ? `${label} (from line ${v.line})` : label }); nCons++; return;
       }
@@ -616,7 +639,11 @@ export class Interp {
       }
     };
     exec(stmts, env);
-    const res = prob.solve();
+    const fp = prob.fingerprint();
+    const hit = solveCache.get(line);
+    const cached = hit !== undefined && hit.fp === fp;
+    const res = cached ? hit.res : prob.solve();
+    if (!cached) { if (solveCache.size > 256) solveCache.clear(); solveCache.set(line, { fp, res }); }
     const subst = (v: Value): Value => {
       if (v instanceof Lin) return res.ok ? v.eval(res.values) : 0;
       if (isList(v)) return v.map(subst);
@@ -636,7 +663,7 @@ export class Interp {
       else shown.push({ name: d.name, value: showSolved(v) });
     }
     out.f.set("solver", new Rec(new Map<string, Value>([["status", res.statusText], ["ok", res.ok], ["engine", res.engine], ["objective", res.objective], ["iterations", res.iterations], ["time_ms", res.timeMs]])));
-    this.traces.push({ line, engine: res.reducedVars === 0 ? "presolve" : res.engine, status: res.statusText, ok: res.ok, timeMs: res.timeMs, iterations: res.iterations, nVars: prob.names.length, nCons, eliminated: res.eliminated ?? 0, objective: res.objective, violations: res.violations, values: shown, boxes });
+    this.traces.push({ line, engine: res.reducedVars === 0 ? "presolve" : res.engine, status: res.statusText, ok: res.ok, timeMs: cached ? 0 : res.timeMs, iterations: res.iterations, cached, nVars: prob.names.length, nCons, eliminated: res.eliminated ?? 0, objective: res.objective, violations: res.violations, values: shown, boxes });
     if (!res.ok) throw err(`solve on line ${line} failed: ${res.statusText} (${res.engine})`, line);
     return out;
   }
@@ -663,12 +690,12 @@ export function compileTree(node: SNode, atlas: Atlas, target: "wgsl" | "js", pr
   const g: Gen = target === "wgsl" ? new WGSL() : new JS();
   const ctx: GenCtx = { atlas, zoom: { t: "f", s: target === "wgsl" ? "u.cam.z" : "zoom" }, time: { t: "f", s: target === "wgsl" ? "u.time" : "T" }, cull: true, defaultColour };
   const r = genShape(g, node, { t: "v2", s: "p0" }, ctx);
-  return { code: g.code(), d: r.d.s, c: r.c.s, params: new Float32Array(g.params), key, reused: false };
+  return { code: g.code(), d: r.d.s, c: r.c.s, params: new Float32Array(g.finalParams()), key, reused: false };
 }
 /** Only the parameter buffer of a tree, in codegen order (see ParamsOnly). */
 export function collectParams(node: SNode, atlas: Atlas, defaultColour: RGBA = DEFAULT_COLOUR): Float32Array {
   const g = new ParamsOnly();
   genShape(g, node, { t: "v2", s: "" }, { atlas, zoom: { t: "f", s: "" }, time: { t: "f", s: "" }, cull: true, defaultColour });
-  return new Float32Array(g.params);
+  return new Float32Array(g.finalParams());
 }
 export { Shape, DEFAULT_COLOUR };
