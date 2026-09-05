@@ -1,4 +1,4 @@
-# Curv+solve — handoff (dev round 8)
+# Curv+solve — handoff (dev round 9)
 
 Browser playground for **Curv** (2D F-Rep, compiled to WGSL / JS) extended with
 `solve { }` constraint blocks solved by **psolve** (LP + convex QP, WebAssembly).
@@ -16,6 +16,26 @@ Headless checks (all use the JS backend, no browser needed):
 All four were green at the end of this round (`paramcheck` and `memotest` exit 1 on any failure — check the exit code).
 
 ## What changed in this round
+
+1. **Shared prelude environment** (`Interp.run`).  The prelude (≈60 defs: palette, box helpers, layout
+   combinators, UI components) is bind-time pure, so it is evaluated **once per process** into a shared
+   `Env` whose vars map is read-only afterwards; each run re-points `sharedPrelude.parent` at the fresh
+   builtins env (which carries this frame's `time`/`mouse`/`viewport`), so names inside prelude bodies
+   resolve against the current frame.  The user program evaluates in a child of a **shallow copy** of the
+   shared map, so assignments to prelude names (`surface := …`) stay frame-local.  Closures dispatch their
+   bodies through a module-level `activeInterp` (set by `run`) instead of the instance that created them —
+   prelude closures and call-memoised closures returned across frames now execute against the current
+   frame's `inputs`/`traces`/memo bookkeeping.  Effects: ~35 % less fixed per-run overhead (156 → 125 µs
+   for a trivial program: no 60-def `bindDefs` per frame), and stable prelude `Fn` identity keeps
+   `fnHashMemo` (and thus block/call key hashing) warm across frames.
+2. **Codegen LRU by structural key** (`compileTree`).  A `key !== null` tree that was compiled before (cap
+   32, per backend) reuses its `code`/`d`/`c`/`usesTime` and only walks for parameters — hopping back to a
+   previous example no longer pays `genShape` (1–5 ms), matching the renderer's pipeline cache.
+3. **memotest prelude section** (31 cases total): assignments to prelude names are visible in the frame
+   that makes them and gone in the next; prelude combinators keep memoising across programs; prelude
+   functions stored in lists/lambdas resolve on every frame.
+
+## Round 8 recap (kept from the round-8 handoff — all still in force)
 
 1. **App static-frame skip** (`src/App.tsx` `evaluate`).  After a successful evaluation, if the program read no
    `time`/`mouse`/`viewport` (`usesTime || CompiledTree.usesTime` covers the shader side too), its
@@ -82,9 +102,10 @@ All four were green at the end of this round (`paramcheck` and `memotest` exit 1
 src/curv/parser.ts      lexer + parser (Curv syntax + solve/var/weak:/minimize statements)
 src/curv/freevars.ts    static free-variable analysis (blocks + closure bodies), astId; FreeInfo.why
 src/curv/interp.ts      tree-walking interpreter, builtins (Fn.key), Cons values + strength tags,
-                        solve { } → block memo → fingerprint cache (astId + LRU) → psolve Problem,
+                        shared prelude env + activeInterp dispatch, solve { } → block memo →
+                        fingerprint cache (astId + LRU) → psolve Problem,
                         call memo (applyMemo/ValueHasher/CALL_* knobs, envEpoch, setVar, fnHashMemo),
-                        compileTree (structural-key reuse) / collectParams / collectParamsFast
+                        compileTree (structural-key reuse + codeLru) / collectParams / collectParamsFast
 src/curv/subcurv.ts     SubCurv: compiles user dist/colour functions to shader code (inlining, loops);
                         tags the point argument, reports time reads (Gen.usesTime)
 src/curv/shapes.ts      SNode F-Rep tree, bboxOf (memoised), textMetrics/textGlyphs, nodeHash (memoised),
@@ -147,17 +168,23 @@ scripts/                selftest, paramcheck, memotest, prof (headless, tsx)
   it (that is why the overlay stroke width is a constant and fitting is one evaluation, not two).
 * `Interp.run` must stay idempotent (App re-runs on the same instance for the fit retry): reset all
   per-instance state at the top.
+* The **prelude must stay bind-time pure**: no `time`/`mouse`/`viewport`/`parametric` reads, no `solve`,
+  no side effects in definitions (function *bodies* may call `text_size`; those are evaluated per call).
+  The shared prelude vars map must **never** be written after the first bind (user assignments land in the
+  per-run copy); don't add prelude defs for host-state-dependent values.
+* New `Fn`-producing helpers must dispatch body evaluation through `activeInterp` (as `makeClosure` does)
+  so shared / memoised closures execute against the current frame.
+* `codeLru` entries must only ever depend on (backend, structural key): anything else baked into code
+  (colours, atlas constants that can differ per document) would need to join the key.
 
 ## Known gaps / next steps
 
 * Eval of the *rest* of an animated cached frame (top-level `union`, builtin pipelines `s >> colour …`,
   record construction) is all that remains on warm frames: dashboard ≈ 0.6–1.4 ms raw (noisy sandbox; in
-  the App static examples skip evaluation entirely).  Candidate: **share the prelude environment across
-  runs** — one shared `Env.vars` map with per-frame parent, prelude closures dispatching through an
-  indirection to the *current* Interp (they capture the creating instance today, which is the blocker).
-  It would skip ~50 `bindDefs` per frame AND make prelude `Fn` hashes (`fnHashMemo`) warm across frames.
-  Requires proving the prelude never reads `time`/`mouse`/`viewport` and re-routing flag/trace side
-  effects of nested calls to the right interp — left out of round 8 as too invasive for the win.
+  the App static examples skip evaluation entirely).  The prelude is shared per-process as of round 9;
+  what's left is per-frame allocation of the *user* tree (records, `SNode`s) and `builtins()` (~100 fresh
+  `Fn`s per run — could be shared the same way once a similar purity proof is made; `time`/`mouse`/
+  `viewport` are *values* there, so the shared parts and the per-frame parts would have to be split).
 * The shader-only-time fast path keeps the quality scale while animating; settling to full resolution
   only happens on pause / interactions (a settle tick that schedules itself per frame was judged too
   finicky).
