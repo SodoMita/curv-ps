@@ -44,7 +44,7 @@ for (const ex of list) {
     ctx.putImageData(img, 0, 0);
     const t3 = performance.now();
     writeFileSync(`/tmp/t/${ex.id}.png`, cv.toBuffer("image/png"));
-    console.log(`OK  ${ex.id.padEnd(14)} eval ${(t1 - t0).toFixed(1)}ms  codegen ${(t2 - t1).toFixed(1)}ms  cpu-render ${(t3 - t2).toFixed(0)}ms  params=${js.params.length} wgsl=${wg.code.length}b lines=${wg.code.split("\n").length} ${ui ? "ui" : "curv"} bbox=${bb ? bb.map((x) => x.toFixed(1)).join(",") : "inf"} ${r.params.length ? "sliders=" + r.params.map((p) => p.name).join(",") : ""}`);
+    console.log(`OK  ${ex.id.padEnd(14)} ${r.usesTime ? "anim " : wg.usesTime ? "anim(shader) " : ""}eval ${(t1 - t0).toFixed(1)}ms  codegen ${(t2 - t1).toFixed(1)}ms  cpu-render ${(t3 - t2).toFixed(0)}ms  params=${js.params.length} wgsl=${wg.code.length}b lines=${wg.code.split("\n").length} ${ui ? "ui" : "curv"} bbox=${bb ? bb.map((x) => x.toFixed(1)).join(",") : "inf"} ${r.params.length ? "sliders=" + r.params.map((p) => p.name).join(",") : ""}`);
     if (want.includes("--wgsl")) console.log(wg.code);
   } catch (e: any) { fails++; console.log(`ERR ${ex.id}: ${e.message} (line ${e.line})`); if (want.includes("--stack")) console.log(e.stack); }
 }

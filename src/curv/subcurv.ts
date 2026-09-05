@@ -10,7 +10,7 @@ import type { GenCtx } from "./shapes";
 
 export type CV =
   | { kind: "static"; v: Value; lit?: boolean }
-  | { kind: "dyn"; e: E }
+  | { kind: "dyn"; e: E; pt?: boolean; time?: boolean } // pt: the [x,y,z,t] point argument of a shader function; time: its t component
   | { kind: "var"; ref: E }
   | { kind: "list"; items: CV[] }
   | { kind: "cfn"; params: Pat[]; body: Expr; env: CEnv; name: string };
@@ -85,7 +85,8 @@ export class SC {
     if (c.kind === "static") return Array.isArray(c.v) ? c.v.map((x) => ({ kind: "static", v: x, lit: c.lit })) : null;
     const e = this.toE(c, line); if (e.t === "f" || e.t === "b") return null;
     const t = this.g.let(e); const n = e.t === "v2" ? 2 : e.t === "v3" ? 3 : 4;
-    return Array.from({ length: n }, (_, i) => ({ kind: "dyn", e: this.g.idx(t, i) }));
+    const pt = c.kind === "dyn" && c.pt === true;
+    return Array.from({ length: n }, (_, i) => ({ kind: "dyn", e: this.g.idx(t, i), time: pt && i === 3 }));
   }
   allStatic(cs: CV[]): boolean { return cs.every((c) => c.kind === "static" || (c.kind === "list" && this.allStatic(c.items))); }
   staticValue(c: CV, line?: number): Value {
@@ -130,9 +131,10 @@ export class SC {
     if (i.kind === "list" && i.items.length === 1) i = i.items[0];
     if (c.kind === "static" && (i.kind === "static")) return this.static(this.it.index(c.v, i.v, line));
     const idxs = i.kind === "static" && Array.isArray(i.v) ? i.v : i.kind === "list" ? i.items.map((x) => this.staticValue(x, line)) : null;
-    if (idxs) { const t = this.g.let(this.toE(c, line)); return this.dyn(this.g.swz(t, idxs.map((k) => { if (!isNum(k)) throw err("Index must be a number", line); return k; }))); }
+    if (idxs) { if (c.kind === "dyn" && c.pt && idxs.includes(3)) this.g.usesTime = true; const t = this.g.let(this.toE(c, line)); return this.dyn(this.g.swz(t, idxs.map((k) => { if (!isNum(k)) throw err("Index must be a number", line); return k; }))); }
     if (i.kind === "static" && isNum(i.v)) {
       if (c.kind === "list") return c.items[i.v] ?? (() => { throw err(`Index ${i.v} out of range`, line); })();
+      if (c.kind === "dyn" && c.pt && i.v === 3) this.g.usesTime = true; // p.[3] / p.[T] of the point argument is the time
       return this.dyn(this.g.idx(this.g.let(this.toE(c, line)), i.v));
     }
     // dynamic index into a small static list: select chain
@@ -150,8 +152,9 @@ export class SC {
       case "str": case "bool": return this.static(e.v, true);
       case "null": return this.static(null, true);
       case "id": {
-        if (e.name === "time") this.it.usesTime = true;
+        if (e.name === "time") this.it.usesTime = this.g.usesTime = true;
         const v = env.lookup(e.name); if (v === undefined) throw err(`Unknown identifier '${e.name}'`, e.line);
+        if (v.kind === "dyn" && v.time) this.g.usesTime = true; // the t of `[x,y,z,t]` — the program animates through the shader uniform
         if (v.kind === "static" && (e.name === "pi" || e.name === "tau" || e.name === "e" || e.name === "inf" || e.name === "deg")) return { ...v, lit: true };
         return v;
       }
@@ -314,7 +317,7 @@ export function compileFnAt(it: Interp, g: Gen, f: Value, p: E, ctx: GenCtx, lin
   if (!(f instanceof Fn)) throw err(`Expected a function, got ${typeName(f)}`, line);
   const sc = new SC(g, it, ctx);
   try {
-    const r = sc.call(sc.static(f), sc.dyn(p), line);
+    const r = sc.call(sc.static(f), { kind: "dyn", e: p, pt: p.t === "v4" }, line);
     return sc.toE(r, line);
   } catch (e) {
     if (e instanceof GenError) throw err(`${f.name}: ${e.message}`, line);

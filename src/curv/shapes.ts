@@ -204,6 +204,61 @@ function weightRaw(n: SNode): number {
 /** Shared by codegen and the structural key: does `kidCulled` wrap this subtree in a bbox test? */
 const cullable = (s: SNode, atlas: Atlas, cull: boolean) => cull && weight(s) >= 4 && finiteBBox(bboxOf(s, atlas)) !== null;
 
+// ---------------------------------------------------------------- content hash
+/** 64-bit FNV-1a style hash of a string, as 16 hex chars (two independent 32-bit lanes). */
+export function hashStr(s: string, h1 = 0x811c9dc5, h2 = 0x01000193): string {
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 0x01000193); h2 = Math.imul(h2 ^ c, 0x5bd1e995) ^ (h2 >>> 15);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 0x85ebca6b) ^ (h1 >>> 13); h2 = Math.imul(h2 ^ (h2 >>> 16), 0xc2b2ae35) ^ (h2 >>> 13);
+  return (h1 >>> 0).toString(16).padStart(8, "0") + (h2 >>> 0).toString(16).padStart(8, "0");
+}
+const nhMemo = new WeakMap<SNode, string | null>();
+/**
+ * Content hash of a shape tree: kind, every number / string, children — everything the
+ * evaluator can observe about a shape (bbox, distance, colour, generated code).  Two nodes
+ * with the same hash are interchangeable.  Memoised per node (nodes are immutable); null when
+ * the tree contains user shader functions, whose captured environment is not hashable here.
+ * Used by the solve-block / call memo so shape-valued inputs take part in cache keys.
+ */
+export function nodeHash(n: SNode): string | null {
+  let h = nhMemo.get(n);
+  if (h === undefined) { h = nodeHashRaw(n); nhMemo.set(n, h); }
+  return h;
+}
+function nodeHashRaw(n: SNode): string | null {
+  const kids = (ks: SNode[]): string | null => { let s = ""; for (const k of ks) { const h = nodeHash(k); if (h === null) return null; s += h; } return s; };
+  const one = (k: SNode, head: string): string | null => { const h = nodeHash(k); return h === null ? null : hashStr(head + "|" + h); };
+  switch (n.k) {
+    case "circle": return hashStr("ci" + n.r);
+    case "rect": return hashStr("re" + n.w + "," + n.h + "," + n.r);
+    case "seg": return hashStr("sg" + n.x1 + "," + n.y1 + "," + n.x2 + "," + n.y2 + "," + n.th);
+    case "ellipse": return hashStr("el" + n.a + "," + n.b);
+    case "nothing": return hashStr("no"); case "everything": return hashStr("ev");
+    case "half": return hashStr("ha" + n.nx + "," + n.ny + "," + n.d);
+    case "ngon": return hashStr("ng" + n.n + "," + n.r);
+    case "poly": return hashStr("po" + n.pts.length + ":" + n.pts.join(","));
+    case "text": return hashStr("tx" + n.align + n.size + ":" + n.text);
+    case "union": case "inter": case "sunion": case "sinter": { const s = kids(n.kids); return s === null ? null : hashStr(n.k + ("s" in n ? n.s : "") + "|" + n.kids.length + "|" + s); }
+    case "diff": case "sdiff": case "morph": { const a = nodeHash(n.a), b = nodeHash(n.b); return a === null || b === null ? null : hashStr(n.k + ("s" in n ? n.s : "t" in n ? n.t : "") + "|" + a + "|" + b); }
+    case "round": return one(n.s, "ro" + n.r);
+    case "stroke": return one(n.s, "st" + n.w);
+    case "complement": return one(n.s, "co");
+    case "lipschitz": return one(n.s, "li" + n.lip);
+    case "colour": return one(n.s, "cl" + n.c.join(","));
+    case "opacity": return one(n.s, "op" + n.a);
+    case "grad": return one(n.s, "gr" + n.c1.join(",") + ";" + n.c2.join(",") + ";" + n.x0 + "," + n.y0 + "," + n.x1 + "," + n.y1);
+    case "shadow": return one(n.s, "sh" + n.dx + "," + n.dy + "," + n.blur + "," + n.a);
+    case "xform": return one(n.s, "xf" + n.tx + "," + n.ty + "," + n.rot + "," + n.sc);
+    case "stretch": return one(n.s, "sx" + n.sx + "," + n.sy);
+    case "reflect": return one(n.s, "rf" + n.nx + "," + n.ny);
+    case "repeat": return one(n.s, "rp" + n.kind + n.a + "," + n.b);
+    case "swirl": return one(n.s, "sw" + n.strength + "," + n.d);
+    case "colourfn": case "custom": return null;
+  }
+}
+
 // ---------------------------------------------------------------- structural key
 /**
  * A string that identifies the *shape* of the generated code: node kinds, tree layout and the
@@ -212,29 +267,39 @@ const cullable = (s: SNode, atlas: Atlas, cull: boolean) => cull && weight(s) >=
  * parameters in the same order, so the second one can reuse the first one's pipeline and
  * only refill the parameter buffer (see `collectParams`).  Returns null when the tree contains
  * user shader functions (`make_shape`, `colour f`), whose code depends on captured values.
+ *
+ * Memoised per subtree and cull flag (nodes are immutable), so subtrees shared inside one
+ * frame (`shadow` visits its child twice, a shape used in several places) and subtrees that
+ * survive across frames through the call memo are keyed once.
  */
+const skMemo: [WeakMap<SNode, string | null>, WeakMap<SNode, string | null>] = [new WeakMap(), new WeakMap()];
 export function structKey(n: SNode, atlas: Atlas, cull = true): string | null {
-  const parts: string[] = [];
-  const walk = (n: SNode, cull: boolean): boolean => {
-    parts.push(n.k);
-    const kidC = (s: SNode) => { parts.push(cullable(s, atlas, cull) ? "[" : "("); const ok = walk(s, cull); parts.push(")"); return ok; };
-    const plain = (s: SNode) => { parts.push("("); const ok = walk(s, false); parts.push(")"); return ok; };
-    switch (n.k) {
-      case "circle": case "rect": case "seg": case "ellipse": case "nothing": case "everything": case "half": case "ngon": return true;
-      case "poly": parts.push(String(n.pts.length)); return true;
-      case "text": parts.push(n.align); return true; // content and length are parameters
-      case "union": case "inter": { let ok = true; for (const k of n.kids) ok = kidC(k) && ok; return ok; }
-      case "sunion": case "sinter": { let ok = true; for (const k of n.kids) ok = plain(k) && ok; return ok; }
-      case "diff": return kidC(n.a) && kidC(n.b);
-      case "sdiff": case "morph": return plain(n.a) && plain(n.b);
-      case "round": case "stroke": case "complement": case "lipschitz": case "stretch": case "repeat": case "swirl": if (n.k === "repeat") parts.push(n.kind); return plain(n.s);
-      case "shadow": { const ok = plain(n.s); parts.push("("); const ok2 = walk(n.s, cull); parts.push(")"); return ok && ok2; }
-      case "xform": parts.push(n.sc === 1 ? "1" : "s"); { parts.push("("); const ok = walk(n.s, cull); parts.push(")"); return ok; }
-      case "colour": case "opacity": case "grad": case "reflect": { parts.push("("); const ok = walk(n.s, cull); parts.push(")"); return ok; }
-      case "colourfn": case "custom": return false;
-    }
-  };
-  return walk(n, cull) ? parts.join("") : null;
+  const memo = skMemo[cull ? 1 : 0];
+  let k = memo.get(n);
+  if (k === undefined) { k = structKeyRaw(n, atlas, cull); memo.set(n, k); }
+  return k;
+}
+function structKeyRaw(n: SNode, atlas: Atlas, cull: boolean): string | null {
+  const kidC = (s: SNode) => { const k = structKey(s, atlas, cull); return k === null ? null : (cullable(s, atlas, cull) ? "[" : "(") + k + ")"; };
+  const plain = (s: SNode) => { const k = structKey(s, atlas, false); return k === null ? null : "(" + k + ")"; };
+  const wrap = (s: SNode) => { const k = structKey(s, atlas, cull); return k === null ? null : "(" + k + ")"; };
+  const many = (ks: SNode[], f: (s: SNode) => string | null) => { let out = ""; for (const k of ks) { const s = f(k); if (s === null) return null; out += s; } return out; };
+  const cat = (...ps: (string | null)[]) => { let out = n.k; for (const p of ps) { if (p === null) return null; out += p; } return out; };
+  switch (n.k) {
+    case "circle": case "rect": case "seg": case "ellipse": case "nothing": case "everything": case "half": case "ngon": return n.k;
+    case "poly": return n.k + n.pts.length;
+    case "text": return n.k + n.align; // content and length are parameters
+    case "union": case "inter": return cat(many(n.kids, kidC));
+    case "sunion": case "sinter": return cat(many(n.kids, plain));
+    case "diff": return cat(kidC(n.a), kidC(n.b));
+    case "sdiff": case "morph": return cat(plain(n.a), plain(n.b));
+    case "repeat": return cat(n.kind, plain(n.s));
+    case "round": case "stroke": case "complement": case "lipschitz": case "stretch": case "swirl": return cat(plain(n.s));
+    case "shadow": return cat(plain(n.s), wrap(n.s));
+    case "xform": return cat(n.sc === 1 ? "1" : "s", wrap(n.s));
+    case "colour": case "opacity": case "grad": case "reflect": return cat(wrap(n.s));
+    case "colourfn": case "custom": return null;
+  }
 }
 
 // ---------------------------------------------------------------- codegen

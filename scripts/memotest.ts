@@ -21,7 +21,8 @@ const cases: [string, string, boolean][] = [ // [name, src, expectMemoisable]
   ["viewport", `(solve { var a : num; a == viewport.w; }).a`, true],
   ["text_size of animated label", `let t = if (time < 1.5) "i" else "mmm"; in (solve { var a : num; a == (text_size t 12).[X]; }).a`, true],
   ["assign outer (impure)", `do local s = 0; local L = solve { var a : num; s := time; a == s; }; in L.a`, false],
-  ["shape input", `let s = circle (10 + time); in (solve { var a : num; a == (bbox_box s).w; }).a`, false],
+  ["shape input", `let s = circle (10 + time); in (solve { var a : num; a == (bbox_box s).w; }).a`, true],
+  ["custom shape input (unhashable)", `let s = make_shape { dist p = p.[X] - time; bbox = [[-1,-1,0],[1,1,0]]; is_2d = true }; in (solve { var a : num; a == s.bbox.[1].[X] + time; }).a`, false],
 ];
 let fails = 0;
 for (const [name, src, expectMemo] of cases) {
@@ -46,5 +47,53 @@ if (fails) process.exitCode = 1;
   const ok = vals(a) === "10,20" && vals(b) === "10,20" && b.traces.length === 2 && b.traces.every((t) => t.cacheKind === "block");
   if (!ok) fails++;
   console.log(`${ok ? "OK " : "ERR"} ${"two evaluations per frame".padEnd(28)} ${vals(b)} memo=${b.traces.map((t) => t.cacheKind ?? "none").join("/")}`);
+}
+
+// ---- call memo: pure user functions are memoised across frames once profiling says they are worth it.
+// Each program is evaluated for several frames at t=1 (warm-up past the measuring phase), then at t=2.
+// Values must be identical for identical inputs, differ when a (possibly indirect) input differs, and
+// the number of solve traces must not change between a cold and a memoised frame.
+console.log("\ncall memo");
+const W = "count [for (i in 0..300) i]"; // makes a body expensive enough to be memoised
+const ccases: [string, string, boolean, boolean][] = [ // [name, src, expectHits, expectTimeDependent]
+  ["const arg", `let f x = (bbox_box (union [for (i in 0..12) circle (x + i) >> translate (i, 0)])).w + ${W}; in f 3 + f 3 + f 4`, true, false],
+  ["reads time", `let f x = x + time + ${W}; in [for (i in 0..5) f i]`, true, true],
+  ["reads time via closure arg", `let g = x -> x + time; f h = h 1 + ${W}; in [for (i in 0..5) f g]`, true, true],
+  ["reads mouse via outer let", `let m = mouse.x; f x = x + m + ${W}; in [for (i in 0..5) f i]`, true, true],
+  ["shape arg", `let f s = (bbox_box s).w + ${W}; in [for (i in 0..5) f (circle (10 + time))]`, true, true],
+  ["assigns outer (impure)", `do local s = 0; local f x = do s := s + x + ${W}; in s; in [for (i in 0..5) f 1] >> map (x -> x + time)`, false, true],
+  ["prints", `let f x = do print x; in x + ${W}; in [for (i in 0..5) f 1] >> map (x -> x + time)`, false, true],
+  ["parametric inside", `let f x = parametric k :: slider[0,1] = 0.5; in x + k + ${W}; in [for (i in 0..5) f 1] >> map (x -> x + time)`, false, true],
+  ["closure over later-mutated var", `let f h = h 1 + ${W}; in do local k = time; local g = x -> x + k; local a = f g; k := k + 100; local b = f g; in [a, b, f g]`, true, true],
+  ["solve block inside", `let f w = (solve { var b : box; b.w == w + time; b.h == 10; b.x == 0; b.y == 0; }).b.w + ${W}; in [for (i in 0..5) f i]`, true, true],
+  ["recursive", `let f n = if (n <= 1) n + ${W} else f (n - 1) + f (n - 2); in f 8 + time`, true, true],
+];
+for (const [name, src, expectHits, expectTimeDep] of ccases) {
+  resetSolveCache();
+  const run = (t: number) => new Interp(atlas, { viewport: { x: 0, y: 0, w: 900, h: 600 }, time: t, mouse: { x: 10 * t, y: 5, down: false } }).run(src);
+  try {
+    const show = (v: unknown) => JSON.stringify(v);
+    const cold = run(1); let warm = cold;
+    for (let i = 0; i < 6; i++) warm = run(1);
+    const other = run(2), other2 = run(2);
+    const same = show(cold.value) === show(warm.value) && show(other.value) === show(other2.value);
+    const dep = show(cold.value) !== show(other.value);
+    const hits = warm.callMemo.hits > 0;
+    const traces = cold.traces.length === warm.traces.length && warm.traces.every((t) => t.cached);
+    const ok = same && dep === expectTimeDep && hits === expectHits && traces;
+    if (!ok) fails++;
+    console.log(`${ok ? "OK " : "ERR"} ${name.padEnd(30)} hits=${warm.callMemo.hits}/${warm.callMemo.misses + warm.callMemo.hits}${hits !== expectHits ? ` (expected ${expectHits ? "hits" : "no hits"})` : ""}${same ? "" : " VALUES DIFFER FOR SAME INPUTS"}${dep === expectTimeDep ? "" : " time-dependence wrong"}${traces ? "" : " TRACES DIFFER"}  ${show(warm.value).slice(0, 40)}`);
+  } catch (e: any) { fails++; console.log(`ERR ${name}: ${e.message}`); }
+}
+// node identity: a memoised shape-valued call returns the very same tree across frames (bbox / key memos hit)
+{
+  resetSolveCache();
+  const src = `let f x = union [for (i in 0..12) circle (x + i) >> translate (i, 0)]; in f 3`;
+  const run = () => new Interp(atlas, { viewport: { x: 0, y: 0, w: 1, h: 1 }, time: 0, mouse: { x: 0, y: 0, down: false } }).run(src);
+  let a = run(); for (let i = 0; i < 6; i++) a = run();
+  const b = run();
+  const ok = a.shape === b.shape && a.shape !== null;
+  if (!ok) fails++;
+  console.log(`${ok ? "OK " : "ERR"} ${"node identity across frames".padEnd(30)} same=${a.shape === b.shape}`);
 }
 if (fails) process.exitCode = 1;

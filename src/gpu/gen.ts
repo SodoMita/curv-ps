@@ -14,6 +14,8 @@ export class GenError extends Error {}
 const UNARY = new Set(["sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh", "exp", "log", "log2", "sqrt", "abs", "floor", "ceil", "round", "trunc", "fract", "sign", "normalize", "length", "exp2"]);
 
 export abstract class Gen {
+  /** set by SubCurv when compiled user code reads the time (the `t` of `[x,y,z,t]`, or `time`): the program animates through the time uniform */
+  usesTime = false;
   abstract target: "wgsl" | "js";
   params: number[] = [];
   protected lines: string[] = [];

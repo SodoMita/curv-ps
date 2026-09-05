@@ -30,7 +30,7 @@ export default function App() {
   const [traces, setTraces] = useState<SolveTrace[]>([]);
   const [params, setParams] = useState<ParamDesc[]>([]);
   const [paramValues, setParamValues] = useState<ParamValues>({});
-  const [stats, setStats] = useState({ evalMs: 0, genMs: 0, fps: 0, compileMs: 0, lines: 0, compiles: 0, quality: 1, reused: false, gpuMs: 0, timestamps: false });
+  const [stats, setStats] = useState({ evalMs: 0, genMs: 0, fps: 0, compileMs: 0, lines: 0, compiles: 0, quality: 1, reused: false, gpuMs: 0, timestamps: false, memoHits: 0, memoCalls: 0 });
   const [status, setStatus] = useState<"loading" | "ready" | "failed">("loading");
   const [rendererInfo, setRendererInfo] = useState<{ kind: string; info?: string } | null>(null);
   const [previewPct, setPreviewPct] = useState(100);
@@ -50,6 +50,7 @@ export default function App() {
   const srcRef = useRef(src);
   const dirty = useRef(true);
   const dynamic = useRef({ time: false, mouse: false, viewport: false });
+  const shaderTimeOnly = useRef(false); // time is read only inside compiled shader code: animate by re-rendering, no re-evaluation
   const mousePx = useRef({ x: -1e6, y: -1e6, down: false });
   const clock = useRef({ t0: performance.now(), pausedAt: 0 });
   const pausedRef = useRef(false);
@@ -162,8 +163,10 @@ export default function App() {
       lastProg.current = prog;
       const t2 = performance.now();
       cpuMs.current = t2 - tStart;
-      dynamic.current = { time: res.usesTime, mouse: res.usesMouse, viewport: res.usesViewport };
-      const animating = res.usesTime && !pausedRef.current;
+      const usesTime = res.usesTime || prog.usesTime; // evaluator-side time, or time read inside compiled shader code
+      dynamic.current = { time: usesTime, mouse: res.usesMouse, viewport: res.usesViewport };
+      shaderTimeOnly.current = prog.usesTime && !res.usesTime;
+      const animating = usesTime && !pausedRef.current;
       const q = animating || drag.current ? quality.current : 1;
       if (!rendering.current) {
         rendering.current = true;
@@ -177,8 +180,8 @@ export default function App() {
       }
       if (force || !animating || tStart - lastUi.current > 250) {
         lastUi.current = tStart;
-        setTraces(res.traces); setParams(res.params); setError(null); setAnimated(res.usesTime); setResponsive(res.usesViewport);
-        setStats((s) => ({ ...s, evalMs: t1 - tStart, genMs: t2 - t1, compileMs: r.stats.lastCompileMs, lines: prog.code.split("\n").length, compiles: r.stats.compiles, quality: q, reused: prog.reused, gpuMs: r.stats.gpuMs, timestamps: r.stats.timestamps }));
+        setTraces(res.traces); setParams(res.params); setError(null); setAnimated(usesTime); setResponsive(res.usesViewport);
+        setStats((s) => ({ ...s, evalMs: t1 - tStart, genMs: t2 - t1, compileMs: r.stats.lastCompileMs, lines: prog.code.split("\n").length, compiles: r.stats.compiles, quality: q, reused: prog.reused, gpuMs: r.stats.gpuMs, timestamps: r.stats.timestamps, memoHits: res.callMemo.hits, memoCalls: res.callMemo.hits + res.callMemo.misses }));
       }
     } catch (e) {
       const err = e as CurvError;
@@ -216,7 +219,11 @@ export default function App() {
         }
         f.last = animating ? t : 0;
         const wasDirty = dirty.current; dirty.current = false;
-        evaluate(wasDirty);
+        if (!wasDirty && shaderTimeOnly.current && lastProg.current && renderer.current && !rendering.current) {
+          // the tree cannot change between frames: just draw it again with the new time uniform
+          const r = renderer.current; rendering.current = true; cpuMs.current = 0;
+          r.render(lastProg.current, cam.current, BG[bgRef.current], now(), quality.current).then(() => { rendering.current = false; }).catch((e: Error) => { rendering.current = false; setError({ message: e.message }); });
+        } else evaluate(wasDirty);
         f.n++;
         if (t - f.t > 1000) { const fps = animating ? (f.n * 1000) / (t - f.t) : 0; setStats((s) => (s.fps === fps ? s : { ...s, fps })); f.n = 0; f.t = t; }
       }
@@ -316,7 +323,7 @@ export default function App() {
             <Editor value={src} onChange={setSrc} errorLine={error?.line} />
           </div>
           <div className={cn("shrink-0 border-t border-line px-4 py-2 font-mono text-[11.5px]", error ? "bg-rose-500/10 text-rose-300" : "text-muted")}>
-            {error ? <><span className="font-semibold">error</span>{error.line ? ` (line ${error.line})` : ""}: {error.message}</> : <>✓ {src.split("\n").length} lines · eval {stats.evalMs.toFixed(1)} ms · {stats.reused ? <span title="Shape tree structure unchanged: shader reused, only the parameter buffer was refilled">params {stats.genMs.toFixed(1)} ms</span> : <>codegen {stats.genMs.toFixed(1)} ms</>} · shader {stats.lines} lines{stats.compiles ? ` · ${stats.compiles} compile${stats.compiles > 1 ? "s" : ""} (last ${stats.compileMs.toFixed(0)} ms)` : ""}{stats.fps > 0 ? ` · ${stats.fps.toFixed(0)} fps` : ""}{stats.timestamps && stats.gpuMs > 0 ? <span title="GPU render-pass time (WebGPU timestamp query)">{` · gpu ${stats.gpuMs.toFixed(1)} ms`}</span> : ""}{stats.quality < 1 ? ` · ${Math.round(stats.quality * 100)}% res` : ""}</>}
+            {error ? <><span className="font-semibold">error</span>{error.line ? ` (line ${error.line})` : ""}: {error.message}</> : <>✓ {src.split("\n").length} lines · eval {stats.evalMs.toFixed(1)} ms{stats.memoCalls > 0 ? <span title="Calls of pure user functions answered from the call memo (same function, same arguments and free variables as an earlier evaluation) / calls that were expensive enough to be memoised">{` (${stats.memoHits}/${stats.memoCalls} memo)`}</span> : ""} · {stats.reused ? <span title="Shape tree structure unchanged: shader reused, only the parameter buffer was refilled">params {stats.genMs.toFixed(1)} ms</span> : <>codegen {stats.genMs.toFixed(1)} ms</>} · shader {stats.lines} lines{stats.compiles ? ` · ${stats.compiles} compile${stats.compiles > 1 ? "s" : ""} (last ${stats.compileMs.toFixed(0)} ms)` : ""}{stats.fps > 0 ? ` · ${stats.fps.toFixed(0)} fps` : ""}{stats.timestamps && stats.gpuMs > 0 ? <span title="GPU render-pass time (WebGPU timestamp query)">{` · gpu ${stats.gpuMs.toFixed(1)} ms`}</span> : ""}{stats.quality < 1 ? ` · ${Math.round(stats.quality * 100)}% res` : ""}</>}
           </div>
         </section>
 

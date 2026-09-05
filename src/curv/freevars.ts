@@ -11,8 +11,11 @@ import type { Expr, Stmt, Pat, ListItem, Def } from "./parser";
 export interface FreeInfo {
   /** names referenced by the block that are not bound inside it (in first-use order) */
   free: string[];
-  /** false when the block assigns (`x := …`) to a variable it does not own — a side effect that must not be skipped */
+  /** false when the block assigns (`x := …`) to a variable it does not own, or reads `parametric` inputs
+   *  (host state that is not in the environment) — effects that must not be skipped */
   pure: boolean;
+  /** why `pure` is false */
+  why?: string;
 }
 
 const isFnDef = (d: Def) => d.params.length > 0 || d.body.k === "lambda";
@@ -28,7 +31,8 @@ function patNames(p: Pat, out: Set<string>) {
 
 class FV {
   free = new Set<string>();
-  pure = true;
+  pure = true; why?: string;
+  impure(why: string) { if (this.pure) { this.pure = false; this.why = why; } }
   /** the body of a definition, with its parameters bound */
   defBody(d: Def, scope: Set<string>) {
     if (d.params.length === 0) { this.expr(d.body, scope); return; }
@@ -58,7 +62,7 @@ class FV {
           else { this.defBody(d, scope); patNames(d.pat, scope); }          // `local x = x + 1` reads the outer x
           break;
         }
-        case "assign": if (!scope.has(s.name)) this.pure = false; this.expr(s.e, scope); break;
+        case "assign": if (!scope.has(s.name)) this.impure("assigns to an outer variable"); this.expr(s.e, scope); break;
         case "cons": if (s.weight) this.expr(s.weight, scope); this.expr(s.e, scope); break;
         case "obj": case "expr": this.expr(s.e, scope); break;
         case "for": { this.expr(s.iter, scope); const s2 = new Set(scope); patNames(s.pat, s2); if (s.until) this.expr(s.until, s2); this.stmts(s.body, s2); break; }
@@ -83,7 +87,7 @@ class FV {
       }
       case "let": { const s2 = new Set(scope); this.defs(e.defs, s2); this.expr(e.body, s2); return; }
       case "do": { const s2 = new Set(scope); this.stmts(e.stmts, s2); this.expr(e.body, s2); return; }
-      case "parametric": { const s2 = new Set(scope); for (const p of e.params) { this.expr(p.pred, scope); this.expr(p.init, scope); s2.add(p.name); } this.expr(e.body, s2); return; }
+      case "parametric": { this.impure("reads parametric inputs"); const s2 = new Set(scope); for (const p of e.params) { this.expr(p.pred, scope); this.expr(p.init, scope); s2.add(p.name); } this.expr(e.body, s2); return; }
       case "if": this.expr(e.cond, scope); this.expr(e.then, scope); this.expr(e.else, scope); return;
       case "lambda": { const s2 = new Set(scope); for (const p of e.params) patNames(p, s2); this.expr(e.body, s2); return; }
       case "call": this.expr(e.fn, scope); this.expr(e.arg, scope); return;
@@ -102,7 +106,7 @@ const blockMemo = new WeakMap<Stmt[], FreeInfo>();
 /** Free variables of a `solve { }` block (memoised on the AST node, which is immutable and cached per source). */
 export function freeVarsOfBlock(stmts: Stmt[]): FreeInfo {
   let r = blockMemo.get(stmts);
-  if (!r) { const fv = new FV(); fv.stmts(stmts, new Set()); r = { free: [...fv.free], pure: fv.pure }; blockMemo.set(stmts, r); }
+  if (!r) { const fv = new FV(); fv.stmts(stmts, new Set()); r = { free: [...fv.free], pure: fv.pure, why: fv.why }; blockMemo.set(stmts, r); }
   return r;
 }
 
@@ -112,7 +116,7 @@ export function freeVarsOfFn(params: Pat[], body: Expr): FreeInfo {
   let byArity = fnMemo.get(body);
   if (!byArity) { byArity = new Map(); fnMemo.set(body, byArity); }
   let r = byArity.get(params.length);
-  if (!r) { const fv = new FV(); const s = new Set<string>(); for (const p of params) patNames(p, s); fv.expr(body, s); r = { free: [...fv.free], pure: fv.pure }; byArity.set(params.length, r); }
+  if (!r) { const fv = new FV(); const s = new Set<string>(); for (const p of params) patNames(p, s); fv.expr(body, s); r = { free: [...fv.free], pure: fv.pure, why: fv.why }; byArity.set(params.length, r); }
   return r;
 }
 

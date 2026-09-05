@@ -3,7 +3,7 @@
 // shader code by subcurv.ts; `solve { ... }` blocks compile to a psolve problem.
 import { parse, CurvError, type Expr, type Def, type Pat, type ListItem, type Stmt } from "./parser";
 import { Lin, Quad, Cons, Problem, STRENGTH, type Rel, type ConstraintResult } from "../psolve/constraints";
-import { Shape, type SNode, type RGBA, type BBox, type ShaderFn, type GenCtx, genShape, bboxOf, structKey, walkParams } from "./shapes";
+import { Shape, type SNode, type RGBA, type BBox, type ShaderFn, type GenCtx, genShape, bboxOf, structKey, walkParams, nodeHash } from "./shapes";
 import { measureText, type Atlas } from "../gpu/atlas";
 import { PRELUDE } from "./prelude";
 import { JS, WGSL, ParamsOnly, makeJSRuntime, type Gen, type E } from "../gpu/gen";
@@ -31,7 +31,7 @@ export interface SolveTrace {
   boxes: { x: number; y: number; w: number; h: number }[];
 }
 export interface ParamDesc { name: string; label: string; kind: "slider" | "int_slider" | "checkbox" | "scale_picker" | "colour_picker"; lo: number; hi: number; value: number | boolean | number[] }
-export interface EvalResult { shape: SNode | null; traces: SolveTrace[]; usesTime: boolean; usesMouse: boolean; usesViewport: boolean; value: Value; params: ParamDesc[] }
+export interface EvalResult { shape: SNode | null; traces: SolveTrace[]; usesTime: boolean; usesMouse: boolean; usesViewport: boolean; value: Value; params: ParamDesc[]; callMemo: CallMemoStats }
 /** Live inputs.  Everything is in Curv world units (y up, origin at the centre of the default view). */
 export interface Inputs { viewport: { x: number; y: number; w: number; h: number }; time: number; mouse: { x: number; y: number; down: boolean }; params?: Record<string, number | boolean | number[]> }
 
@@ -166,7 +166,10 @@ function parseCached(src: string): Expr {
 
 // ---------- solve cache: the interpreter re-runs the whole program every frame; a solve { } block
 // whose numeric problem (fingerprint) did not change since the last evaluation reuses its result.
-const solveCache = new Map<number, { fp: string; res: ConstraintResult }>();
+// Keyed by the block's AST identity with a small LRU per block (a block evaluated several times per
+// frame with different inputs keeps all of its problems).
+const solveCache = new Map<number, { fp: string; res: ConstraintResult }[]>();
+const PROBLEM_LRU = 8;
 // Whole-block memo: keyed by the block's AST identity plus the values of its free variables.  A hit
 // skips *everything* (constraint construction included) and returns the previous result record.
 interface BlockHit { key: string; out: Rec; trace: SolveTrace; flags: { time: boolean; mouse: boolean; viewport: boolean } }
@@ -174,24 +177,56 @@ interface BlockHit { key: string; out: Rec; trace: SolveTrace; flags: { time: bo
 // with different inputs (inside a `for`, or a function called twice) keeps all of its results
 const blockCache = new Map<number, BlockHit[]>();
 const BLOCK_LRU = 8;
-export function resetSolveCache() { solveCache.clear(); blockCache.clear(); }
+// Call memo for pure user functions (see Interp.applyMemo): keyed by the body's AST identity, LRU per body.
+interface CallHit { key: string; out: Value; traces: SolveTrace[]; flags: { time: boolean; mouse: boolean; viewport: boolean } }
+const callCache = new Map<number, CallHit[]>();
+const CALL_LRU = 32;
+let callCacheSize = 0;
+const CALL_CACHE_MAX = 4096;
+/** Profile of a function body: how expensive an un-memoised call is, and whether we decided to memoise it. */
+interface CallStat { n: number; ms: number; first: number; mode: "measure" | "memo" | "skip"; why?: string }
+const callStats = new Map<number, CallStat>();
+const CALL_MEMO_MIN_MS = 0.025;  // average un-memoised call cost (ms, first cold call excluded) above which memoising pays for the hashing
+const CALL_MEMO_SAMPLES = 4;     // calls measured before deciding
+const CALL_HASH_LIMIT = 4000;    // parts; bigger arguments are not worth hashing per call
+export function resetSolveCache() { solveCache.clear(); blockCache.clear(); callCache.clear(); callCacheSize = 0; callStats.clear(); }
 /** Most recent key-computation stats (for scripts / debugging): why a block could not be memoised. */
 export const blockCacheStats = { lastReason: "" as string };
+/** Per-evaluation call-memo counters (reset by `Interp.run`). */
+export interface CallMemoStats { hits: number; misses: number; measured: number; skipped: number; hashMs: number }
+/** Snapshot of the call-memo decisions, for scripts / the UI: one row per function body. */
+export function callMemoTable(): { id: number; name: string; mode: CallStat["mode"]; calls: number; avgMs: number; why?: string; entries: number }[] {
+  return [...callStats].map(([id, s]) => ({ id, name: bodyNames.get(id) ?? "?", mode: s.mode, calls: s.n, avgMs: s.n > 1 ? (s.ms - s.first) / (s.n - 1) : s.ms, why: s.why, entries: callCache.get(id)?.length ?? 0 }));
+}
+const bodyNames = new Map<number, string>();
+
+/**
+ * Bumped whenever an environment binding that a closure may have captured is *overwritten*
+ * (`x := …`, or a name re-bound in the same env).  Closure hashes memoised in `fnHashMemo` are
+ * only valid for the epoch they were computed in; new bindings of previously undefined names
+ * never invalidate them because a closure whose free variable was undefined is not memoised.
+ */
+let envEpoch = 0;
+const fnHashMemo = new WeakMap<Fn, { epoch: number; s: string }>();
+/** Bind `name` in `env`; an overwrite invalidates memoised closure hashes. */
+function setVar(env: Env, name: string, v: Value) { if (env.vars.has(name)) envEpoch++; env.vars.set(name, v); }
 
 const HASH_LIMIT = 20000; // parts; bigger inputs fall back to the fingerprint cache
 class Unhashable extends Error { constructor(public why: string) { super(why); } }
 /**
- * Serialise a value for a solve-block cache key.  Numbers, strings, booleans, null, lists, records,
- * affine expressions and constraint values are hashed by content; builtins by name; closures by
- * body identity plus (recursively) the values of their free variables in their captured
- * environment.  Shapes and anonymous host functions are not hashable (→ fingerprint cache).
+ * Serialise a value for a solve-block / call cache key.  Numbers, strings, booleans, null, lists,
+ * records, affine expressions and constraint values are hashed by content; builtins by name;
+ * shapes by the content hash of their node tree; closures by body identity plus (recursively) the
+ * values of their free variables in their captured environment.  Anonymous host functions and
+ * shapes with user shader functions are not hashable (→ fingerprint cache / no call memo).
  */
 class ValueHasher {
   parts: (string | number)[] = [];
   private inProgress = new Set<Fn>();
   private fnMemo = new Map<Fn, string>();
   private tick = 0;
-  push(x: string | number) { this.parts.push(x); if (++this.tick > HASH_LIMIT) throw new Unhashable("input too large"); }
+  constructor(private limit = HASH_LIMIT) {}
+  push(x: string | number) { this.parts.push(x); if (++this.tick > this.limit) throw new Unhashable("input too large"); }
   value(v: Value): void {
     if (v === null) { this.push("_"); return; }
     switch (typeof v) {
@@ -205,29 +240,41 @@ class ValueHasher {
     if (v instanceof Cons) { this.push("C" + v.rel + (v.weight ?? "")); this.lin(v.lin); return; }
     if (v instanceof Quad) { this.push("Q" + v.q.size); this.lin(v.lin); for (const [, [i, j, c]] of v.q) this.push(i + "," + j + "=" + c); return; }
     if (v instanceof Fn) { this.fn(v); return; }
-    throw new Unhashable("shape value"); // Shape: nodes are rebuilt every evaluation, no cheap identity
+    if (v instanceof Shape) {
+      const h = nodeHash(v.node);
+      if (h === null) throw new Unhashable("shape with a user shader function");
+      this.push("S" + h + (v.bbox3 ? JSON.stringify(v.bbox3) : "")); return;
+    }
+    throw new Unhashable("value of type " + typeName(v));
   }
   private lin(l: Lin) { this.push("L" + l.t.size + ":" + l.c); for (const [k, c] of l.t) this.push(k + "=" + c); }
-  private fn(f: Fn) {
+  fn(f: Fn) {
     const memo = this.fnMemo.get(f);
     if (memo !== undefined) { this.push(memo); return; }
     if (!f.closure) { if (f.key === undefined) throw new Unhashable(`function ${f.name}`); this.push("B" + f.key); return; }
+    const g = fnHashMemo.get(f);
+    if (g !== undefined && g.epoch === envEpoch) { this.push(g.s); return; }
     const id = "F" + astId(f.closure.body) + "/" + f.closure.params.length;
     if (this.inProgress.has(f)) { this.push(id + "~"); return; } // recursive function: body identity is enough for the cycle
     this.inProgress.add(f);
     const start = this.parts.length;
     this.push(id + "(");
     const info = freeVarsOfFn(f.closure.params, f.closure.body);
-    for (const name of info.free) { const v = f.closure.env.lookup(name); if (v !== undefined) { this.push(name); this.value(v); } }
+    let complete = true;
+    for (const name of info.free) { const v = f.closure.env.lookup(name); if (v !== undefined) { this.push(name); this.value(v); } else complete = false; }
     this.push(")");
     this.inProgress.delete(f);
-    this.fnMemo.set(f, this.parts.slice(start).join("\u0001"));
+    const s = this.parts.slice(start).join("\u0001");
+    this.fnMemo.set(f, s);
+    // a closure with an undefined free variable may see it bound later (let/do bind in order) → not memoised globally
+    if (complete) fnHashMemo.set(f, { epoch: envEpoch, s });
   }
 }
 
 // ---------- interpreter ----------
 export class Interp {
   traces: SolveTrace[] = []; usesTime = false; usesMouse = false; usesViewport = false; params: ParamDesc[] = [];
+  callMemo: CallMemoStats = { hits: 0, misses: 0, measured: 0, skipped: 0, hashMs: 0 };
   private cpuFns = new WeakMap<SNode, { dist: (x: number, y: number, t: number) => number; colour: (x: number, y: number, t: number) => number[] }>();
   constructor(public atlas: Atlas, public inputs: Inputs) {}
 
@@ -495,22 +542,94 @@ export class Interp {
     if (value instanceof Shape) node = value.node;
     else if (isList(value) && value.length > 0 && value.every((v) => v instanceof Shape)) node = { k: "union", kids: value.map((v) => (v as Shape).node) };
     else if (value instanceof Rec && value.f.has("dist")) node = this.makeShape(value).node;
-    return { shape: node, traces: this.traces, usesTime: this.usesTime, usesMouse: this.usesMouse, usesViewport: this.usesViewport, value, params: this.params };
+    return { shape: node, traces: this.traces, usesTime: this.usesTime, usesMouse: this.usesMouse, usesViewport: this.usesViewport, value, params: this.params, callMemo: this.callMemo };
   }
 
   bindPat(p: Pat, v: Value, env: Env, line?: number) {
     if (p.k === "any") return;
-    if (p.k === "id") { env.vars.set(p.name, v); return; }
+    if (p.k === "id") { setVar(env, p.name, v); return; }
     if (p.k === "list") { if (!isList(v) || v.length !== p.items.length) throw err(`Pattern expects a list of ${p.items.length}, got ${show(v)}`, line); p.items.forEach((q, i) => this.bindPat(q, v[i], env, line)); return; }
-    const r = v instanceof Shape ? this.shapeRec(v) : rec(v, line); for (const n of p.names) { if (!r.f.has(n)) throw err(`Record has no field '${n}'`, line); env.vars.set(n, r.f.get(n)!); }
+    const r = v instanceof Shape ? this.shapeRec(v) : rec(v, line); for (const n of p.names) { if (!r.f.has(n)) throw err(`Record has no field '${n}'`, line); setVar(env, n, r.f.get(n)!); }
   }
   makeClosure(params: Pat[], body: Expr, env: Env, name: string): Fn {
     const mk = (i: number, e: Env): Fn => {
-      const f = new Fn(name, (arg, line) => { const e2 = e.child(); this.bindPat(params[i], arg, e2, line); return i + 1 < params.length ? mk(i + 1, e2) : this.eval(body, e2); });
+      const f: Fn = new Fn(name, (arg, line) => {
+        if (i + 1 < params.length) { const e2 = e.child(); this.bindPat(params[i], arg, e2, line); return mk(i + 1, e2); }
+        return this.applyMemo(f, arg, () => { const e2 = e.child(); this.bindPat(params[i], arg, e2, line); return this.eval(body, e2); });
+      });
       f.closure = { params: params.slice(i), body, env: e };
       return f;
     };
     return mk(0, env);
+  }
+
+  // ---------- call memo ----------
+  /**
+   * Apply a user function, memoising the result across evaluations when that pays off.
+   *
+   * The key is the closure's hash (body identity + values of its free variables, so `time`,
+   * outer parameters and other functions it calls are covered) plus the argument's hash.  Only
+   * *pure* bodies qualify (no `:=` to an outer variable, no `parametric`, no `print`); bodies are
+   * profiled for their first few calls and memoised only when an un-memoised call costs more than
+   * `CALL_MEMO_MIN_MS` on average, so tiny helpers are never slowed down by hashing.  Side effects
+   * a hit must replay: solve traces pushed by blocks inside the body and the time/mouse/viewport
+   * usage flags.  Values are immutable, so a shared result is safe (and node identity survives,
+   * which lets `bboxOf` / `structKey` / `nodeHash` memos hit across frames).
+   */
+  private applyMemo(f: Fn, arg: Value, run: () => Value): Value {
+    const body = f.closure!.body;
+    const id = astId(body);
+    let st = callStats.get(id);
+    if (st === undefined) {
+      if (callStats.size > 4096) callStats.clear(); // ids of edited-away programs
+      st = { n: 0, ms: 0, first: 0, mode: "measure" };
+      const info = freeVarsOfFn(f.closure!.params, body);
+      if (!info.pure) { st.mode = "skip"; st.why = info.why ?? "impure"; }
+      else if (info.free.includes("print")) { st.mode = "skip"; st.why = "prints"; }
+      callStats.set(id, st); bodyNames.set(id, f.name);
+    }
+    if (st.mode === "skip") { this.callMemo.skipped++; return run(); }
+    if (st.mode === "measure") {
+      const t0 = performance.now(); const v = run(); const dt = performance.now() - t0; st.ms += dt; if (st.n++ === 0) st.first = dt;
+      this.callMemo.measured++;
+      if (st.n >= CALL_MEMO_SAMPLES) { // decide on the warm calls (the first one pays for cold memos / JIT)
+        const avg = (st.ms - st.first) / (st.n - 1);
+        if (avg >= CALL_MEMO_MIN_MS) st.mode = "memo"; else { st.mode = "skip"; st.why = `cheap (${(avg * 1000).toFixed(0)} µs)`; }
+      }
+      return v;
+    }
+    // memo mode
+    const th = performance.now();
+    let key: string | null = null;
+    try { const h = new ValueHasher(CALL_HASH_LIMIT); h.fn(f); h.value(arg); key = h.parts.join("\u0001"); }
+    catch (e) { if (!(e instanceof Unhashable)) throw e; st.why = e.why; }
+    this.callMemo.hashMs += performance.now() - th;
+    if (key === null) { this.callMemo.skipped++; return run(); }
+    const slots = callCache.get(id);
+    const i = slots ? slots.findIndex((h) => h.key === key) : -1;
+    if (slots && i >= 0) {
+      const hit = slots[i];
+      if (i > 0) { slots.splice(i, 1); slots.unshift(hit); }
+      this.usesTime ||= hit.flags.time; this.usesMouse ||= hit.flags.mouse; this.usesViewport ||= hit.flags.viewport;
+      for (const t of hit.traces) this.traces.push({ ...t, cached: true, cacheKind: t.cacheKind ?? "block", timeMs: 0 });
+      this.callMemo.hits++;
+      return hit.out;
+    }
+    const t0 = performance.now(); const tr0 = this.traces.length;
+    const uT = this.usesTime, uM = this.usesMouse, uV = this.usesViewport;
+    this.usesTime = this.usesMouse = this.usesViewport = false;
+    let out: Value, flags: CallHit["flags"];
+    try { out = run(); }
+    finally { flags = { time: this.usesTime, mouse: this.usesMouse, viewport: this.usesViewport }; this.usesTime ||= uT; this.usesMouse ||= uM; this.usesViewport ||= uV; }
+    st.ms += performance.now() - t0; st.n++;
+    this.callMemo.misses++;
+    if (callCacheSize >= CALL_CACHE_MAX) { callCache.clear(); callCacheSize = 0; }
+    let sl = callCache.get(id);
+    if (!sl) { sl = []; callCache.set(id, sl); }
+    sl.unshift({ key, out, traces: this.traces.slice(tr0), flags });
+    callCacheSize++;
+    if (sl.length > CALL_LRU) { sl.length = CALL_LRU; callCacheSize--; }
+    return out;
   }
   bindDefs(defs: Def[], env: Env) {
     // functions first (recursion-friendly), then values in order
@@ -567,7 +686,7 @@ export class Interp {
             else value = typeof given === "number" ? (kind === "int_slider" ? Math.round(given) : given) : init;
           }
           this.params.push({ name: p.name, label: p.label, kind, lo, hi, value: value as number | boolean | number[] });
-          e2.vars.set(p.name, value);
+          setVar(e2, p.name, value);
         }
         return this.eval(e.body, e2);
       }
@@ -631,7 +750,7 @@ export class Interp {
     for (const s of ss) {
       switch (s.k) {
         case "local": case "def": { const d = s.k === "local" ? s.def : s.def; if (d.params.length > 0) this.bindDefs([d], env); else this.bindPat(d.pat, this.eval(d.body, env), env, d.line); break; }
-        case "assign": { const o = env.owner(s.name); if (!o) throw err(`Unknown variable '${s.name}'`, s.line); o.vars.set(s.name, this.eval(s.e, env)); break; }
+        case "assign": { const o = env.owner(s.name); if (!o) throw err(`Unknown variable '${s.name}'`, s.line); setVar(o, s.name, this.eval(s.e, env)); break; }
         case "if": if (truthy(this.eval(s.cond, env), s.line)) this.execDo(s.body, env.child()); else if (s.else) this.execDo(s.else, env.child()); break;
         case "for": { const l = this.eval(s.iter, env); if (!isList(l)) throw err("for expects a list", s.line); for (const x of l) { const e2 = env.child(); this.bindPat(s.pat, x, e2, s.line); if (s.until && truthy(this.eval(s.until, e2), s.line)) break; this.execDo(s.body, e2); } break; }
         case "while": { let n = 0; while (truthy(this.eval(s.cond, env), s.line)) { this.execDo(s.body, env.child()); if (++n > 1e6) throw err("while loop did not terminate", s.line); } break; }
@@ -645,7 +764,7 @@ export class Interp {
   /** Cache key of a solve block: AST identity + hashed values of its free variables (null when not memoisable). */
   private blockKey(stmts: Stmt[], outer: Env): string | null {
     const info = freeVarsOfBlock(stmts);
-    if (!info.pure) { blockCacheStats.lastReason = "assigns to an outer variable"; return null; }
+    if (!info.pure) { blockCacheStats.lastReason = info.why ?? "impure"; return null; }
     const h = new ValueHasher();
     h.push("S" + astId(stmts));
     try {
@@ -718,11 +837,11 @@ export class Interp {
         switch (s.k) {
           case "var": {
             const cnt = s.count ? num(this.eval(s.count, env), "count", s.line) : undefined;
-            for (const n of s.names) { const v: Value = cnt === undefined ? mkVar(n, s.type) : Array.from({ length: cnt }, (_, i) => mkVar(`${n}[${i}]`, s.type)); env.vars.set(n, v); declared.push({ name: n, value: v }); }
+            for (const n of s.names) { const v: Value = cnt === undefined ? mkVar(n, s.type) : Array.from({ length: cnt }, (_, i) => mkVar(`${n}[${i}]`, s.type)); setVar(env, n, v); declared.push({ name: n, value: v }); }
             break;
           }
           case "def": case "local": this.bindDefs([s.def], env); break;
-          case "assign": { const o = env.owner(s.name); if (!o) throw err(`Unknown variable '${s.name}'`, s.line); o.vars.set(s.name, this.eval(s.e, env)); break; }
+          case "assign": { const o = env.owner(s.name); if (!o) throw err(`Unknown variable '${s.name}'`, s.line); setVar(o, s.name, this.eval(s.e, env)); break; }
           case "cons": {
             // `a == b;` or `weak: expr;` — expr may be any expression producing constraint values
             // (a comparison, or a call such as `hstack 12 main cards`)
@@ -745,10 +864,18 @@ export class Interp {
     };
     exec(stmts, env);
     const fp = prob.fingerprint();
-    const hit = solveCache.get(line);
-    const cached = hit !== undefined && hit.fp === fp;
-    const res = cached ? hit.res : prob.solve();
-    if (!cached) { if (solveCache.size > 256) solveCache.clear(); solveCache.set(line, { fp, res }); }
+    const pid = astId(stmts);
+    let pslots = solveCache.get(pid);
+    const pi = pslots ? pslots.findIndex((h) => h.fp === fp) : -1;
+    const cached = pi >= 0;
+    let res: ConstraintResult;
+    if (pslots && pi >= 0) { res = pslots[pi].res; if (pi > 0) { const h = pslots.splice(pi, 1)[0]; pslots.unshift(h); } }
+    else {
+      res = prob.solve();
+      if (solveCache.size > 256) solveCache.clear();
+      if (!pslots || !solveCache.has(pid)) { pslots = []; solveCache.set(pid, pslots); }
+      pslots.unshift({ fp, res }); if (pslots.length > PROBLEM_LRU) pslots.length = PROBLEM_LRU;
+    }
     const subst = (v: Value): Value => {
       if (v instanceof Lin) return res.ok ? v.eval(res.values) : 0;
       if (isList(v)) return v.map(subst);
@@ -781,7 +908,9 @@ function showSolved(v: Value): string {
   return show(v);
 }
 
-export interface CompiledTree { code: string; d: string; c: string; params: Float32Array; key: string | null; reused: boolean }
+export interface CompiledTree { code: string; d: string; c: string; params: Float32Array; key: string | null; reused: boolean;
+  /** compiled user shader code reads the time (`[x,y,z,t]` argument or `time`): the picture animates even if the evaluator saw no `time` */
+  usesTime: boolean }
 
 /**
  * Compile a whole program (shape tree) for a backend.  If `prev` is the result of a previous
@@ -795,7 +924,7 @@ export function compileTree(node: SNode, atlas: Atlas, target: "wgsl" | "js", pr
   const g: Gen = target === "wgsl" ? new WGSL() : new JS();
   const ctx: GenCtx = { atlas, zoom: { t: "f", s: target === "wgsl" ? "u.cam.z" : "zoom" }, time: { t: "f", s: target === "wgsl" ? "u.time" : "T" }, cull: true, defaultColour };
   const r = genShape(g, node, { t: "v2", s: "p0" }, ctx);
-  return { code: g.code(), d: r.d.s, c: r.c.s, params: new Float32Array(g.finalParams()), key, reused: false };
+  return { code: g.code(), d: r.d.s, c: r.c.s, params: new Float32Array(g.finalParams()), key, reused: false, usesTime: g.usesTime };
 }
 /** Only the parameter buffer of a tree, in codegen order, via the generic ParamsOnly backend (reference implementation). */
 export function collectParams(node: SNode, atlas: Atlas, defaultColour: RGBA = DEFAULT_COLOUR): Float32Array {

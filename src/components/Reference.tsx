@@ -69,6 +69,15 @@ const sections: { title: string; rows: [string, string][] }[] = [
       ["viewport · time · mouse.x/y/pos/down", "live inputs in world units: re-evaluated on viewport change / every frame (pause button) / on move"],
     ],
   },
+  {
+    title: "What is cached between frames",
+    rows: [
+      ["solve { … }  → memoised", "a block whose free variables (incl. shapes, closures, time/mouse/viewport) have the same values as before is not re-evaluated at all"],
+      ["solve { … }  → cached", "re-evaluated, but the numeric problem was seen before: presolve + psolve skipped"],
+      ["f x  (pure user functions)", "calls costing more than ~25 µs are memoised on (function, free variables, argument); results are immutable so the same tree is reused — `x := outer`, `parametric` and `print` disable it. The status line shows hits/calls"],
+      ["shader", "a tree with the same structure only refills its parameter buffer (no recompile); resolution adapts to the GPU + CPU budget"],
+    ],
+  },
 ];
 
 export function Reference() {
