@@ -1,4 +1,4 @@
-# Curv+solve — handoff (dev round 10)
+# Curv+solve — handoff (dev round 11)
 
 Browser playground for **Curv** (2D F-Rep, compiled to WGSL / JS) extended with
 `solve { }` constraint blocks solved by **psolve** (LP + convex QP, WebAssembly).
@@ -16,6 +16,29 @@ Headless checks (all use the JS backend, no browser needed):
 All four were green at the end of this round (`paramcheck` and `memotest` exit 1 on any failure — check the exit code).
 
 ## What changed in this round
+
+1. **Adaptive layout combinators** (`src/curv/prelude.ts`).  `flow_fit gap maxw maxh pad s labels b items`
+   greedily wraps *measured* chips (like `flow_text`) after bisecting the largest font size ≤ s whose rows
+   fit `maxw × maxh` (8 steps ≈ 1 %; font metrics via `text_size`; wraps are discrete so the decision is
+   numeric, only positions are solved).  It returns `{ size, cells }`: `F.cells` adds the constraints and
+   the caller exports `F.size` through a solved variable (`var fsz : num; fsz == F.size;`) to draw the
+   chips at exactly the chosen size.  `fit_labels gap pad s maxw labels` returns the longest prefix (+1)
+   of a toolbar row whose measured chips fit `maxw` — items that cannot fit are *dropped* instead of
+   over-constraining the system.
+2. **The examples never go infeasible anymore** (new `wrapfit` example; `toolbar`, `buttons`, `tooltip`
+   updated): a solver-run grid over 140..900 × 320..700 succeeds everywhere.  This surfaced two rules
+   worth keeping:
+   * **psolve's active-set QP degenerates on tens of parallel softened inequalities around active
+     bounds** (KKT_FAIL — empirically at widths where intrinsic minima went slack).  Adaptation belongs in
+     the evaluator (bisection/truncation on numerics); keep the solver's soft constraints as plain
+     quadratic pulls (`weak:`/`weight k: ==`), not soft inequalities that sit on their bound.
+   * Conflicting slack pulls compromise in the ratio of their squared weights: body-hug `weight 4` vs
+     space `weak` settles ≈ 15:1.  (And an unconstrained record width solves to 0 — `tagbox` needed
+     `right == …` pinned, cosmetically.)
+3. Reference rows for `fit_labels` / `flow_fit`; `buttons` and `tooltip` got bounded adaptive variants of
+   their teaching constraints (list-driven rendering replaces hard-coded indices).
+
+## Round 10 recap (kept from the round-10 handoff — all still in force)
 
 1. **Shared static builtin environment** (`staticBuiltins`, per-atlas `WeakMap`).  All ~150 builtins that
    depend only on their arguments (math, lists, strings, colours, shape constructors/operators, text
@@ -178,6 +201,11 @@ scripts/                selftest, paramcheck, memotest, prof (headless, tsx)
 * Keep `OPS` in the lexer sorted longest-prefix-first for operators that share a prefix.
 * Soft equalities must not be modelled as inequality pairs (psolve's active-set QP degenerates); keep them
   in the objective.  If you add a new relation type, add it to `Problem.fingerprint()` too.
+* **Do not soften bounds in bulk with `strength`/`weight` tags inside combinators**: many parallel soft
+  inequalities going in and out of satisfaction degenerate the active-set QP (KKT_FAIL).  Numeric
+  adaptation (`flow_fit` bisection, `fit_labels` truncation) in the evaluator is the sane pattern; in the
+  solver, prefer quadratic pulls toward equality.  Sweep a viewport grid (selftest renders one; grep the
+  scripts for the 140..900 × 320..700 loop) when touching example structure.
 * `weak`, `medium`, `strong`, `required` are keywords — new strength-related builtins need other names.
 * The fast frame-loop path (`shaderTimeOnly`) may re-render without evaluating **only** when the program
   used no evaluator-side `time`: any `res.usesTime` means the tree itself changes per frame.
@@ -215,8 +243,8 @@ scripts/                selftest, paramcheck, memotest, prof (headless, tsx)
   only happens on pause / interactions (a settle tick that schedules itself per frame was judged too
   finicky).
 * Solids-of-revolution style 3D shapes are rejected ('box [w,h,d]' error) — only 2D SDF.
-* `flow` needs a *numeric* maximum width (wrapping is discrete); `hstack_fit` gives all items the same
-  font size / padding.
+* `flow`/`flow_fit`/`fit_labels` need *numeric* budgets (wrapping is discrete); `hstack_fit` gives all
+  items the same font size / padding.
 * Kerning is measured pairwise from the canvas font, so metrics can differ slightly between machines; the
   atlas has one weight, no ligatures, no combining marks.
 * The GPU budget is derived from the *previous* frame's CPU time; a sudden CPU spike is corrected one
