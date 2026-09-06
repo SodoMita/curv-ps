@@ -1,0 +1,5 @@
+upstream: https://github.com/SodoMita/psolve
+commit:   05f9411cccbc5d212de67c86f897118b60f4503c (main; merge of arena/01a07358-psolve PR #1)
+files:    src/{err,kernels,lu,splu,solver,qp}.c + tools/psolve_web.c (bridge ABI 3), verbatim
+wasm:     sha256 bcbe7b1d089417df69e05bc3c29d419c4c20254d5cf39566c49bbc0c420658a8
+tool:     wasi-sdk 25 (clang 19.1.5), recipe: build-wasm.sh

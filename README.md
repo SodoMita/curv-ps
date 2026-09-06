@@ -25,10 +25,18 @@ read `parametric` or print are never memoised), programs that only use `time` in
 re-rendering the same tree, layout combinators (`hstack`, `grid`, `flow`, `hstack_fit`, …) are plain Curv functions
 that return constraint values, and text is an SDF atlas (ASCII + Latin-1 + symbols, kerned).
 
+The solver is psolve's own wasm bridge (ABI 3, reproducibly built — see `psolve-src/PIN`): the previous frame's
+solution is fed back as a **warm start** (pixel-identical layouts at a fraction of the time on drag frames), a solve
+that fails degrades to the block's **last good layout** (amber, with the failure verdict) instead of erroring the
+whole program, reported infeasibility is **Farkas-certified** with the conflicting constraints named, and every solve
+runs inside a per-frame **wall-clock budget** that hands back an incumbent rather than hanging the UI.
+
 * `npm install && npm run dev` — development server
 * `npm run build` — single-file `dist/index.html`
 * `npx tsx scripts/selftest.ts` — headless render of every example
 * `npx tsx scripts/paramcheck.ts` — verifies the codegen fast paths and solve-block memoisation
+* `npx tsx scripts/warmcheck.ts` — warm-start / certified-infeasibility / budget / degradation oracle for the solver bridge
+* `npx tsx scripts/warmbench.ts [example …]` — cold vs warm-started solve timings (interleaved best-of-4)
 * `npx tsx scripts/shaderbench.ts [example …]` — benchmarks the shader-generation variants (`SHADER_FLAGS`) per example: JS raster time, WGSL bytes, branch/loop counts
 * `npx tsx scripts/memotest.ts` — dependency-tracking tests for solve-block and call memoisation
 

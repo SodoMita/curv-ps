@@ -29,6 +29,20 @@ export interface SolveTrace {
   nVars: number; nCons: number; eliminated: number; objective: number; violations: { label: string; amount: number }[];
   values: { name: string; value: string }[];
   boxes: { x: number; y: number; w: number; h: number }[];
+  /** verdict wording that separates a give-up from a proof (NO_FEASIBLE_START vs INFEASIBLE_PROVEN) */
+  verdict?: string;
+  /** the previous solve's values were fed as a warm start and accepted (Phase-I skipped) */
+  warm?: boolean;
+  /** the warm attempt wandered past its sub-budget and was retried cold */
+  warmRetry?: boolean;
+  /** budget/iteration-limit incumbent: feasible-ish but not a certified optimum */
+  approx?: boolean;
+  /** largest row violation at the returned point (caller's units) */
+  maxResid?: number;
+  /** Farkas-certified conflicting rows (only when infeasibility is proven) */
+  conflicts?: { label: string; lambda: number }[];
+  /** the solve failed and the trace shows the failure, but the block's values come from the last good solve (amber, no throw) */
+  degraded?: { status: string; verdict: string; conflicts?: { label: string; lambda: number }[] };
 }
 export interface ParamDesc { name: string; label: string; kind: "slider" | "int_slider" | "checkbox" | "scale_picker" | "colour_picker"; lo: number; hi: number; value: number | boolean | number[] }
 export interface EvalResult { shape: SNode | null; traces: SolveTrace[]; usesTime: boolean; usesMouse: boolean; usesViewport: boolean; value: Value; params: ParamDesc[]; callMemo: CallMemoStats }
@@ -175,6 +189,17 @@ function parseCached(src: string): Expr {
 // frame with different inputs keeps all of its problems).
 const solveCache = new Map<number, { fp: string; res: ConstraintResult }[]>();
 const PROBLEM_LRU = 8;
+// Warm-start cache: the last GOOD solution per block (variable names + values).  Feeding it as
+// psolve's x0 on the next frame's (slightly different) problem skips Phase-I (upstream measured
+// 23–35× on drag frames; CURV_PS_PLAN P0.2).  It only ever holds certified/approximate-ok results,
+// and it is consulted for numerics only — cache fingerprints still key on the problem itself, so no
+// memoised result can depend on it.  Only a prefix-identical name list is a legal start for a new
+// problem (variable ids are assigned in declaration order; a same-text block with a different `for`
+// count would shift ids).
+const warmCache = new Map<number, { names: string[]; values: number[] }>();
+/** Wall-clock budget handed to each psolve call: one 60 fps frame.  A binding budget reports
+ *  STOPPED + incumbent (approximate) instead of hanging the UI on a pathological model. */
+export const SOLVE_BUDGET_MS = 16;
 // Whole-block memo: keyed by the block's AST identity plus the values of its free variables.  A hit
 // skips *everything* (constraint construction included) and returns the previous result record.
 interface BlockHit { key: string; out: Rec; trace: SolveTrace; flags: { time: boolean; mouse: boolean; viewport: boolean } }
@@ -194,7 +219,7 @@ const callStats = new Map<number, CallStat>();
 const CALL_MEMO_MIN_MS = 0.008;  // floor under which even free memos make no sense; the effective threshold is max(this, 2 × warm-measured hash cost of a representative call)
 const CALL_MEMO_SAMPLES = 4;     // calls measured before deciding
 const CALL_HASH_LIMIT = 4000;    // parts; bigger arguments are not worth hashing per call
-export function resetSolveCache() { solveCache.clear(); blockCache.clear(); callCache.clear(); callCacheSize = 0; callStats.clear(); }
+export function resetSolveCache() { solveCache.clear(); warmCache.clear(); blockCache.clear(); callCache.clear(); callCacheSize = 0; callStats.clear(); }
 /** Most recent key-computation stats (for scripts / debugging): why a block could not be memoised. */
 export const blockCacheStats = { lastReason: "" as string };
 /** Per-evaluation call-memo counters (reset by `Interp.run`). */
@@ -512,6 +537,9 @@ function staticBuiltins(atlas: Atlas): Map<string, Value> {
 export class Interp {
   traces: SolveTrace[] = []; usesTime = false; usesMouse = false; usesViewport = false; params: ParamDesc[] = [];
   callMemo: CallMemoStats = { hits: 0, misses: 0, measured: 0, skipped: 0, hashMs: 0 };
+  /** set when a solve block degraded to a previous good result this frame: such results are
+   *  history-dependent, so the whole-block memo must not store them (next frame re-attempts). */
+  unmemoizableFrame = false;
   private cpuFns = new WeakMap<SNode, { dist: (x: number, y: number, t: number) => number; colour: (x: number, y: number, t: number) => number[] }>();
   constructor(public atlas: Atlas, public inputs: Inputs) {}
 
@@ -593,6 +621,7 @@ export class Interp {
     // idempotent: App re-runs the same program with the same inputs when a camera-fit retry was needed
     this.traces.length = 0; this.params.length = 0; this.usesTime = this.usesMouse = this.usesViewport = false;
     this.callMemo = { hits: 0, misses: 0, measured: 0, skipped: 0, hashMs: 0 };
+    this.unmemoizableFrame = false;
     activeInterp = this;
     const base = this.builtins(); // the small dynamic layer (time/mouse/viewport) over shared static builtins
     if (!sharedPrelude) { // the prelude is bind-time pure (constants, colour strings, function defs)
@@ -699,6 +728,8 @@ export class Interp {
     finally { flags = { time: this.usesTime, mouse: this.usesMouse, viewport: this.usesViewport }; this.usesTime ||= uT; this.usesMouse ||= uM; this.usesViewport ||= uV; }
     st.ms += performance.now() - t0; st.n++;
     this.callMemo.misses++;
+    // a degraded solve inside the body makes the result history-dependent: never memoised
+    if (this.unmemoizableFrame) return out;
     if (callCacheSize >= CALL_CACHE_MAX) { callCache.clear(); callCacheSize = 0; }
     let sl = callCache.get(id);
     if (!sl) { sl = []; callCache.set(id, sl); }
@@ -870,7 +901,7 @@ export class Interp {
       }
     }
     const out = this.solveUncached(stmts, outer, line);
-    if (key !== null) {
+    if (key !== null && !this.unmemoizableFrame) { // a degraded (fallback) solve is history-dependent: never memoised
       if (blockCache.size > 256) blockCache.clear();
       let slots = blockCache.get(id);
       if (!slots) { slots = []; blockCache.set(id, slots); }
@@ -945,12 +976,36 @@ export class Interp {
     const pi = pslots ? pslots.findIndex((h) => h.fp === fp) : -1;
     const cached = pi >= 0;
     let res: ConstraintResult;
-    if (pslots && pi >= 0) { res = pslots[pi].res; if (pi > 0) { const h = pslots.splice(pi, 1)[0]; pslots.unshift(h); } }
-    else {
-      res = prob.solve();
-      if (solveCache.size > 256) solveCache.clear();
-      if (!pslots || !solveCache.has(pid)) { pslots = []; solveCache.set(pid, pslots); }
-      pslots.unshift({ fp, res }); if (pslots.length > PROBLEM_LRU) pslots.length = PROBLEM_LRU;
+    let degraded: SolveTrace["degraded"] | undefined;
+    if (pslots && pi >= 0) {
+      res = pslots[pi].res; if (pi > 0) { const h = pslots.splice(pi, 1)[0]; pslots.unshift(h); }
+    } else {
+      // warm start: the block's last good solution — legal only when the new problem's variable
+      // names extend the cached list in order (ids are declaration-order; see warmCache above)
+      const wc = warmCache.get(pid);
+      const x0 = wc && wc.names.length <= prob.names.length && wc.names.every((n, i) => prob.names[i] === n) ? wc.values : undefined;
+      const fresh = prob.solve({ x0, budgetMs: SOLVE_BUDGET_MS });
+      if (fresh.ok) {
+        res = fresh;
+        warmCache.set(pid, { names: [...prob.names], values: fresh.values });
+        if (solveCache.size > 256) solveCache.clear();
+        if (!pslots || !solveCache.has(pid)) { pslots = []; solveCache.set(pid, pslots); }
+        pslots.unshift({ fp, res }); if (pslots.length > PROBLEM_LRU) pslots.length = PROBLEM_LRU;
+      } else {
+        // The solve failed: NEVER make the whole program an error when a previous good layout
+        // exists for this block — reuse it and mark the block amber.  The failure itself is not
+        // cached anywhere (next frame re-attempts), and the block is not memoised this frame.
+        const good = pslots?.find((h) => h.res.ok && h.res.values.length >= prob.names.length);
+        if (good) {
+          res = good.res;
+          degraded = { status: fresh.statusText, verdict: fresh.verdictText, conflicts: fresh.conflicts };
+          this.unmemoizableFrame = true;
+        } else {
+          this.traces.push({ line, engine: fresh.reducedVars === 0 ? "presolve" : fresh.engine, status: fresh.statusText, ok: false, timeMs: fresh.timeMs, iterations: fresh.iterations, cached: false, nVars: prob.names.length, nCons, eliminated: fresh.eliminated ?? 0, objective: fresh.objective, violations: fresh.violations, values: [], boxes: [], verdict: fresh.verdictText, warm: fresh.warm || undefined, maxResid: fresh.maxResid, conflicts: fresh.conflicts });
+          const why = fresh.conflicts?.length ? ` — conflicting: ${fresh.conflicts.slice(0, 3).map((c) => `'${c.label}'`).join(", ")}` : "";
+          throw err(`solve on line ${line} failed: ${fresh.verdictText} (${fresh.engine})${why}`, line);
+        }
+      }
     }
     const subst = (v: Value): Value => {
       if (v instanceof Lin) return res.ok ? v.eval(res.values) : 0;
@@ -970,9 +1025,19 @@ export class Interp {
       if (isList(v) && v.length > 0 && (v[0] instanceof Rec || isList(v[0]))) v.slice(0, 16).forEach((x, i) => shown.push({ name: `${d.name}[${i}]`, value: showSolved(x) }));
       else shown.push({ name: d.name, value: showSolved(v) });
     }
-    out.f.set("solver", new Rec(new Map<string, Value>([["status", res.statusText], ["ok", res.ok], ["engine", res.engine], ["objective", res.objective], ["iterations", res.iterations], ["time_ms", res.timeMs]])));
-    this.traces.push({ line, engine: res.reducedVars === 0 ? "presolve" : res.engine, status: res.statusText, ok: res.ok, timeMs: cached ? 0 : res.timeMs, iterations: res.iterations, cached, cacheKind: cached ? "problem" : undefined, nVars: prob.names.length, nCons, eliminated: res.eliminated ?? 0, objective: res.objective, violations: res.violations, values: shown, boxes });
-    if (!res.ok) throw err(`solve on line ${line} failed: ${res.statusText} (${res.engine})`, line);
+    out.f.set("solver", new Rec(new Map<string, Value>([
+      ["status", degraded ? degraded.verdict : res.statusText], ["ok", degraded ? false : res.ok], ["engine", res.engine],
+      ["objective", res.objective], ["iterations", res.iterations], ["time_ms", res.timeMs],
+      ["warm", res.warm && !cached], ["approx", res.approximate], ["proven", res.proven],
+      ["max_resid", res.maxResid], ["degraded", degraded !== undefined],
+    ])));
+    this.traces.push({
+      line, engine: res.reducedVars === 0 ? "presolve" : res.engine, status: degraded ? degraded.status : res.statusText, ok: degraded ? false : res.ok,
+      timeMs: cached ? 0 : res.timeMs, iterations: res.iterations, cached, cacheKind: cached ? "problem" : undefined,
+      nVars: prob.names.length, nCons, eliminated: res.eliminated ?? 0, objective: res.objective, violations: res.violations, values: shown, boxes,
+      verdict: degraded ? degraded.verdict : res.verdictText, warm: res.warm && !cached || undefined, warmRetry: res.warmRetry || undefined, approx: res.approximate || undefined,
+      maxResid: res.maxResid || undefined, conflicts: degraded ? degraded.conflicts : res.conflicts, degraded,
+    });
     return out;
   }
 }

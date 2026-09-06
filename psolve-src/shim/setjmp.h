@@ -1,8 +1,9 @@
-/* wasm32 shim: psolve's error frames are never armed from the browser
- * bridge, so setjmp/longjmp are declared but unreachable. */
-#ifndef _SHIM_SETJMP_H
-#define _SHIM_SETJMP_H
-typedef long jmp_buf[8];
+/* setjmp/longjmp stub for wasm: the psw_* bridge never arms a PSolveErrFrame,
+ * so setjmp is only ever called by code paths that are never reached (a frame
+ * must be armed first for longjmp to run, and psolve_fail exit()s otherwise). */
+#ifndef PSOLVE_SHIM_SETJMP_H
+#define PSOLVE_SHIM_SETJMP_H
+typedef struct { int __r; } jmp_buf[1];
 int setjmp(jmp_buf env);
-void longjmp(jmp_buf env, int val);
+void longjmp(jmp_buf env, int v);
 #endif

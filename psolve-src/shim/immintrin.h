@@ -1,1 +1,1 @@
-/* wasm32: no x86 intrinsics; kernels.c falls back to scalar */
+/* empty: kernels.c falls back to its scalar paths on wasm32 */

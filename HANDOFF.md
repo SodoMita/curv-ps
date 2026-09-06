@@ -1,4 +1,4 @@
-# Curv+solve — handoff (dev round 13)
+# Curv+solve — handoff (dev round 14)
 
 Browser playground for **Curv** (2D F-Rep, compiled to WGSL / JS) extended with
 `solve { }` constraint blocks solved by **psolve** (LP + convex QP, WebAssembly).
@@ -9,13 +9,88 @@ Headless checks (all use the JS backend, no browser needed):
 | command | what it does |
 |---|---|
 | `npx tsx scripts/selftest.ts [id \| file.curv …]` | evaluates every example, compiles both backends (`anim`/`anim(shader)` flags when the program reads time in the evaluator / only inside compiled shader code), renders `/tmp/t/<id>.png` |
-| `npx tsx scripts/paramcheck.ts` | **fast-path oracle**: `walkParams` buffer == ParamsOnly buffer == full codegen's; key stable and shader text identical across time/viewport; **memoised evaluations produce the same buffer as cold ones** (`memo=` column); **`skip=safe`** when a program reads no time/mouse/viewport and its key *and* parameter buffer are identical for every input (the exact precondition of the App's static-frame skip) |
+| `npx tsx scripts/paramcheck.ts` | **fast-path oracle**: `walkParams` buffer == ParamsOnly buffer == full codegen's; key stable and shader text identical across time/viewport; **memo replays are bitwise-identical and memo-vs-cold buffers agree within `warmΔ ≤ 1e-6`** (`memo=` column; the Δ is solve-path rounding from accepted warm starts, replay itself stays bitwise); **`skip=safe`** when a program reads no time/mouse/viewport and its key *and* parameter buffer are identical for every input |
 | `npx tsx scripts/memotest.ts` | solve-block **and call-memo** dependency tests (time/mouse/viewport through closures, shadowing, mutations, impure bodies, `print`/`parametric`, node identity …) |
-| `npx tsx scripts/prof.ts [-v]` | warm eval / codegen / params-only timings, per-`solve` cache kind, call-memo hit/miss counters; `-v` prints the per-function memo decisions (calls, warm avg µs, LRU entries, skip reason) |
+| `npx tsx scripts/warmcheck.ts` | **round-14 bridge oracle**: warm→cold drag equivalence (plan P0.2 acceptance: pixel-identity), failure degradation/recovery with **no memo pollution**, first-frame certified-infeasible error message, wall-clock **budget → STOPPED + approximate incumbent (never garbage)**, budget ladder certifies |
+| `npx tsx scripts/warmbench.ts [example …]` | cold-vs-chained solve timing, interleaved best-of-4 per width (round-12 noise lesson), warm-accept / cold-retry counters |
+| `npx tsx scripts/prof.ts [-v]` | warm eval / codegen / params-only timings, per-`solve` cache kind, call-memo hit/miss counters; `-v` prints the per-function memo decisions |
 
-All four were green at the end of this round (`paramcheck` and `memotest` exit 1 on any failure — check the exit code).
+All five checks were green at the end of this round (`paramcheck` / `memotest` / `warmcheck` exit 1 on any failure — check the exit code).
 
-## What changed in this round
+## What changed in this round — psolve sync + the bridge upgrade (upstream `docs/CURV_PS_PLAN.md` P0, and §6 "what curv-ps should change")
+
+Upstream psolve moved to `main` (`05f9411cccbc`, merge of `arena/01a07358-psolve`, PR #1: certified QP
+Phase-I infeasibility, warm starts, wall-clock budgets, the psolve-owned wasm bridge).  This round
+re-syncs the vendored solver and adopts the new contract end-to-end; the exact text of the plan this
+implements lives in the psolve repo at `docs/CURV_PS_PLAN.md` (P0.1/P0.2/P0.3 acceptance + §6 items 1–5).
+
+1. **psolve re-vendored from `main@05f9411cccbc`, reproducibly.**  `psolve-src/` now carries the
+   upstream bridge *verbatim* (`psolve_web.c` ABI 3 + `psolve_web.h`), a `PIN` (upstream commit,
+   blob sha256, toolchain), and `build-wasm.sh` — verified to reproduce the committed blob
+   **byte-identically** (`bcbe7b1d…`, two consecutive builds).  The recipe mirrors upstream's
+   `tools/wasm_build.sh` with the two documented deltas modern wasi-sdk forces: `shim/` (setjmp —
+   hard error since wasi-sdk 25; the psw_* paths never arm a `PSolveErrFrame`, so it is dead code —
+   plus empty `immintrin.h` and a nearest-only `fenv.h`, same semantics as the round-3 shims) and an
+   explicit 32 MB initial memory.  Errata discovered and fixed while doing this: host `nm` cannot
+   read wasm objects (the export list silently came out empty → a *different, broken* module — the
+   script now calls wasi-sdk's `llvm-nm`), and link object order changes the hash, so the recipe's
+   object glob order is load-bearing.  The blob fell from ~263 KB to 215.7 KB binary
+   (`--gc-sections`; recipe uses plain `-O2`, not `-flto` — LTO on the old corpus cost more link
+   time than it saved bytes here; re-A/B if module size matters again).
+2. **`src/psolve/psolve.ts` rewritten for ABI 3.**  ABI asserted on load; status/verdict **strings
+   come from the wasm module** (`psw_qp_status_name` / `psw_qp_verdict_name`) so a give-up
+   (`NO_FEASIBLE_START`) can never be renamed "infeasible" by a stale JS table; a real WASI
+   `clock_time_get` shim (budgets are wall-clock); `qpStartFeasible()` exposed (the engine's own
+   warm-start acceptance test); `SolveResult` gains `verdictText`, `certified`, `approximate`
+   (status 2/6 = usable incumbent, *not* a certified optimum — plan P2.1), `warm`, `warmRetry`,
+   `proven`, `farkas`, `maxResid`.  Warm starts are handed over **only when
+   `psw_qp_start_feasible` accepts them** — a rejected start would still sway the Phase-I search
+   point, and with it the numerics; a rejected x0 therefore runs the byte-exact cold path.
+3. **`constraints.ts` per plan §6.1/§6.3.**  (a) All LP/QP rows are normalised to unit max
+   coefficient before marshalling (pixels vs the engine's absolute working-set tolerances).
+   (b) Presolve thresholds are *relative to each row's own scale* (pivot `1e-11·rowmax`,
+   inconsistency `1e-9·(1+rowmax)`) — the old absolute `1e-6` test could declare a pixel-scale
+   layout inconsistently at the front end.  (c) When the equality presolve declines, the problem is
+   handed to psolve **unreduced** (hard equalities as ≤/≥ pairs — reliable upstream since the
+   probe's encoding-equivalence fix) instead of the old `INFEASIBLE, amount: Infinity`
+   short-circuit.  (d) A required constraint that propagates to a constant is itself a *proof*: it
+   returns a certified `INFEASIBLE_PROVEN` result naming the constraint (it used to throw straight
+   out of `Problem.solve`, dodging every recovery path).  (e) `Problem.solve({x0, budgetMs,
+   warmBudgetMs})`: a warm attempt (accepted starts only) gets a 4 ms sub-budget; if it is STOPPED,
+   the problem is retried cold inside the frame budget and the *feasible/certified* of the two
+   attempts wins (`warmRetry`, timings summed).  Rationale, measured (`scripts/warmbench.ts`,
+   interleaved best-of-4): px-continuous drags win (chart **2.1×**: 0.114→0.054 ms/frame; upstream's
+   probe measures 23–35× at N=8–32 with 1 px steps), while resize jumps with *discrete* structure
+   changes (toolbar/wrapfit/buttons 40 px/frame) get **0/5 accepts** — the prior point is simply
+   infeasible for the new row set — and cost nothing (≈1.0×).  First un-interleaved measurements
+   reported "toolbar 6× slower, chart 18×" — both were JIT noise; the round-12 lesson applies to
+   every benchmark, including new ones.
+4. **`interp.ts` per plan §6.2/§6.4.**  `warmCache` (per block-astId: names + last good values)
+   feeds `x0`; a warm start is *legal only when the cached variable names are a prefix of the new
+   problem's in declaration order* (ids shift with `for`-loop counts — same-text blocks with
+   different `n` must not start from each other).  A failed solve **never throws when the block has
+   any previous good result** with enough values: the block degrades to that layout and the trace is
+   marked amber (`degraded`), listing the failure verdict and Farkas-conflict rows (§6.2: amber, not
+   a red screen).  Failures are **never cached** — not in the fingerprint LRU, not in the block memo
+   (`unmemoizableFrame` skips the store), not in the call memo (same flag in `applyMemo`) — so the
+   next frame re-attempts and recovery is observable (`warmcheck` [2]: recovered frame is
+   bitwise-identical to a clean-cache evaluation, i.e. zero memo pollution).  A first-frame failure
+   still throws, now with the certified verdict and the conflicting constraint labels.  Every solve
+   runs under `SOLVE_BUDGET_MS = 16 ms` (one 60 fps frame): a binding budget reports
+   STOPPED + incumbent (trace badge "incumbent", `approx:true`) instead of hanging the UI.
+   The block's `solver` record gains `verdict/proven/approx/warm/max_resid/degraded`.
+5. **SolverPanel** shows the new vocabulary: the pill honours verdicts and incumbents; per-block
+   badges "warm start" / "warm → cold retry" / "incumbent" / amber "fallback: last good" (with the
+   failure status and Farkas rows); a proven-infeasible banner names the conflicting constraints;
+   the footer carries the provenance (bridge ABI, wasm sha256 head, upstream pin — plan §6.5).
+6. **Scripts**: `warmcheck.ts` (above) and `warmbench.ts` (above) are new; `paramcheck.ts`'s
+   `memo=` column is now explicitly two properties: replay integrity (**bitwise** — a replay
+   rebuilds from the stored result object) and warm-path equality vs cold (**≤ 1e-6**; the sole
+   nonzero on the matrix is `chart`, `warmΔ=9.5e-7` on 1/699 floats — the accepted warm start lands
+   a different rounding of the same optimum; §Invariants updated accordingly).  Reference rows for
+   all of this are in `warmcheck.ts`'s output.
+
+## Round 13 recap (kept from the round-13 handoff — all still in force)
 
 1. **`textWindow` shader variant** (`SHADER_FLAGS.textWindow`, round-13 attempt at faster text): text
    nodes with more than 6 glyphs binary-search the glyph cell under the pixel (cells are sorted along
@@ -207,12 +282,17 @@ src/curv/examples.ts    example programs (group "solve" | "curv")
 src/gpu/gen.ts          code generators: WGSL, JS, ParamsOnly; dynBlock/finalParams; Gen.usesTime
 src/gpu/renderer.ts     WebGPU renderer (pipeline cache keyed by code, timestamp queries) + CPU fallback
 src/gpu/atlas.ts        SDF glyph atlas (Canvas2D + EDT), GLYPHS charset, kerning
-src/psolve/*.ts         Lin/Quad affine expressions, Cons, presolve, QP/LP assembly, bridge to psolve.wasm (b64 inline)
-psolve-src/             C bridge + build instructions for the wasm (unmodified psolve cores)
+src/psolve/constraints.ts  Lin/Quad affine exprs, Cons, presolve (relative thresholds, unreduced
+                           fallback, constant-false = certified proof), row normalisation, QP/LP
+                           assembly, warm-start + budget + cold-retry policy, Farkas conflict labels
+src/psolve/psolve.ts    ABI-3 bridge to psolve.wasm (wasm-side status/verdict names, clock shim,
+                           qpStartFeasible, SolveResult flags), psolveInfo() provenance
+psolve-src/             vendored upstream bridge (verbatim) + shims + build-wasm.sh + PIN
+                           (reproduces the committed blob byte-identically)
 src/App.tsx             UI: editor, preview (camera, pause, CPU-aware quality controller, static-frame
                         skip cache, shader-time re-render path, single-eval camera fitting), solver +
                         params panels, memo hits + static badge in the status line
-scripts/                selftest, paramcheck, memotest, prof (headless, tsx)
+scripts/                selftest, paramcheck, memotest, warmcheck, warmbench, prof, shaderbench, sheet (headless, tsx)
 ```
 
 ## Invariants to keep (things that will silently break otherwise)
@@ -280,9 +360,42 @@ scripts/                selftest, paramcheck, memotest, prof (headless, tsx)
   or prelude name must stay a same-frame shadow, not corruption of the shared env.
 * `codeLru` entries must only ever depend on (backend, structural key): anything else baked into code
   (colours, atlas constants that can differ per document) would need to join the key.
+* **A failed solve is never cached anywhere** (fingerprint LRU, block memo, call memo): a degraded
+  result is history-dependent by construction, and caching one would make recovery unreachable.
+  `unmemoizableFrame` is the single guard — set it on any future failure/degrade path.
+* **Warm starts are numerics-only, never identity**: `warmCache` may only seed `x0` when (a) the
+  cached names prefix the new problem's names in declaration order and (b) the engine's own
+  `psw_qp_start_feasible` accepts the point.  A rejected start must run the *exact* cold path (it is
+  what keeps paramcheck's replay-vs-cold Δ a rounding artifact instead of a semantics question).
+* **`verdict` vs `status`**: `-1` is `NO_FEASIBLE_START` unless `proven` — never relabel it
+  "infeasible" (that is the bug class upstream's P0.1 exists to kill; the JS prints wasm-side
+  strings only).  `approximate` (STOPPED / ITER_LIMIT) results are wall-clock-dependent and may
+  differ between machines; certified results may not.
+* Budgets: only the *quality* of a STOPPED outcome is machine-dependent; correctness is the
+  `maxResid`/violations checks.  Keep `SOLVE_BUDGET_MS` ≥ worst honest solve (≈2 ms today) with
+  generous headroom (16 ms), so certified answers are the steady state.
+* When touching the wasm: bump `PIN`, `PSOLVE_WASM_SHA256`/`PSOLVE_UPSTREAM_PIN`, keep
+  `psw_abi()` == `PSOLVE_BRIDGE_ABI`, re-run the build twice and compare sha256 before committing
+  the blob.
 
 ## Known gaps / next steps
 
+* The solver side is now upstream-shaped; the next capacity items live in psolve and are enumerated
+  in `docs/CURV_PS_PLAN.md` there: **P1.1 native equalities & variable bounds in the QP** (would let
+  this repo delete its Gaussian `eliminate` + the ≤/≥ pair fallback and shrink `m` 2–3×),
+  **P1.2 sparse QP input / diagonal+rank-1 Q** (`n²` marshalling dominates at n≳32),
+  **P1.3 IIS/conflict rows on the LP path & the sparse KKT** (also the honest fix for
+  KKT_FAIL/ITER_LIMIT at 1e3–1e6 scales).  The LP warm start does not exist upstream yet; LPs here
+  are rare and tiny.
+* Warm starts are accepted on only some workloads (continuous drags: yes; jump-resizes with discrete
+  structure changes: no — by engine design).  The adaptive piece worth having is MPC-style *active-set*
+  reuse (upstream roadmap §13.2 "sequence API", listed as plan P0.2's persistent handle), not
+  tolerance loosening.  `psw_qp_set_phase1_lp_first` is plumbed but unused (dense-first answers more
+  models at our sizes; flip if n+m ≳ 600 models appear — that is where the upstream gate already
+  makes LP-first bind).
+* The psolve arena (`psw_arena_*`) is deliberately **not** used: upstream measured it *slower* than
+  libc malloc on this QP workload (their P2.4), and an exhausted arena aborts the module; it stays a
+  determinism option, not a speed one.
 * Eval of the *rest* of an animated cached frame (user-tree construction, `union` literals) is nearly
   all that remains on warm frames (split 0.04 ms, dashboard ≈ 0.9 ms raw; static examples skip
   evaluation entirely).  Builtins (round 10) and the prelude (round 9) are shared per-process now; the
