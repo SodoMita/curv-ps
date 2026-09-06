@@ -1,4 +1,4 @@
-# Curv+solve — handoff (dev round 11)
+# Curv+solve — handoff (dev round 12)
 
 Browser playground for **Curv** (2D F-Rep, compiled to WGSL / JS) extended with
 `solve { }` constraint blocks solved by **psolve** (LP + convex QP, WebAssembly).
@@ -16,6 +16,32 @@ Headless checks (all use the JS backend, no browser needed):
 All four were green at the end of this round (`paramcheck` and `memotest` exit 1 on any failure — check the exit code).
 
 ## What changed in this round
+
+1. **GitHub Pages**: the single-file build is live at <https://sodomita.github.io/curv-ps/> — served from
+   the `gh-pages` branch (repo root `index.html` = `dist/index.html`), rebuilt and force-pushed by
+   `.github/workflows/pages.yml` on every push to main; repo homepage set via the API.
+   Refresh the branch manually with `npm run build` + the same orphan-commit recipe if Actions is off.
+2. **Shader-variant infrastructure and the branch-reduction study** (`SHADER_FLAGS` in `src/gpu/gen.ts`,
+   benchmark `scripts/shaderbench.ts`).  Every variant preserves the parameter layout exactly (params
+   verified equal with all flags on) and is fingerprinted into `structKey` (`flagsKey`) so caches never
+   mix.  Measured per example on the JS backend (what the CPU renderer executes), with interleaved
+   best-of-4 timing — first-run JIT effects otherwise masquerade as ±20 % between *identical* code:
+
+   | way (vs baseline) | total over 19 examples | branches (`if`) | verdict |
+   |---|---|---|---|
+   | poly-select (`%`→conditional index, sign via `select`) | +0 % (±4 % on polygon) | 334→333 | off: branch is cheaper where it skips |
+   | text-branchless (always sample + `select`) | +0 %, **stacks +69 %** | 334→217 | off: texture-call traffic beats divergence here |
+   | if-flatten (dynamic `if` → `select`, tiny bodies) | +1 %, mandelbrot +18 % | 334→333 | off: computes both sides per pixel |
+   | unroll static loops ≤ 8 | **+9 %** (smoke +51 %) | code +27 kB | off: JIT/code-size hurt |
+   | **cull-none** (no bbox culling) | **+149 %** | 334→120 | — |
+   | cull weight 1 / 8 / 16 (baseline 4) | +7 % / +9 % / +43 % | 576 / 290 / 199 | keep 4 |
+
+   Takeaways kept as invariants: **bbox-cull branches are the single biggest shader win (2.5×)**;
+   textbook "branchless is better on GPUs" is **false on this corpus** for scalar/texture-heavy paths —
+   a skipped texture call and a skipped subtree beat `select`.  `flattenIf`/`unrollMax` remain available
+   for future programs; re-run `shaderbench` before enabling anything by default.
+
+## Round 11 recap (kept from the round-11 handoff — all still in force)
 
 1. **Adaptive layout combinators** (`src/curv/prelude.ts`).  `flow_fit gap maxw maxh pad s labels b items`
    greedily wraps *measured* chips (like `flow_text`) after bisecting the largest font size ≤ s whose rows
@@ -38,7 +64,7 @@ All four were green at the end of this round (`paramcheck` and `memotest` exit 1
 3. Reference rows for `fit_labels` / `flow_fit`; `buttons` and `tooltip` got bounded adaptive variants of
    their teaching constraints (list-driven rendering replaces hard-coded indices).
 
-## Round 10 recap (kept from the round-10 handoff — all still in force)
+## Round 10/9/8/7 recaps (kept from earlier handoffs — all still in force)
 
 1. **Shared static builtin environment** (`staticBuiltins`, per-atlas `WeakMap`).  All ~150 builtins that
    depend only on their arguments (math, lists, strings, colours, shape constructors/operators, text
@@ -60,7 +86,7 @@ All four were green at the end of this round (`paramcheck` and `memotest` exit 1
 3. Warm-frame effect (`prof.ts`, noisy sandbox but consistent): split eval 0.15 → 0.04 ms, dashboard
    1.3 → 0.9 ms, toolbar 0.7 → 0.8 ms with 27 memo hits; params-only on cached trees is 0.01–0.1 ms.
 
-## Round 9 recap (kept from the round-9 handoff — all still in force)
+### Round 9 recap (kept from the round-9 handoff — all still in force)
 
 1. **Shared prelude environment** (`Interp.run`).  The prelude (≈60 defs: palette, box helpers, layout
    combinators, UI components) is bind-time pure, so it is evaluated **once per process** into a shared
@@ -78,7 +104,7 @@ All four were green at the end of this round (`paramcheck` and `memotest` exit 1
    that makes them and gone in the next; prelude combinators keep memoising across programs; prelude
    functions stored in lists/lambdas resolve on every frame.
 
-## Round 8 recap (kept from the round-8 handoff — all still in force)
+### Round 8 recap (kept from the round-8 handoff — all still in force)
 
 1. **App static-frame skip** (`src/App.tsx` `evaluate`).  After a successful evaluation, if the program read no
    `time`/`mouse`/`viewport` (`usesTime || CompiledTree.usesTime` covers the shader side too), its
@@ -99,7 +125,7 @@ All four were green at the end of this round (`paramcheck` and `memotest` exit 1
    8 → 24 per warm frame with hashing ≈ 0.12 ms; a 9 µs body hashed in ~7 µs is correctly skipped.
 3. **`paramcheck` static-skip oracle** (`skip=safe` column) and Reference rows for the new behaviour.
 
-## Round 7 recap (kept from the round-7 handoff — all still in force)
+### Round 7 recap (kept from the round-7 handoff — all still in force)
 
 1. **Call memo for pure user functions** (`Interp.applyMemo`, used by `makeClosure`'s final application).
    Each function *body* is profiled for `CALL_MEMO_SAMPLES` (4) calls — the first call is

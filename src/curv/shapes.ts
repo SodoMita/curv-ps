@@ -3,7 +3,7 @@
 // the Gen backends.  All numbers that may vary between evaluations are emitted
 // as parameters so re-solving / animating never triggers a shader recompile.
 import { type Atlas, CELL, FONT_PX, GLYPH_PAD, BASELINE, ATLAS_COLS, ATLAS_ROWS, penAdvance } from "../gpu/atlas";
-import { type Gen, type E, GenError } from "../gpu/gen";
+import { type Gen, type E, GenError, SHADER_FLAGS, flagsKey } from "../gpu/gen";
 
 export type RGBA = [number, number, number, number];
 export type BBox = [number, number, number, number]; // x0 y0 x1 y1 (local coords)
@@ -233,7 +233,7 @@ function weightRaw(n: SNode): number {
 }
 
 /** Shared by codegen and the structural key: does `kidCulled` wrap this subtree in a bbox test? */
-const cullable = (s: SNode, atlas: Atlas, cull: boolean) => cull && weight(s) >= 4 && finiteBBox(bboxOf(s, atlas)) !== null;
+const cullable = (s: SNode, atlas: Atlas, cull: boolean) => cull && weight(s) >= SHADER_FLAGS.cullWeight && finiteBBox(bboxOf(s, atlas)) !== null;
 
 // ---------------------------------------------------------------- content hash
 /** 64-bit FNV-1a style hash of a string, as 16 hex chars (two independent 32-bit lanes). */
@@ -303,12 +303,16 @@ function nodeHashRaw(n: SNode): string | null {
  * frame (`shadow` visits its child twice, a shape used in several places) and subtrees that
  * survive across frames through the call memo are keyed once.
  */
-const skMemo: [WeakMap<SNode, string | null>, WeakMap<SNode, string | null>] = [new WeakMap(), new WeakMap()];
+// memo slot per (cull, flags): the cull threshold changes cullable() and thus the key content,
+// and the whole key is prefixed with the flag fingerprint so `codeLru` never mixes variants
+const skMemos = new Map<string, WeakMap<SNode, string | null>>();
 export function structKey(n: SNode, atlas: Atlas, cull = true): string | null {
-  const memo = skMemo[cull ? 1 : 0];
+  const fk = flagsKey() + (cull ? "/1" : "/0");
+  let memo = skMemos.get(fk);
+  if (!memo) { memo = new WeakMap(); skMemos.set(fk, memo); }
   let k = memo.get(n);
   if (k === undefined) { k = structKeyRaw(n, atlas, cull); memo.set(n, k); }
-  return k;
+  return k === null ? null : flagsKey() + "|" + k;
 }
 function structKeyRaw(n: SNode, atlas: Atlas, cull: boolean): string | null {
   const kidC = (s: SNode) => { const k = structKey(s, atlas, cull); return k === null ? null : (cullable(s, atlas, cull) ? "[" : "(") + k + ")"; };
@@ -415,14 +419,15 @@ export function genShape(g: Gen, n: SNode, p: E, ctx: GenCtx): DC {
       const v0 = g.vec([g.paramAt(baseE), g.paramAt(g.bin("+", baseE, g.num(1)))]);
       const dv = g.var(g.fn("dot", [g.bin("-", p, v0), g.bin("-", p, v0)])); const sv = g.var(g.num(1));
       g.loop(g.num(N), (i) => {
-        const j = g.let(g.bin("%", g.bin("+", i, g.num(N - 1)), g.num(N)));
+        const j = SHADER_FLAGS.polySelect ? g.let(g.sel(g.cmp("<", i, g.num(1)), g.num(N - 1), g.bin("-", i, g.num(1)))) : g.let(g.bin("%", g.bin("+", i, g.num(N - 1)), g.num(N)));
         const vi = g.let(g.vec([at(i, 0), at(i, 1)])), vj = g.let(g.vec([at(j, 0), at(j, 1)]));
         const e = g.let(g.bin("-", vj, vi)), w = g.let(g.bin("-", p, vi));
         const b = g.let(g.bin("-", w, g.bin("*", e, g.fn("clamp", [g.bin("/", g.fn("dot", [w, e]), g.fn("max", [g.fn("dot", [e, e]), g.num(1e-9)])), g.num(0), g.num(1)]))));
         g.assign(dv, g.fn("min", [dv, g.fn("dot", [b, b])]));
         const c1 = g.cmp(">=", py(), g.idx(vi, 1)), c2 = g.cmp("<", py(), g.idx(vj, 1)), c3 = g.cmp(">", g.bin("-", g.bin("*", g.idx(e, 0), g.idx(w, 1)), g.bin("*", g.idx(e, 1), g.idx(w, 0))), g.num(0));
         const all = g.logic("&&", g.logic("&&", c1, c2), c3), none = g.logic("&&", g.logic("&&", g.not(c1), g.not(c2)), g.not(c3));
-        g.if(g.logic("||", all, none), () => g.assign(sv, g.neg(sv)));
+        if (SHADER_FLAGS.polySelect) g.assign(sv, g.bin("*", sv, g.sel(g.logic("||", all, none), g.num(-1), g.num(1))));
+        else g.if(g.logic("||", all, none), () => g.assign(sv, g.neg(sv)));
       });
       return prim(g.bin("*", sv, g.fn("sqrt", [dv])));
     }
@@ -441,12 +446,20 @@ export function genShape(g: Gen, n: SNode, p: E, ctx: GenCtx): DC {
         const at = (off: number) => g.paramAt(g.bin("+", g.bin("+", baseE, g.bin("*", i, g.num(5))), g.num(off)));
         const lp = g.let(g.bin("-", p, g.vec([at(0), qyE])));
         const bd = g.let(sdBox(g, g.bin("-", lp, half), half, half, g.num(0)));
-        g.if(g.cmp("<", bd, pad), () => {
+        if (SHADER_FLAGS.textBranchless) {
+          // branchless: always sample, select the result — no divergence, more texture traffic
           const q = g.fn("clamp", [g.bin("/", lp, qsE), g.num(0), g.num(1)]);
           const uv = g.fn("mix", [g.vec([at(1), at(2)]), g.vec([at(3), at(4)]), q]);
           const dg = g.bin("*", g.bin("*", g.bin("-", g.num(0.5), g.tex(uv)), g.num(2 * 8)), sE);
-          g.assign(dv, g.fn("min", [dv, g.fn("max", [dg, bd])]));
-        }, () => g.assign(dv, g.fn("min", [dv, g.bin("+", bd, pad)])));
+          g.assign(dv, g.fn("min", [dv, g.sel(g.cmp("<", bd, pad), g.fn("max", [dg, bd]), g.bin("+", bd, pad))]));
+        } else {
+          g.if(g.cmp("<", bd, pad), () => {
+            const q = g.fn("clamp", [g.bin("/", lp, qsE), g.num(0), g.num(1)]);
+            const uv = g.fn("mix", [g.vec([at(1), at(2)]), g.vec([at(3), at(4)]), q]);
+            const dg = g.bin("*", g.bin("*", g.bin("-", g.num(0.5), g.tex(uv)), g.num(2 * 8)), sE);
+            g.assign(dv, g.fn("min", [dv, g.fn("max", [dg, bd])]));
+          }, () => g.assign(dv, g.fn("min", [dv, g.bin("+", bd, pad)])));
+        }
       });
       return { d: dv, c: white };
     }

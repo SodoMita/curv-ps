@@ -13,6 +13,27 @@ export class GenError extends Error {}
 
 const UNARY = new Set(["sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh", "exp", "log", "log2", "sqrt", "abs", "floor", "ceil", "round", "trunc", "fract", "sign", "normalize", "length", "exp2"]);
 
+/**
+ * Code-generation variants, all preserving the parameter layout (so `walkParams` and the memoised
+ * caches stay valid).  `scripts/shaderbench.ts` measures them individually; the defaults are the
+ * winners of that benchmark.  A change of any flag changes the generated text, so it is part of
+ * the structural key (see `flagsKey`) — `codeLru`/`structKey` results are never confused across them.
+ */
+export interface ShaderFlags {
+  /** polygon loop: conditional index instead of `%`, sign via `select` instead of `if` (branchless) */
+  polySelect: boolean;
+  /** text loop: always sample the atlas and `select` instead of `if (inside) {…} else {…}` (branchless) */
+  textBranchless: boolean;
+  /** minimum subtree weight for a bbox-cull branch in unions/intersections (Infinity = never cull) */
+  cullWeight: number;
+  /** SubCurv: flatten a dynamic `if` with tiny branch bodies into `select`s (compute both, pick) */
+  flattenIf: boolean;
+  /** SubCurv: unroll loops whose trip count is a compile-time constant ≤ this */
+  unrollMax: number;
+}
+export const SHADER_FLAGS: ShaderFlags = { polySelect: false, textBranchless: false, cullWeight: 4, flattenIf: false, unrollMax: 0 };
+export const flagsKey = () => (SHADER_FLAGS.polySelect ? "p" : "") + (SHADER_FLAGS.textBranchless ? "T" : "") + "w" + SHADER_FLAGS.cullWeight + (SHADER_FLAGS.flattenIf ? "f" : "") + "u" + SHADER_FLAGS.unrollMax;
+
 export abstract class Gen {
   /** set by SubCurv when compiled user code reads the time (the `t` of `[x,y,z,t]`, or `time`): the program animates through the time uniform */
   usesTime = false;
@@ -24,6 +45,9 @@ export abstract class Gen {
   tmp(prefix = "t") { return `${prefix}${this.n++}`; }
   emit(s: string) { this.lines.push(this.indent + s); }
   code() { return this.lines.join("\n"); }
+  /** statement count for speculative emission (SubCurv's if-flattening); `cut` returns and removes everything after the mark */
+  mark(): number { return this.lines.length; }
+  cut(m: number): string[] { return this.lines.splice(m); }
 
   param(v: number): E { const i = this.params.length; this.params.push(Number.isFinite(v) ? v : v > 0 ? 3e38 : v < 0 ? -3e38 : 0); return { t: "f", s: `P[${i}]` }; }
   /** Variable-length blocks (glyphs, polygon vertices) are appended *after* all scalar parameters by

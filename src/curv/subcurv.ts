@@ -4,7 +4,7 @@
 // the pixel position (or on a loop variable / mutable local) becomes shader
 // code.  Function calls are inlined.
 import { CurvError, type Expr, type Pat, type Stmt } from "./parser";
-import { type Gen, type E, GenError } from "../gpu/gen";
+import { type Gen, type E, GenError, SHADER_FLAGS } from "../gpu/gen";
 import { Fn, Rec, Env, Interp, arith, show, typeName, type Value } from "./interp";
 import type { GenCtx } from "./shapes";
 
@@ -23,6 +23,7 @@ export class CEnv {
     while (e) { if (e.vars.has(n)) return e.vars.get(n); if (e.fallback) { const v = e.fallback.lookup(n); if (v !== undefined) return { kind: "static", v }; } e = e.parent; }
     return undefined;
   }
+  owner(n: string): CEnv | null { let e: CEnv | null = this; while (e) { if (e.vars.has(n)) return e; e = e.parent; } return null; }
   child() { return new CEnv(this, null); }
 }
 
@@ -261,11 +262,19 @@ export class SC {
           if (cur.kind !== "var") throw err(`'${s.name}' is not a local variable (declare it with 'local')`, s.line);
           const v = this.toE(this.expr(s.e, env), s.line);
           if (v.t !== cur.ref.t) throw err(`Cannot assign a ${v.t} to '${s.name}' (a ${cur.ref.t})`, s.line);
-          g.assign(cur.ref, v); break;
+          // if-flattening: assignments to outer vars become selects later; rebind as a shadow let so
+          // reads inside the same branch see the new value (branch-locals declared inside stay normal)
+          if (this.flattenCaptures && !this.insideBoundary(env.owner(s.name) ?? env)) {
+            const t = g.let(v);
+            this.flattenCaptures.set(s.name, t);
+            env.vars.set(s.name, { kind: "dyn", e: t });
+          } else g.assign(cur.ref, v);
+          break;
         }
         case "if": {
           const c = this.expr(s.cond, env);
           if (c.kind === "static") { if (c.v === true) this.exec(s.body, env.child()); else if (s.else) this.exec(s.else, env.child()); break; }
+          if (SHADER_FLAGS.flattenIf && !this.flattenCaptures && this.tryFlattenIf(s, c, env)) break;
           g.if(this.toE(c, s.line), () => this.exec(s.body, env.child()), s.else ? () => this.exec(s.else!, env.child()) : undefined);
           break;
         }
@@ -274,13 +283,20 @@ export class SC {
           if (it.k === "range") {
             const a = this.expr(it.a, env), b = this.expr(it.b, env); step = it.step ? this.expr(it.step, env) : this.static(1, true);
             start = a;
+            // fully static small range: unroll (no loop machinery, constants fold through the body)
+            if (SHADER_FLAGS.unrollMax > 0 && start.kind === "static" && typeof start.v === "number" && b.kind === "static" && typeof b.v === "number" && step.kind === "static" && typeof step.v === "number" && step.v !== 0) {
+              const a0 = start.v, b0 = b.v as number, s0 = step.v as number, raw = (b0 - a0) / s0;
+              const n2 = it.open ? Math.ceil(raw - 1e-9) : Math.floor(raw + 1 + 1e-9);
+              if (n2 > 0 && n2 <= SHADER_FLAGS.unrollMax) { for (let k = 0; k < n2; k++) { const e2 = env.child(); this.bind(s.pat, this.static(a0 + k * s0, true), e2, s.line); this.forBody(s, e2); } break; }
+            }
             const n = g.bin("/", g.bin("-", this.toE(b), this.toE(a)), this.toE(step));
             count = g.let(it.open ? g.fn("ceil", [g.bin("-", n, g.num(1e-9))]) : g.fn("floor", [g.bin("+", n, g.num(1 + 1e-9))]));
           } else {
             const l = this.expr(it, env); const items = this.items(l, s.line); if (!items) throw err("for expects a list or range", s.line);
             if (items.every((x) => x.kind === "static" && isNum(x.v)) && items.length > 0) {
-              // iterate a static numeric list by index
               const vals = items.map((x) => (x as { v: number }).v);
+              if (vals.length <= SHADER_FLAGS.unrollMax) { for (const v2 of vals) { const e2 = env.child(); this.bind(s.pat, this.static(v2, true), e2, s.line); this.forBody(s, e2); } break; }
+              // iterate a static numeric list by index
               g.loop(g.num(vals.length), (i) => { const e2 = env.child(); const iv = this.index({ kind: "list", items }, this.dyn(i), s.line); this.bind(s.pat, iv, e2, s.line); this.forBody(s, e2); void vals; });
               break;
             }
@@ -306,6 +322,50 @@ export class SC {
       }
     }
   }
+  /**
+   * While speculatively flattening a dynamic `if` (SHADER_FLAGS.flattenIf): assignments to *outer*
+   * variables are captured here (name → let) instead of emitted, shadowed locally for the rest of
+   * the branch, and merged afterwards as `v = select(c, then, else)`.  Because both bodies are
+   * computed unconditionally, flattening applies only when the bodies are tiny and contain no
+   * control flow (a nested `if`/`for`/`break` rolls the speculation back, see `tryFlattenIf`).
+   */
+  private flattenCaptures: Map<string, E> | null = null;
+  private flattenBoundary: CEnv | null = null;
+  private insideBoundary(h: CEnv) {
+    for (let e: CEnv | null = h; e; e = e.parent) { if (e === this.flattenBoundary) return true; if (e.parent === this.flattenBoundary) return true; if (e === this.flattenBoundary?.parent) return false; }
+    return false;
+  }
+  /**
+   * Try to compile a dynamic `if` statement branchlessly.  Returns true when flattened (both bodies
+   * emitted unconditionally, merges emitted as selects).  Body expressions never emit shader params,
+   * so only lines can need rollback.
+   */
+  private tryFlattenIf(s: Extract<Stmt, { k: "if" }>, c: CV, env: CEnv): boolean {
+    const g = this.g;
+    const m0 = g.mark();
+    const capT = new Map<string, E>(), capE = new Map<string, E>();
+    const bodyEnvT = env.child();
+    this.flattenCaptures = capT; this.flattenBoundary = bodyEnvT;
+    this.exec(s.body, bodyEnvT);
+    if (s.else) { const bodyEnvE = env.child(); this.flattenCaptures = capE; this.flattenBoundary = bodyEnvE; this.exec(s.else, bodyEnvE); }
+    this.flattenCaptures = null; this.flattenBoundary = null;
+    const emitted = g.cut(m0);
+    const bad = emitted.length > 10 || emitted.some((l) => /(^|\W)(if|for)\s*\(/.test(l) || /\bbreak\b/.test(l));
+    if (bad) { for (const l of emitted) g.emit(l); return false; }
+    const merges: [E, E, E][] = [];
+    let localsOnly = true;
+    for (const n of new Set([...capT.keys(), ...capE.keys()])) {
+      const cur = env.lookup(n);
+      if (!cur || cur.kind !== "var") { localsOnly = false; break; }
+      merges.push([cur.ref, capT.get(n) ?? cur.ref, capE.get(n) ?? cur.ref]);
+    }
+    if (!localsOnly) { for (const l of emitted) g.emit(l); return false; }
+    const ce = g.let(this.toE(c, s.line));
+    for (const l of emitted) g.emit(l); // both branches' arithmetic, once, unconditionally
+    for (const [ref, t, e2] of merges) g.assign(ref, g.sel(ce, t, e2));
+    return true;
+  }
+
   private forBody(s: Extract<Stmt, { k: "for" }>, env: CEnv) {
     if (s.until) this.g.if(this.toE(this.expr(s.until, env), s.line), () => this.g.brk());
     this.exec(s.body, env);

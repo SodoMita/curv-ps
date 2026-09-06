@@ -29,6 +29,7 @@ that return constraint values, and text is an SDF atlas (ASCII + Latin-1 + symbo
 * `npm run build` — single-file `dist/index.html`
 * `npx tsx scripts/selftest.ts` — headless render of every example
 * `npx tsx scripts/paramcheck.ts` — verifies the codegen fast paths and solve-block memoisation
+* `npx tsx scripts/shaderbench.ts [example …]` — benchmarks the shader-generation variants (`SHADER_FLAGS`) per example: JS raster time, WGSL bytes, branch/loop counts
 * `npx tsx scripts/memotest.ts` — dependency-tracking tests for solve-block and call memoisation
 
 See [HANDOFF.md](HANDOFF.md) for the architecture, invariants and the current state of development.
