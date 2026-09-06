@@ -23,6 +23,7 @@ const ways: [string, Partial<ShaderFlags>][] = [
   ["baseline", {}],
   ["poly-select", { polySelect: true }],
   ["text-branchless", { textBranchless: true }],
+  ["text-window", { textWindow: true }],
   ["if-flatten", { flattenIf: true }],
   ["unroll-8", { unrollMax: 8 }],
   ["cull-none", { cullWeight: Infinity }],

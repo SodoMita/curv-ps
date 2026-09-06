@@ -1,4 +1,4 @@
-# Curv+solve — handoff (dev round 12)
+# Curv+solve — handoff (dev round 13)
 
 Browser playground for **Curv** (2D F-Rep, compiled to WGSL / JS) extended with
 `solve { }` constraint blocks solved by **psolve** (LP + convex QP, WebAssembly).
@@ -16,6 +16,26 @@ Headless checks (all use the JS backend, no browser needed):
 All four were green at the end of this round (`paramcheck` and `memotest` exit 1 on any failure — check the exit code).
 
 ## What changed in this round
+
+1. **`textWindow` shader variant** (`SHADER_FLAGS.textWindow`, round-13 attempt at faster text): text
+   nodes with more than 6 glyphs binary-search the glyph cell under the pixel (cells are sorted along
+   the row; 6 branchless steps cover N ≤ 64), then evaluate only a 6-glyph window around the hit, with a
+   guard falling back to the full loop when the AA pad exceeds half a cell (deep zoom-out).  Verified
+   **pixel-identical to the baseline on toolbar (0/9216 differing pixels)** and buffer-identical on all
+   examples.  Benchmark verdict, though (full 19-example matrix, JS raster): **+6 % total** — the
+   search + guard costs ≈ saved glyph scans; the dominant per-pixel term is uniform loads / address
+   arithmetic, not glyph count.  Off by default, kept for a future GPU-side benchmark (`shaderbench`).
+2. Round-13 full matrix (sums over all 19 examples; baseline 509 ms total raster):
+
+   | way | Δ time | WGSL |
+   |---|---|---|
+   | text-window | +6 % (stacks +94 %, buttons +48 %) | +18 % |
+   | unroll-8 | +13 % | code +5 % |
+   | text-branchless / if-flatten / poly-select | +2–3 % each | −30 % .. 0 |
+   | **cull removed** | **+157 %** | branches −64 % |
+   | cull weight 1 / 8 / 16 | +9 / +10 / +46 % | — |
+
+## Round 12 recap (kept from the round-12 handoff — all still in force)
 
 1. **GitHub Pages**: the single-file build is live at <https://sodomita.github.io/curv-ps/> — served from
    the `gh-pages` branch (repo root `index.html` = `dist/index.html`), rebuilt and force-pushed by
@@ -38,8 +58,10 @@ All four were green at the end of this round (`paramcheck` and `memotest` exit 1
 
    Takeaways kept as invariants: **bbox-cull branches are the single biggest shader win (2.5×)**;
    textbook "branchless is better on GPUs" is **false on this corpus** for scalar/texture-heavy paths —
-   a skipped texture call and a skipped subtree beat `select`.  `flattenIf`/`unrollMax` remain available
-   for future programs; re-run `shaderbench` before enabling anything by default.
+   a skipped texture call and a skipped subtree beat `select`, and reducing per-pixel loop iterations
+   does not pay when the dominant cost is uniform loads / address arithmetic.  `flattenIf`/`unrollMax`/
+   `textWindow` remain available for future programs; re-run `shaderbench` before enabling anything by
+   default (round 13 added the same lesson yet again: verify with pixel-equivalence probes, then measure).
 
 ## Round 11 recap (kept from the round-11 handoff — all still in force)
 

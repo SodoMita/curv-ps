@@ -442,6 +442,38 @@ export function genShape(g: Gen, n: SNode, p: E, ctx: GenCtx): DC {
       const pad = g.let(g.bin("/", g.num(1.5), ctx.zoom));
       const half = g.let(g.bin("*", qsE, g.num(0.5)));
       const dv = g.var(g.num(1e30));
+      if (SHADER_FLAGS.textWindow && glyphs.length > 6) {
+        // Long label: binary-search the first cell whose x0 is right of px.v (cells are sorted along
+        // the row), then apply the same per-glyph body to a 6-glyph window around the hit.  Cell box
+        // distances rise monotonically away from the hit and within-pad cells are always in the
+        // window, so the min() is unchanged; reads the same parameters, no extra ones.
+        const lo = g.var(g.num(0)), hi = g.var(g.fn("max", [nE, g.num(1)]));
+        for (let step = 0; step < 6; step++) { // 6 steps cover N ≤ 64
+          const mid = g.let(g.fn("floor", [g.bin("*", g.bin("+", lo, hi), g.num(0.5))]));
+          const xm = g.let(g.paramAt(g.bin("+", baseE, g.bin("*", mid, g.num(5)))));
+          const k = g.cmp("<", g.idx(p, 0), xm);
+          g.assign(lo, g.sel(k, lo, g.bin("+", mid, g.num(1))));
+          g.assign(hi, g.sel(k, mid, hi));
+        }
+        const idxAt = (i: E) => {
+          const at = (off: number) => g.paramAt(g.bin("+", g.bin("+", baseE, g.bin("*", i, g.num(5))), g.num(off)));
+          const lp = g.let(g.bin("-", p, g.vec([at(0), qyE])));
+          const bd = g.let(sdBox(g, g.bin("-", lp, half), half, half, g.num(0)));
+          g.if(g.cmp("<", bd, pad), () => {
+            const q = g.fn("clamp", [g.bin("/", lp, qsE), g.num(0), g.num(1)]);
+            const uv = g.fn("mix", [g.vec([at(1), at(2)]), g.vec([at(3), at(4)]), q]);
+            const dg = g.bin("*", g.bin("*", g.bin("-", g.num(0.5), g.tex(uv)), g.num(2 * 8)), sE);
+            g.assign(dv, g.fn("min", [dv, g.fn("max", [dg, bd])]));
+          }, () => g.assign(dv, g.fn("min", [dv, g.bin("+", bd, pad)])));
+        };
+        const W = 2; // window [lo-1-W+1 .. lo+W], clamped — 2W+2 glyphs
+        // … except when the AA pad is bigger than half a cell (deep zoom-out): cells outside the
+        // window can then be within pad, so every glyph must be considered (baseline loop)
+        g.if(g.cmp("<=", pad, g.bin("*", qsE, g.num(0.5))), () => {
+          g.loop(g.num(2 * W + 2), (j) => idxAt(g.let(g.fn("max", [g.num(0), g.fn("min", [g.bin("-", nE, g.num(1)), g.bin("-", g.bin("+", lo, j), g.num(W + 1))])]))));
+        }, () => { g.loop(nE, (i) => idxAt(i)); });
+        return { d: dv, c: white };
+      }
       g.loop(nE, (i) => {
         const at = (off: number) => g.paramAt(g.bin("+", g.bin("+", baseE, g.bin("*", i, g.num(5))), g.num(off)));
         const lp = g.let(g.bin("-", p, g.vec([at(0), qyE])));

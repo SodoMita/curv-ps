@@ -30,9 +30,12 @@ export interface ShaderFlags {
   flattenIf: boolean;
   /** SubCurv: unroll loops whose trip count is a compile-time constant ≤ this */
   unrollMax: number;
+  /** text loop: binary-search the glyph window under the pixel (cells are sorted along the row) and
+   *  evaluate only ~6 glyphs instead of all N — same parameters, different code */
+  textWindow: boolean;
 }
-export const SHADER_FLAGS: ShaderFlags = { polySelect: false, textBranchless: false, cullWeight: 4, flattenIf: false, unrollMax: 0 };
-export const flagsKey = () => (SHADER_FLAGS.polySelect ? "p" : "") + (SHADER_FLAGS.textBranchless ? "T" : "") + "w" + SHADER_FLAGS.cullWeight + (SHADER_FLAGS.flattenIf ? "f" : "") + "u" + SHADER_FLAGS.unrollMax;
+export const SHADER_FLAGS: ShaderFlags = { polySelect: false, textBranchless: false, cullWeight: 4, flattenIf: false, unrollMax: 0, textWindow: false };
+export const flagsKey = () => (SHADER_FLAGS.polySelect ? "p" : "") + (SHADER_FLAGS.textBranchless ? "T" : "") + "w" + SHADER_FLAGS.cullWeight + (SHADER_FLAGS.flattenIf ? "f" : "") + "u" + SHADER_FLAGS.unrollMax + (SHADER_FLAGS.textWindow ? "G" : "");
 
 export abstract class Gen {
   /** set by SubCurv when compiled user code reads the time (the `t` of `[x,y,z,t]`, or `time`): the program animates through the time uniform */
