@@ -4,6 +4,8 @@ A browser playground for [Curv](https://github.com/curv3d/curv) 2D shapes (F-Rep
 with a JS fallback) extended with `solve { … }` blocks: linear / convex-quadratic constraints solved by
 [psolve](https://github.com/SodoMita/psolve) compiled to WebAssembly.
 
+**Live: <https://sodomita.github.io/curv-ps/>** (the single-file `dist/index.html`, rebuilt on every push to main).
+
 ```curv
 let
   L = solve {
