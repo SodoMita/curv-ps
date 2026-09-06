@@ -1,11 +1,18 @@
 name: pages
+
 on:
   push:
     branches: [main]
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -18,15 +25,17 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
-      - name: Publish dist/index.html to gh-pages
-        run: |
-          set -e
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          HEAD_REF="$(git rev-parse --short HEAD)"
-          git checkout --orphan gh-pages-tmp
-          git rm -q -rf .
-          cp dist/index.html index.html
-          git add index.html
-          git commit -q -m "Pages: ${HEAD_REF}"
-          git push -q -f origin gh-pages-tmp:gh-pages
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
