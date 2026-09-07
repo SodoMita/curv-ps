@@ -290,7 +290,133 @@ function nodeHashRaw(n: SNode): string | null {
   }
 }
 
-// ---------------------------------------------------------------- structural key
+// ---------------------------------------------------------------- hash-consing (round 15)
+/** Interning statistics (internbench prints the per-example deltas): table hits vs stored nodes, dead refs swept. */
+export const internStats = { hits: 0, stores: 0, swept: 0 };
+/**
+ * Numeric content hash (two u32 lanes) driving the intern table below.  COVERAGE COUPLING:
+ * cHashRaw must mix exactly the fields nodeHashRaw mixes — both make "same hash ⇒
+ * interchangeable object" true (the same assumption the solve/call memos make with the string
+ * hash).  It exists separately from nodeHash because eager hashing must not allocate WeakMap
+ * entries: the hash is stored ON the node at creation (`__ch__` — never enumerated by the
+ * evaluator; the tree is immutable from then on), doubles are mixed as their u32 bit-pairs
+ * through a shared view, and children contribute their stored lanes.  Per-S() hashing is then
+ * O(own fields + child count) with no per-node memo traffic (~50 ns/level; WeakMap-keyed
+ * hashing measured 2.4× EVAL slower in internbench's first iteration — the round-15 lesson).
+ */
+interface CHash { h1: number; h2: number }
+type HNode = SNode & { __ch__?: CHash | null; __ik__?: string };
+const f64v = new Float64Array(1), u32v = new Uint32Array(f64v.buffer);
+const M1 = (h: CHash, x: number) => { h.h1 = Math.imul(h.h1 ^ x | 0, 0x01000193); };
+const M2 = (h: CHash, x: number) => { h.h2 = Math.imul(h.h2 ^ x | 0, 0x5bd1e995) ^ (h.h2 >>> 15); };
+const mNum = (h: CHash, v: number) => { f64v[0] = v; M1(h, u32v[0]); M2(h, u32v[1]); };
+const mTag = (h: CHash, t: number) => M1(h, Math.imul(t, 0x9e3779b1));
+const mStr = (h: CHash, s: string) => { M2(h, s.length); for (let i = 0; i < s.length; i++) M1(h, s.charCodeAt(i)); };
+function cHash(n: HNode): CHash | null {
+  let h = n.__ch__;
+  if (h === undefined) { h = cHashRaw(n); n.__ch__ = h; }
+  return h;
+}
+function cHashRaw(n: HNode): CHash | null {
+  const h: CHash = { h1: 0x811c9dc5, h2: 0x01000193 };
+  const kid = (k: SNode): boolean => { const c = cHash(k); if (c === null) return false; M1(h, c.h1 ^ (c.h2 >>> 3)); M2(h, c.h2 ^ ((c.h1 << 5) | (c.h1 >>> 27))); return true; };
+  const kids = (ks: SNode[]): boolean => { M2(h, ks.length); for (const k of ks) if (!kid(k)) return false; return true; };
+  switch (n.k) {
+    case "circle": mTag(h, 1); mNum(h, n.r); break;
+    case "rect": mTag(h, 2); mNum(h, n.w); mNum(h, n.h); mNum(h, n.r); break;
+    case "seg": mTag(h, 3); mNum(h, n.x1); mNum(h, n.y1); mNum(h, n.x2); mNum(h, n.y2); mNum(h, n.th); break;
+    case "ellipse": mTag(h, 4); mNum(h, n.a); mNum(h, n.b); break;
+    case "nothing": mTag(h, 5); break;
+    case "everything": mTag(h, 6); break;
+    case "half": mTag(h, 7); mNum(h, n.nx); mNum(h, n.ny); mNum(h, n.d); break;
+    case "ngon": mTag(h, 8); mNum(h, n.n); mNum(h, n.r); break;
+    case "poly": mTag(h, 9); M2(h, n.pts.length); for (const p of n.pts) mNum(h, p); break;
+    case "text": mTag(h, 10); mNum(h, n.size); mStr(h, n.align); mStr(h, n.text); break;
+    case "union": mTag(h, 11); if (!kids(n.kids)) return null; break;
+    case "inter": mTag(h, 12); if (!kids(n.kids)) return null; break;
+    case "sunion": mTag(h, 13); mNum(h, n.s); if (!kids(n.kids)) return null; break;
+    case "sinter": mTag(h, 14); mNum(h, n.s); if (!kids(n.kids)) return null; break;
+    case "diff": mTag(h, 15); if (!kid(n.a) || !kid(n.b)) return null; break;
+    case "sdiff": mTag(h, 16); mNum(h, n.s); if (!kid(n.a) || !kid(n.b)) return null; break;
+    case "morph": mTag(h, 17); mNum(h, n.t); if (!kid(n.a) || !kid(n.b)) return null; break;
+    case "round": mTag(h, 18); mNum(h, n.r); if (!kid(n.s)) return null; break;
+    case "stroke": mTag(h, 19); mNum(h, n.w); if (!kid(n.s)) return null; break;
+    case "complement": mTag(h, 20); if (!kid(n.s)) return null; break;
+    case "lipschitz": mTag(h, 21); mNum(h, n.lip); if (!kid(n.s)) return null; break;
+    case "colour": mTag(h, 22); for (const c of n.c) mNum(h, c); if (!kid(n.s)) return null; break;
+    case "opacity": mTag(h, 23); mNum(h, n.a); if (!kid(n.s)) return null; break;
+    case "colourfn": case "custom": return null;
+    case "grad": mTag(h, 25); for (const c of n.c1) mNum(h, c); for (const c of n.c2) mNum(h, c); mNum(h, n.x0); mNum(h, n.y0); mNum(h, n.x1); mNum(h, n.y1); if (!kid(n.s)) return null; break;
+    case "shadow": mTag(h, 26); mNum(h, n.dx); mNum(h, n.dy); mNum(h, n.blur); mNum(h, n.a); if (!kid(n.s)) return null; break;
+    case "xform": mTag(h, 27); mNum(h, n.tx); mNum(h, n.ty); mNum(h, n.rot); mNum(h, n.sc); if (!kid(n.s)) return null; break;
+    case "stretch": mTag(h, 28); mNum(h, n.sx); mNum(h, n.sy); if (!kid(n.s)) return null; break;
+    case "reflect": mTag(h, 29); mNum(h, n.nx); mNum(h, n.ny); if (!kid(n.s)) return null; break;
+    case "repeat": mTag(h, 30); mStr(h, n.kind); mNum(h, n.a); mNum(h, n.b); if (!kid(n.s)) return null; break;
+    case "swirl": mTag(h, 31); mNum(h, n.strength); mNum(h, n.d); if (!kid(n.s)) return null; break;
+  }
+  // final avalanche (same finalizer as hashStr's lanes) so table keys are well spread
+  h.h1 = Math.imul(h.h1 ^ (h.h1 >>> 16), 0x85ebca6b) ^ (h.h1 >>> 13);
+  h.h2 = Math.imul(h.h2 ^ (h.h2 >>> 16), 0xc2b2ae35) ^ (h.h2 >>> 13);
+  if (h.h1 === 0 && h.h2 === 0) h.h1 = 1; // (0,0) is reserved for "unhashable"
+  return h;
+}
+const internTable = new Map<string, WeakRef<SNode>[]>();
+const INTERN_SWEEP_EVERY = 4096, INTERN_MAX_BUCKETS = 32768;
+let internSinceSweep = 0;
+// OFF BY DEFAULT (round-15 study, scripts/internbench.ts): at S()-level the per-call hashing
+// machinery (CHash objects, closures, WeakRefs, GC churn) costs ~2.4× EVAL across the corpus while
+// saving strictly less in the per-frame key/param walks it amortises (every one of 19 measured
+// examples nets negative — the hasher pays per node per frame, the walks it replaces were already
+// mostly amortised by the existing WeakMap memos).  Kept, flag-gated, for a future cheaper hasher
+// or a genuinely identity-starved workload; re-run internbench before enabling anywhere.
+let internOn = false;
+let internTableOn = false; // probe: "hash" mode computes cHash + ikey but never touches the table
+export function setInterning(on: boolean | "hash") { internOn = on !== false; internTableOn = on === true; }
+function internSweep() {
+  let removed = 0;
+  for (const [h, bucket] of internTable) {
+    let w = 0;
+    for (let i = 0; i < bucket.length; i++) { const m = bucket[i].deref(); if (m) bucket[w++] = bucket[i]; }
+    removed += bucket.length - w;
+    bucket.length = w;
+    if (w === 0) internTable.delete(h);
+  }
+  internSinceSweep = 0;
+  internStats.swept += removed;
+  if (internTable.size > INTERN_MAX_BUCKETS) internTable.clear(); // safety cap; hits rebuild
+}
+/**
+ * Hash-consing: structurally identical nodes (see the coverage note on cHash above) become ONE
+ * object.  Nodes are immutable, so sharing is semantics-preserving; it turns every identity-keyed
+ * memo (bboxOf, weight, structKey, walkParams segments, nodeHash itself) into a cross-frame hit
+ * whenever a subtree reappears — including for programs the call memo skips (time-dependent or
+ * impure bodies), whose static subtrees now survive as identical objects even though the frame
+ * re-allocates fresh candidates that are then discarded.
+ */
+export function inode(n: SNode): SNode {
+  if (!internOn) return n;
+  const hn = n as HNode;
+  let key = hn.__ik__;
+  if (key === undefined) {
+    const h = cHash(hn);
+    if (h === null) { hn.__ik__ = ""; return n; }
+    key = (h.h1 >>> 0).toString(36) + "." + (h.h2 >>> 0).toString(36);
+    hn.__ik__ = key;
+  }
+  if (key === "") return n;
+  if (!internTableOn) return n;
+  const bucket = internTable.get(key);
+  if (bucket) for (const r of bucket) { const m = r.deref(); if (m !== undefined) { internStats.hits++; return m; } }
+  if (++internSinceSweep >= INTERN_SWEEP_EVERY) internSweep();
+  let b = bucket;
+  if (!b) { b = []; internTable.set(key, b); }
+  b.push(new WeakRef(n));
+  internStats.stores++;
+  return n;
+}
+/** Test hook: drop all interned identities (value-transparent; only memo hit rates change). Counters are NOT reset (internbench measures deltas). */
+export function resetInterning() { internTable.clear(); internSinceSweep = 0; }
+
 /**
  * A string that identifies the *shape* of the generated code: node kinds, tree layout and the
  * few numbers that codegen branches on (text content, polygon size, unit scale, bbox
@@ -303,38 +429,132 @@ function nodeHashRaw(n: SNode): string | null {
  * frame (`shadow` visits its child twice, a shape used in several places) and subtrees that
  * survive across frames through the call memo are keyed once.
  */
-// memo slot per (cull, flags): the cull threshold changes cullable() and thus the key content,
-// and the whole key is prefixed with the flag fingerprint so `codeLru` never mixes variants
-const skMemos = new Map<string, WeakMap<SNode, string | null>>();
-export function structKey(n: SNode, atlas: Atlas, cull = true): string | null {
+// Memo slot per (cull, flags): the cull threshold changes cullable() and thus the key content,
+// and the flag fingerprint separates the slots so `codeLru` never mixes variants (round 15: the
+// key itself is now two avalanche-mixed u32 lanes, materialised as ONE short string per tree;
+// the pre-round-15 string-concatenating version spent its time building one string per NODE —
+// measured as the dominant residual on viewport-dirty frames, e.g. 1.86 ms/frame on wrapfit).
+// Coverage invariant: the lanes must mix exactly the things codegen branches on (node kinds,
+// tree layout and child ORDER, repeat mode, text align, polygon arity, unit-scale xform, and
+// per-child cull-bracket state).  A lane collision would swap compiled code; 64 bits, and the
+// branch list below is exhaustive over SNode — keep it that way when adding node kinds.
+const skSlots = new Map<string, { a: WeakMap<SNode, number>; b: WeakMap<SNode, number> }>();
+function skSlot(cull: boolean) {
   const fk = flagsKey() + (cull ? "/1" : "/0");
-  let memo = skMemos.get(fk);
-  if (!memo) { memo = new WeakMap(); skMemos.set(fk, memo); }
-  let k = memo.get(n);
-  if (k === undefined) { k = structKeyRaw(n, atlas, cull); memo.set(n, k); }
-  return k === null ? null : flagsKey() + "|" + k;
+  let m = skSlots.get(fk);
+  if (!m) { m = { a: new WeakMap(), b: new WeakMap() }; skSlots.set(fk, m); }
+  return m;
 }
-function structKeyRaw(n: SNode, atlas: Atlas, cull: boolean): string | null {
-  const kidC = (s: SNode) => { const k = structKey(s, atlas, cull); return k === null ? null : (cullable(s, atlas, cull) ? "[" : "(") + k + ")"; };
-  const plain = (s: SNode) => { const k = structKey(s, atlas, false); return k === null ? null : "(" + k + ")"; };
-  const wrap = (s: SNode) => { const k = structKey(s, atlas, cull); return k === null ? null : "(" + k + ")"; };
-  const many = (ks: SNode[], f: (s: SNode) => string | null) => { let out = ""; for (const k of ks) { const s = f(k); if (s === null) return null; out += s; } return out; };
-  const cat = (...ps: (string | null)[]) => { let out = n.k; for (const p of ps) { if (p === null) return null; out += p; } return out; };
+let skOut2 = 0; // lane-2 out-param of skNum (read immediately after each call)
+const SK_TAGS: Record<SNode["k"], number> = {
+  circle: 1, rect: 2, seg: 3, ellipse: 4, nothing: 5, everything: 6, half: 7, ngon: 8, poly: 9,
+  text: 10, union: 11, inter: 12, sunion: 13, sinter: 14, diff: 15, sdiff: 16, morph: 17, round: 18,
+  stroke: 19, complement: 20, lipschitz: 21, colour: 22, opacity: 23, colourfn: 24, grad: 25, shadow: 26,
+  xform: 27, stretch: 28, reflect: 29, repeat: 30, swirl: 31, custom: 32,
+};
+const MK_CULLED = 0x16d3, MK_UNCULLED = 0x2a41, MK_PLAIN = 0x519b, MK_WRAP = 0x72a9; // how the parent consumes a child (mirrors the old " [ ( " brackets)
+/** Numeric structural key for one node; returns the stored lane-1 (0 ⇔ unhashable with skOut2==0).  A
+ *  legitimate h1==0 is mapped to -0x80000000 UNIFORMLY before memoing, so memo-hits and misses
+ *  return identical lanes (parents must see one representation — verified by paramcheck). */
+function skNum(n: SNode, atlas: Atlas, cull: boolean): number {
+  const m = skSlot(cull);
+  const ma = m.a.get(n);
+  if (ma !== undefined) { skOut2 = m.b.get(n)!; return ma; }
+  const h1 = skRaw(n, atlas, cull);
+  const h2 = skOut2;
+  const unhashable = h1 === 0 && h2 === 0;
+  const stored = unhashable ? 0 : h1 === 0 ? -0x80000000 : h1;
+  m.a.set(n, stored); m.b.set(n, unhashable ? 0 : h2);
+  return unhashable ? 0 : stored;
+}
+// Mix markers and child lanes with inline arithmetic — no per-node closures/allocations: this walk
+// runs on every fresh node of every dirty frame (the round-15 profiling showed closure churn here
+// eats the win on medium trees).
+function skRaw(n: SNode, atlas: Atlas, cull: boolean): number {
+  let h1 = 0x811c9dc5, h2 = 0x01000193;
+  // inlined: child lanes a1/a2 consumed as marker, rot(a1), rot(a2) with order-sensitive positions
+  let a1 = 0, a2 = 0;
+  h1 = Math.imul(h1 ^ SK_TAGS[n.k] | 0, 0x01000193);
   switch (n.k) {
-    case "circle": case "rect": case "seg": case "ellipse": case "nothing": case "everything": case "half": case "ngon": return n.k;
-    case "poly": return n.k + n.pts.length;
-    case "text": return n.k + n.align; // content and length are parameters
-    case "union": case "inter": return cat(many(n.kids, kidC));
-    case "sunion": case "sinter": return cat(many(n.kids, plain));
-    case "diff": return cat(kidC(n.a), kidC(n.b));
-    case "sdiff": case "morph": return cat(plain(n.a), plain(n.b));
-    case "repeat": return cat(n.kind, plain(n.s));
-    case "round": case "stroke": case "complement": case "lipschitz": case "stretch": case "swirl": return cat(plain(n.s));
-    case "shadow": return cat(plain(n.s), wrap(n.s));
-    case "xform": return cat(n.sc === 1 ? "1" : "s", wrap(n.s));
-    case "colour": case "opacity": case "grad": case "reflect": return cat(wrap(n.s));
-    case "colourfn": case "custom": return null;
+    case "circle": case "rect": case "seg": case "ellipse": case "nothing": case "everything": case "half": case "ngon": break;
+    case "poly": h2 = Math.imul(h2 ^ n.pts.length | 0, 0x5bd1e995) ^ (h2 >>> 15); break;
+    case "text": h1 = Math.imul(h1 ^ (n.align === "left" ? 2 : 1), 0x01000193); break; // content & length are params
+    case "union": case "inter":
+      for (const k of n.kids) {
+        a1 = skNum(k, atlas, cull); a2 = skOut2; if (a1 === 0 && a2 === 0) return skFail();
+        // kidC: culled/uncullled marker by cullable()
+        const m1 = cullable(k, atlas, cull) ? MK_CULLED : MK_UNCULLED;
+        h1 = Math.imul(h1 ^ m1, 0x01000193); h1 = Math.imul(h1 ^ (a1 ^ (a2 >>> 3)), 0x01000193);
+        h2 = Math.imul(h2 ^ m1, 0x5bd1e995) ^ (h2 >>> 15); h2 = Math.imul(h2 ^ (a2 ^ ((a1 << 5) | (a1 >>> 27))), 0x5bd1e995) ^ (h2 >>> 15);
+      }
+      break;
+    case "sunion": case "sinter":
+      for (const k of n.kids) {
+        a1 = skNum(k, atlas, false); a2 = skOut2; if (a1 === 0 && a2 === 0) return skFail();
+        h1 = Math.imul(h1 ^ MK_PLAIN, 0x01000193); h1 = Math.imul(h1 ^ (a1 ^ (a2 >>> 3)), 0x01000193);
+        h2 = Math.imul(h2 ^ MK_PLAIN, 0x5bd1e995) ^ (h2 >>> 15); h2 = Math.imul(h2 ^ (a2 ^ ((a1 << 5) | (a1 >>> 27))), 0x5bd1e995) ^ (h2 >>> 15);
+      }
+      break;
+    case "diff":
+      { const m1 = cullable(n.a, atlas, cull) ? MK_CULLED : MK_UNCULLED;
+        a1 = skNum(n.a, atlas, cull); a2 = skOut2; if (a1 === 0 && a2 === 0) return skFail();
+        h1 = Math.imul(h1 ^ m1, 0x01000193); h1 = Math.imul(h1 ^ (a1 ^ (a2 >>> 3)), 0x01000193);
+        h2 = Math.imul(h2 ^ m1, 0x5bd1e995) ^ (h2 >>> 15); h2 = Math.imul(h2 ^ (a2 ^ ((a1 << 5) | (a1 >>> 27))), 0x5bd1e995) ^ (h2 >>> 15);
+        const m2 = cullable(n.b, atlas, cull) ? MK_CULLED : MK_UNCULLED;
+        a1 = skNum(n.b, atlas, cull); a2 = skOut2; if (a1 === 0 && a2 === 0) return skFail();
+        h1 = Math.imul(h1 ^ m2, 0x01000193); h1 = Math.imul(h1 ^ (a1 ^ (a2 >>> 3)), 0x01000193);
+        h2 = Math.imul(h2 ^ m2, 0x5bd1e995) ^ (h2 >>> 15); h2 = Math.imul(h2 ^ (a2 ^ ((a1 << 5) | (a1 >>> 27))), 0x5bd1e995) ^ (h2 >>> 15); break; }
+    case "sdiff": case "morph":
+      { a1 = skNum(n.a, atlas, false); a2 = skOut2; if (a1 === 0 && a2 === 0) return skFail();
+        h1 = Math.imul(h1 ^ MK_PLAIN, 0x01000193); h1 = Math.imul(h1 ^ (a1 ^ (a2 >>> 3)), 0x01000193);
+        h2 = Math.imul(h2 ^ MK_PLAIN, 0x5bd1e995) ^ (h2 >>> 15); h2 = Math.imul(h2 ^ (a2 ^ ((a1 << 5) | (a1 >>> 27))), 0x5bd1e995) ^ (h2 >>> 15);
+        a1 = skNum(n.b, atlas, false); a2 = skOut2; if (a1 === 0 && a2 === 0) return skFail();
+        h1 = Math.imul(h1 ^ MK_PLAIN, 0x01000193); h1 = Math.imul(h1 ^ (a1 ^ (a2 >>> 3)), 0x01000193);
+        h2 = Math.imul(h2 ^ MK_PLAIN, 0x5bd1e995) ^ (h2 >>> 15); h2 = Math.imul(h2 ^ (a2 ^ ((a1 << 5) | (a1 >>> 27))), 0x5bd1e995) ^ (h2 >>> 15); break; }
+    case "repeat":
+      { h1 = Math.imul(h1 ^ (400 + REPEAT_TAGS[n.kind]), 0x01000193);
+        a1 = skNum(n.s, atlas, false); a2 = skOut2; if (a1 === 0 && a2 === 0) return skFail();
+        h1 = Math.imul(h1 ^ MK_PLAIN, 0x01000193); h1 = Math.imul(h1 ^ (a1 ^ (a2 >>> 3)), 0x01000193);
+        h2 = Math.imul(h2 ^ MK_PLAIN, 0x5bd1e995) ^ (h2 >>> 15); h2 = Math.imul(h2 ^ (a2 ^ ((a1 << 5) | (a1 >>> 27))), 0x5bd1e995) ^ (h2 >>> 15); break; }
+    case "round": case "stroke": case "complement": case "lipschitz": case "stretch": case "swirl":
+      { const nn = n as { s: SNode };
+        a1 = skNum(nn.s, atlas, false); a2 = skOut2; if (a1 === 0 && a2 === 0) return skFail();
+        h1 = Math.imul(h1 ^ MK_PLAIN, 0x01000193); h1 = Math.imul(h1 ^ (a1 ^ (a2 >>> 3)), 0x01000193);
+        h2 = Math.imul(h2 ^ MK_PLAIN, 0x5bd1e995) ^ (h2 >>> 15); h2 = Math.imul(h2 ^ (a2 ^ ((a1 << 5) | (a1 >>> 27))), 0x5bd1e995) ^ (h2 >>> 15); break; }
+    case "shadow":
+      { const nn = n as { s: SNode };
+        a1 = skNum(nn.s, atlas, false); a2 = skOut2; if (a1 === 0 && a2 === 0) return skFail();
+        h1 = Math.imul(h1 ^ MK_PLAIN, 0x01000193); h1 = Math.imul(h1 ^ (a1 ^ (a2 >>> 3)), 0x01000193);
+        h2 = Math.imul(h2 ^ MK_PLAIN, 0x5bd1e995) ^ (h2 >>> 15); h2 = Math.imul(h2 ^ (a2 ^ ((a1 << 5) | (a1 >>> 27))), 0x5bd1e995) ^ (h2 >>> 15);
+        a1 = skNum(nn.s, atlas, cull); a2 = skOut2; if (a1 === 0 && a2 === 0) return skFail();
+        h1 = Math.imul(h1 ^ MK_WRAP, 0x01000193); h1 = Math.imul(h1 ^ (a1 ^ (a2 >>> 3)), 0x01000193);
+        h2 = Math.imul(h2 ^ MK_WRAP, 0x5bd1e995) ^ (h2 >>> 15); h2 = Math.imul(h2 ^ (a2 ^ ((a1 << 5) | (a1 >>> 27))), 0x5bd1e995) ^ (h2 >>> 15); break; }
+    case "xform":
+      { h1 = Math.imul(h1 ^ (n.sc === 1 ? 1 : 2), 0x01000193);
+        a1 = skNum(n.s, atlas, cull); a2 = skOut2; if (a1 === 0 && a2 === 0) return skFail();
+        h1 = Math.imul(h1 ^ MK_WRAP, 0x01000193); h1 = Math.imul(h1 ^ (a1 ^ (a2 >>> 3)), 0x01000193);
+        h2 = Math.imul(h2 ^ MK_WRAP, 0x5bd1e995) ^ (h2 >>> 15); h2 = Math.imul(h2 ^ (a2 ^ ((a1 << 5) | (a1 >>> 27))), 0x5bd1e995) ^ (h2 >>> 15); break; }
+    case "colour": case "opacity": case "grad": case "reflect":
+      { const nn = n as { s: SNode };
+        a1 = skNum(nn.s, atlas, cull); a2 = skOut2; if (a1 === 0 && a2 === 0) return skFail();
+        h1 = Math.imul(h1 ^ MK_WRAP, 0x01000193); h1 = Math.imul(h1 ^ (a1 ^ (a2 >>> 3)), 0x01000193);
+        h2 = Math.imul(h2 ^ MK_WRAP, 0x5bd1e995) ^ (h2 >>> 15); h2 = Math.imul(h2 ^ (a2 ^ ((a1 << 5) | (a1 >>> 27))), 0x5bd1e995) ^ (h2 >>> 15); break; }
+    case "colourfn": case "custom": return skFail();
   }
+  {
+    const a = Math.imul(h1 ^ (h1 >>> 16), 0x85ebca6b) ^ (h1 >>> 13);
+    const b = Math.imul(h2 ^ (h2 >>> 16), 0xc2b2ae35) ^ (h2 >>> 13);
+    if (a === 0 && b === 0) return skFail();
+    skOut2 = b;
+    return a;
+  }
+}
+const REPEAT_TAGS: Record<string, number> = { x: 1, y: 2, xy: 3, radial: 4, mirror_x: 5, mirror_y: 6, mirror_xy: 7 };
+function skFail(): number { skOut2 = 0; return 0; }
+export function structKey(n: SNode, atlas: Atlas, cull = true): string | null {
+  const h1 = skNum(n, atlas, cull);
+  if (h1 === 0 && skOut2 === 0) return null;
+  return flagsKey() + "|" + (h1 >>> 0).toString(36) + "." + (skOut2 >>> 0).toString(36);
 }
 
 // ---------------------------------------------------------------- codegen

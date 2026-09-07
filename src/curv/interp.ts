@@ -3,7 +3,7 @@
 // shader code by subcurv.ts; `solve { ... }` blocks compile to a psolve problem.
 import { parse, CurvError, type Expr, type Def, type Pat, type ListItem, type Stmt } from "./parser";
 import { Lin, Quad, Cons, Problem, STRENGTH, type Rel, type ConstraintResult } from "../psolve/constraints";
-import { Shape, type SNode, type RGBA, type BBox, type ShaderFn, type GenCtx, genShape, bboxOf, structKey, walkParams, nodeHash } from "./shapes";
+import { Shape, type SNode, type RGBA, type BBox, type ShaderFn, type GenCtx, genShape, bboxOf, structKey, walkParams, nodeHash, inode } from "./shapes";
 import { measureText, type Atlas } from "../gpu/atlas";
 import { PRELUDE } from "./prelude";
 import { JS, WGSL, ParamsOnly, makeJSRuntime, type Gen, type E } from "../gpu/gen";
@@ -156,7 +156,7 @@ function boxOf(v: Value, line?: number): { x: number; y: number; w: number; h: n
   const r = rec(v, line); const g = (k: string) => num(r.get(k) ?? 0, `box field ${k}`, line);
   return { x: g("x"), y: g("y"), w: g("w"), h: g("h") };
 }
-const S = (n: SNode) => new Shape(n);
+const S = (n: SNode) => new Shape(inode(n)); // hash-consed: equal subtrees share one object across frames
 const fn1 = (name: string, f: (a: Value, line?: number) => Value) => new Fn(name, f);
 const fn2 = (name: string, f: (a: Value, b: Value, line?: number) => Value) => new Fn(name, (a, l) => new Fn(name + "'", (b, l2) => f(a, b, l2 ?? l)));
 const fn3 = (name: string, f: (a: Value, b: Value, c: Value, line?: number) => Value) => new Fn(name, (a) => new Fn(name, (b) => new Fn(name, (c, l) => f(a, b, c, l))));

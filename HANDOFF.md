@@ -1,4 +1,4 @@
-# Curv+solve — handoff (dev round 14)
+# Curv+solve — handoff (dev round 15)
 
 Browser playground for **Curv** (2D F-Rep, compiled to WGSL / JS) extended with
 `solve { }` constraint blocks solved by **psolve** (LP + convex QP, WebAssembly).
@@ -13,11 +13,46 @@ Headless checks (all use the JS backend, no browser needed):
 | `npx tsx scripts/memotest.ts` | solve-block **and call-memo** dependency tests (time/mouse/viewport through closures, shadowing, mutations, impure bodies, `print`/`parametric`, node identity …) |
 | `npx tsx scripts/warmcheck.ts` | **round-14 bridge oracle**: warm→cold drag equivalence (plan P0.2 acceptance: pixel-identity), failure degradation/recovery with **no memo pollution**, first-frame certified-infeasible error message, wall-clock **budget → STOPPED + approximate incumbent (never garbage)**, budget ladder certifies |
 | `npx tsx scripts/warmbench.ts [example …]` | cold-vs-chained solve timing, interleaved best-of-4 per width (round-12 noise lesson), warm-accept / cold-retry counters |
+| `npx tsx scripts/internbench.ts [example …]` | round-15 hash-consing A/B (inode ON/OFF, alternated in-process, best-of-6): full-eval cost vs fresh-tree key+param-walk cost, hit counters |
 | `npx tsx scripts/prof.ts [-v]` | warm eval / codegen / params-only timings, per-`solve` cache kind, call-memo hit/miss counters; `-v` prints the per-function memo decisions |
 
-All five checks were green at the end of this round (`paramcheck` / `memotest` / `warmcheck` exit 1 on any failure — check the exit code).
+All six check scripts were green at the end of this round (`paramcheck` / `memotest` / `warmcheck` exit 1 on any failure — check the exit code).
 
-## What changed in this round — psolve sync + the bridge upgrade (upstream `docs/CURV_PS_PLAN.md` P0, and §6 "what curv-ps should change")
+## What changed in this round — the top round-13/14 gap ("per-frame cost is dominated by the program's own tree"): measured study + one shipped win
+
+1. **Hash-consing (`inode`, shapes.ts) — studied, measured, kept OFF.**  Design: S() hash-conses every
+   constructed node through a WeakRef table keyed by a numeric content hash (`cHash`, two u32 lanes
+   stored on the node as `__ch__`, table key `__ik__`, coverage 1:1 with `nodeHashRaw`), so equal
+   subtrees become one object and every identity-keyed memo hits across frames.  Measured
+   (`internbench`, in-process alternated ON/OFF, best-of-6, all 19 examples): the fresh-tree
+   key+param walk drops 8–48× as designed — **but full eval costs 2.4× more, on every shape-bearing
+   example, so all 19 net negative.**  The mechanism, measured by bisection (off / hash-only /
+   full table): the entire regression is the *hasher*, not the WeakRef table; it is not the string
+   hash (a WeakMap-keyed string hash and an inline-field numeric hash cost the same), it is the
+   per-call constant work + allocation churn (CHash objects, closures, table stores) on ~10²–10³
+   constructed nodes per frame — while the walks it replaces were already mostly amortised by the
+   existing WeakMap memos.  **Verdict: default OFF, infrastructure kept** (`setInterning`, bench),
+   same outcome class as round-12/13's off-by-default shader variants.  The invariant it would have
+   needed stays recorded: *amortised WalkMap walks are cheaper than correct eager hashing; sharing
+   identity only pays when the hash itself is (nearly) free or the shared work is per-node ×K, not
+   per-frame ×1.*
+2. **Structural keys are two avalanche-mixed u32 lanes now (the shipped win).**  `structKeyRaw`'s
+   per-fresh-node string concatenation was the largest *legitimate* residual on dirty frames
+   (internbench's fresh-tree walk column: 1.86 ms/frame on wrapfit, 1.59 on toolbar).  Same
+   coverage (kinds, tree layout and child order, repeat mode, text align, polygon arity, unit-scale
+   xform, per-child cull-bracket state), same memo-per-(cull,flags)-slot design, but lanes are mixed
+   with inline `Math.imul` arithmetic (no closures — closure allocation per node ate the first
+   attempt's win on medium trees) and materialised as ONE short `flags|h1.h2` string per tree.
+   `skNum`'s `h1==0` sentinel is stored mapped (`-0x80000000`) **uniformly on miss and hit** —
+   memo-hit/miss lane mismatches would fork every parent key.  Fresh-tree key+walk, same machine
+   and harness before→after: wrapfit 1.92→0.55, toolbar 1.59→0.61, dashboard 0.83→0.72,
+   tooltip 0.50→0.38, chart 0.46→0.36, buttons 0.29→0.14, everything else ~1.1–2× better,
+   custom-function trees unchanged (they skip the walk).  `paramcheck` stayed 19/19 bitwise-green
+   (the oracle's `reused`/`codeSame`/`memo=`/`skip=safe` columns all exercise key semantics).
+3. `tsconfig` target/lib ES2020 → ES2021 (`WeakRef`, for the kept-off inode table).
+
+## Round 14 recap (kept from the round-14 handoff — all still in force)
+
 
 Upstream psolve moved to `main` (`05f9411cccbc`, merge of `arena/01a07358-psolve`, PR #1: certified QP
 Phase-I infeasibility, warm starts, wall-clock budgets, the psolve-owned wasm bridge).  This round
@@ -276,7 +311,9 @@ src/curv/interp.ts      tree-walking interpreter, shared static builtins + dynam
 src/curv/subcurv.ts     SubCurv: compiles user dist/colour functions to shader code (inlining, loops);
                         tags the point argument, reports time reads (Gen.usesTime)
 src/curv/shapes.ts      SNode F-Rep tree, bboxOf (memoised), textMetrics/textGlyphs, nodeHash (memoised),
-                        weight (memoised), structKey (memoised per subtree), genShape, walkParams (segment-memoised)
+                        weight (memoised), structKey (numeric two-lane, memoised per (cull,flags) slot),
+                        inode hash-consing (off by default — round-15 study), genShape,
+                        walkParams (segment-memoised)
 src/curv/prelude.ts     palette, box helpers, layout combinators (incl. flow / hstack_fit), UI components — in Curv
 src/curv/examples.ts    example programs (group "solve" | "curv")
 src/gpu/gen.ts          code generators: WGSL, JS, ParamsOnly; dynBlock/finalParams; Gen.usesTime
@@ -377,6 +414,17 @@ scripts/                selftest, paramcheck, memotest, warmcheck, warmbench, pr
 * When touching the wasm: bump `PIN`, `PSOLVE_WASM_SHA256`/`PSOLVE_UPSTREAM_PIN`, keep
   `psw_abi()` == `PSOLVE_BRIDGE_ABI`, re-run the build twice and compare sha256 before committing
   the blob.
+* **Structural-key coverage is a correctness invariant on its own** (`skRaw`): any new `SNode`
+  kind, or any new codegen branch on a *value*, must be mixed into the numeric lanes in lockstep
+  (the old string-key rule, now `skNum`); the `(0,0)` pair means "unhashable" and `h1==0` is
+  stored as `-0x80000000` through ONE code path so memo-hit and memo-miss return identical lanes.
+  `paramcheck` (exit code) is the oracle — its `reused`/`codeSame` and skip-oracle only hold when
+  keys partition exactly like codegen.
+* `__ch__`/`__ik__` on nodes are inode's private cache fields; never enumerate or branch on them
+  (all evaluator observation goes through `n.k`-switched code — keep that exhaustive).
+* `inode` is OFF by default (round-15 measured net loss at S()-level on all 19 examples); enabling
+  it anywhere needs an internbench run first.  Do not diversify its hash coverage away from
+  `nodeHashRaw` — the intern table's correctness argument is the same interchangeability lemma.
 
 ## Known gaps / next steps
 
@@ -398,8 +446,11 @@ scripts/                selftest, paramcheck, memotest, warmcheck, warmbench, pr
   determinism option, not a speed one.
 * Eval of the *rest* of an animated cached frame (user-tree construction, `union` literals) is nearly
   all that remains on warm frames (split 0.04 ms, dashboard ≈ 0.9 ms raw; static examples skip
-  evaluation entirely).  Builtins (round 10) and the prelude (round 9) are shared per-process now; the
-  per-frame cost is now dominated by the program's own tree allocation.
+  evaluation entirely).  Round 15 measured the obvious cure (hash-consing — every identity memo hits
+  for free) and found the hasher costs more than the walks it saves at S()-level; the residual moved
+  to the *evaluator's own* allocation+application work, so the next honest items are an
+  expression-level memo for expensive pure literals (the call memo generalised) or a cheaper
+  tree-builder — not a better intern table.
 * The shader-only-time fast path keeps the quality scale while animating; settling to full resolution
   only happens on pause / interactions (a settle tick that schedules itself per frame was judged too
   finicky).
