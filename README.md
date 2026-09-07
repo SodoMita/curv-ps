@@ -38,6 +38,7 @@ runs inside a per-frame **wall-clock budget** that hands back an incumbent rathe
 * `npx tsx scripts/warmcheck.ts` — warm-start / certified-infeasibility / budget / degradation oracle for the solver bridge
 * `npx tsx scripts/warmbench.ts [example …]` — cold vs warm-started solve timings (interleaved best-of-4)
 * `npx tsx scripts/internbench.ts [example …]` — hash-consing A/B benchmark (round-15 study: inode stays off by default)
+* `npx tsx scripts/exprbench.ts [example …]` — expression-memo A/B benchmark (round-16: pure list/comprehension memo sites)
 * `npx tsx scripts/shaderbench.ts [example …]` — benchmarks the shader-generation variants (`SHADER_FLAGS`) per example: JS raster time, WGSL bytes, branch/loop counts
 * `npx tsx scripts/memotest.ts` — dependency-tracking tests for solve-block and call memoisation
 

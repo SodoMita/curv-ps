@@ -8,7 +8,7 @@ import { measureText, type Atlas } from "../gpu/atlas";
 import { PRELUDE } from "./prelude";
 import { JS, WGSL, ParamsOnly, makeJSRuntime, type Gen, type E } from "../gpu/gen";
 import { SC, compileFnAt, type CV } from "./subcurv";
-import { freeVarsOfBlock, freeVarsOfFn, astId } from "./freevars";
+import { freeVarsOfBlock, freeVarsOfExpr, freeVarsOfFn, astId } from "./freevars";
 
 export class Rec { constructor(public f: Map<string, Value> = new Map()) {} get(k: string) { return this.f.get(k); } }
 export class Fn {
@@ -213,22 +213,40 @@ const callCache = new Map<number, CallHit[]>();
 const CALL_LRU = 32;
 let callCacheSize = 0;
 const CALL_CACHE_MAX = 4096;
+// Expression memo (round 16, see Interp.applyExprMemo): same machinery for expensive pure *list
+// literals/comprehensions — the tree-assembly sites the call memo cannot cover (their items are
+// calls, often already memoised, but the parent still re-hashes every child every frame).
+const exprCache = new Map<number, CallHit[]>();
+const EXPR_LRU = 8;
+let exprCacheSize = 0;
+let exprMemoOn = true; // bench switch (exprbench A/Bs it in-process); on in production
+export function setExprMemo(on: boolean) { exprMemoOn = on; }
 /** Profile of a function body: how expensive an un-memoised call is, and whether we decided to memoise it. */
 interface CallStat { n: number; ms: number; first: number; mode: "measure" | "memo" | "skip"; why?: string }
 const callStats = new Map<number, CallStat>();
+const exprStats = new Map<number, CallStat>(); // same decision lattice, separate sites (list literals)
 const CALL_MEMO_MIN_MS = 0.008;  // floor under which even free memos make no sense; the effective threshold is max(this, 2 × warm-measured hash cost of a representative call)
 const CALL_MEMO_SAMPLES = 4;     // calls measured before deciding
 const CALL_HASH_LIMIT = 4000;    // parts; bigger arguments are not worth hashing per call
-export function resetSolveCache() { solveCache.clear(); warmCache.clear(); blockCache.clear(); callCache.clear(); callCacheSize = 0; callStats.clear(); }
+export function resetSolveCache() { solveCache.clear(); warmCache.clear(); blockCache.clear(); callCache.clear(); callCacheSize = 0; callStats.clear(); exprCache.clear(); exprCacheSize = 0; exprStats.clear(); }
 /** Most recent key-computation stats (for scripts / debugging): why a block could not be memoised. */
 export const blockCacheStats = { lastReason: "" as string };
 /** Per-evaluation call-memo counters (reset by `Interp.run`). */
 export interface CallMemoStats { hits: number; misses: number; measured: number; skipped: number; hashMs: number }
-/** Snapshot of the call-memo decisions, for scripts / the UI: one row per function body. */
+/** Snapshot of the call-memo decisions, for scripts / the UI: one row per memoised site
+ *  (function body or list-literal expression site — the «list» rows). */
 export function callMemoTable(): { id: number; name: string; mode: CallStat["mode"]; calls: number; avgMs: number; why?: string; entries: number }[] {
-  return [...callStats].map(([id, s]) => ({ id, name: bodyNames.get(id) ?? "?", mode: s.mode, calls: s.n, avgMs: s.n > 1 ? (s.ms - s.first) / (s.n - 1) : s.ms, why: s.why, entries: callCache.get(id)?.length ?? 0 }));
+  return [
+    ...[...callStats].map(([id, s]) => ({ id, name: bodyNames.get(id) ?? "?", mode: s.mode, calls: s.n, avgMs: s.n > 1 ? (s.ms - s.first) / (s.n - 1) : s.ms, why: s.why, entries: callCache.get(id)?.length ?? 0 })),
+    ...[...exprStats].map(([id, s]) => ({ id, name: bodyNames.get(id) ?? "«list»", mode: s.mode, calls: s.n, avgMs: s.n > 1 ? (s.ms - s.first) / (s.n - 1) : s.ms, why: s.why, entries: exprCache.get(id)?.length ?? 0 })),
+  ];
 }
 const bodyNames = new Map<number, string>();
+/** Side-effect tripwire for the expression memo's measure phase: `print` is an effect a memoised
+ *  site must not replay away.  (Writes are watched through envEpoch, parametric reads through
+ *  this.params.length — together the three host effects the static analysis can miss through a
+ *  called closure whose branch was not sampled.) */
+let printCount = 0;
 
 /**
  * Bumped whenever an environment binding that a closure may have captured is *overwritten*
@@ -401,7 +419,7 @@ function staticBuiltins(atlas: Atlas): Map<string, Value> {
     b("strength", fn2("strength", (sName, c, l) => { if (typeof sName !== "string" || !(sName in STRENGTH)) throw err('strength expects "weak", "medium", "strong" or "required"', l); const w = STRENGTH[sName]; return tagCons(c, (k) => k.withWeight(w), l); }));
     b("weight", fn2("weight", (w, c, l) => { const k = num(w, "weight", l); if (!(k > 0)) throw err("weight must be positive", l); return tagCons(c, (x) => x.withWeight((x.weight === undefined || x.weight === Infinity ? STRENGTH.weak : x.weight) * k), l); }));
     b("soft", fn1("soft", (c, l) => tagCons(c, (k) => k.withWeight(STRENGTH.weak), l)));
-    b("print", fn1("print", (a) => { console.log("[curv]", show(a)); return null; }));
+    b("print", fn1("print", (a) => { printCount++; console.log("[curv]", show(a)); return null; }));
     b("error", fn1("error", (a, l) => { throw err(typeof a === "string" ? a : show(a), l); }));
     // --- colours
     for (const [n, hex] of Object.entries(NAMED)) b(n, colour(hex).slice(0, 3));
@@ -738,6 +756,126 @@ export class Interp {
     if (sl.length > CALL_LRU) { sl.length = CALL_LRU; callCacheSize--; }
     return out;
   }
+
+  /**
+   * Expression memo for pure *list literals* and comprehensions (round 16).  Warm frames spend
+   * their remaining time assembling trees: `[nav vp, panel "x" rows, for (c in cards) card c]`
+   * re-evaluates every item (often call-memo hits — each still paying its own hash) and
+   * re-hashes the whole parent downstream.  A list whose free variables hash identically is
+   * replayed as ONE hit: same mechanism as the call memo (profile-guided election, purity from
+   * freeVarsOfExpr — `parametric`/captured-`:=`/`print` never memoise — flags + solve traces
+   * recorded and replayed, identical immutable value returned).  Constant/tiny lists never
+   * enter (a colour vector `[r,g,b]` is cheaper evaluated than profiled).
+   */
+  private applyExprMemo(e: Expr & { k: "list" }, env: Env, run: () => Value): Value {
+    const id = astId(e);
+    let st = exprStats.get(id);
+    if (st === undefined) {
+      if (exprStats.size > 4096) exprStats.clear();
+      st = { n: 0, ms: 0, first: 0, mode: "measure" };
+      const info = freeVarsOfExpr(e);
+      if (!info.pure) { st.mode = "skip"; st.why = info.why ?? "impure"; }
+      else if (info.free.includes("print")) { st.mode = "skip"; st.why = "prints"; }
+      else {
+        // Callee purity is NOT covered by the list's own statics: `[for (i in xs) f i]` is only as
+        // pure as f.  Require every closure reachable from the free values (bounded) to be
+        // statically pure as well — over-approximation is safe, under-approximation is not
+        // (memotest: assigns-outer / prints / parametric-through-closure).
+        let why = "";
+        const seen = new Set<Value>(); const scan = (v: Value, depth: number) => {
+          if (why || depth > 3 || seen.size > 32 || seen.has(v)) return;
+          seen.add(v);
+          if (v instanceof Fn && v.closure) {
+            const fi = freeVarsOfFn(v.closure.params, v.closure.body);
+            if (!fi.pure) why = `impure callee '${v.name}' (${fi.why ?? "?"})`;
+            else if (fi.free.includes("print")) why = `printing callee '${v.name}'`;
+          } else if (v instanceof Fn && !v.key) why = `unkeyed builtin '${v.name}'`;
+          else if (isList(v)) for (const x of v) scan(x, depth + 1);
+          else if (v instanceof Rec) for (const [, x] of v.f) scan(x, depth + 1);
+        };
+        for (const name of info.free) { const v = env.lookup(name); if (v !== undefined) scan(v, 0); }
+        if (why) { st.mode = "skip"; st.why = why; }
+      }
+      exprStats.set(id, st); bodyNames.set(id, "«list»");
+    }
+    if (st.mode === "skip") { this.callMemo.skipped++; return run(); }
+    const hashFree = (): string => {
+      const info = freeVarsOfExpr(e);
+      const h = new ValueHasher(CALL_HASH_LIMIT);
+      h.push("E" + id);
+      for (const name of info.free) {
+        const v = env.lookup(name);
+        if (v === undefined) continue; // over-approximated name (or an error that will raise on evaluation)
+        h.push(name); h.value(v);
+      }
+      return h.parts.join("");
+    };
+    if (st.mode === "measure") {
+      // Runtime tripwire: effects a called closure could hide from EVERY static analysis above
+      // (a write to an existing binding, a parametric read, a print).  Any of them observed while
+      // sampling the site disqualifies it forever — observing is cheap because we measure anyway.
+      const e0 = envEpoch, p0 = this.params.length, pr0 = printCount;
+      const t0 = performance.now(); const v = run(); const dt = performance.now() - t0; st.ms += dt; if (st.n++ === 0) st.first = dt;
+      this.callMemo.measured++;
+      if (envEpoch !== e0) { st.mode = "skip"; st.why = "observed a binding write"; return v; }
+      if (this.params.length !== p0) { st.mode = "skip"; st.why = "observed a parametric read"; return v; }
+      if (printCount !== pr0) { st.mode = "skip"; st.why = "observed a print"; return v; }
+      if (st.n >= CALL_MEMO_SAMPLES) {
+        const avg = (st.ms - st.first) / (st.n - 1);
+        let hashMs = -1;
+        try { hashFree(); const th = performance.now(); hashFree(); hashMs = performance.now() - th; }
+        catch (e2) { if (!(e2 instanceof Unhashable)) throw e2; }
+        if (hashMs < 0) { st.mode = "skip"; st.why = "unhashable inputs"; }
+        else if (avg >= Math.max(CALL_MEMO_MIN_MS, hashMs * 2)) st.mode = "memo";
+        else { st.mode = "skip"; st.why = `cheap (${(avg * 1000).toFixed(0)} µs ≈ ${hashMs > 0 ? (avg / hashMs).toFixed(1) : "?"}×hash)`; }
+      }
+      return v;
+    }
+    // memo mode
+    const th = performance.now();
+    let key: string | null = null;
+    try { key = hashFree(); }
+    catch (e2) { if (!(e2 instanceof Unhashable)) throw e2; st.why = e2.why; }
+    this.callMemo.hashMs += performance.now() - th;
+    if (key === null) { this.callMemo.skipped++; return run(); }
+    const slots = exprCache.get(id);
+    const i = slots ? slots.findIndex((h) => h.key === key) : -1;
+    if (slots && i >= 0) {
+      const hit = slots[i];
+      if (i > 0) { slots.splice(i, 1); slots.unshift(hit); }
+      this.usesTime ||= hit.flags.time; this.usesMouse ||= hit.flags.mouse; this.usesViewport ||= hit.flags.viewport;
+      for (const t of hit.traces) this.traces.push({ ...t, cached: true, cacheKind: t.cacheKind ?? "block", timeMs: 0 });
+      this.callMemo.hits++;
+      return hit.out;
+    }
+    const t0 = performance.now(); const tr0 = this.traces.length;
+    const uT = this.usesTime, uM = this.usesMouse, uV = this.usesViewport;
+    this.usesTime = this.usesMouse = this.usesViewport = false;
+    let out: Value, flags: CallHit["flags"];
+    try { out = run(); }
+    finally { flags = { time: this.usesTime, mouse: this.usesMouse, viewport: this.usesViewport }; this.usesTime ||= uT; this.usesMouse ||= uM; this.usesViewport ||= uV; }
+    st.ms += performance.now() - t0; st.n++;
+    this.callMemo.misses++;
+    // a degraded solve inside the list makes the result history-dependent: never memoised
+    if (this.unmemoizableFrame) return out;
+    if (exprCacheSize >= CALL_CACHE_MAX) { exprCache.clear(); exprCacheSize = 0; }
+    let sl = exprCache.get(id);
+    if (!sl) { sl = []; exprCache.set(id, sl); }
+    sl.unshift({ key, out, traces: this.traces.slice(tr0), flags });
+    exprCacheSize++;
+    if (sl.length > EXPR_LRU) { sl.length = EXPR_LRU; exprCacheSize--; }
+    return out;
+  }
+  /** Lists that are worth profiling: anything with a call / nested structure / comprehension item.
+   *  (A `[x, y]` pair or `[r,g,b]` colour is cheaper evaluated than measured.) */
+  private memoWorthyList(e: Expr & { k: "list" }): boolean {
+    for (const it of e.items) {
+      if (it.k !== "expr") return true; // comprehension/spread/conditional
+      const k = it.e.k;
+      if (k === "call" || k === "list" || k === "rec" || k === "let" || k === "do" || k === "solve") return true;
+    }
+    return false;
+  }
   bindDefs(defs: Def[], env: Env) {
     // functions first (recursion-friendly), then values in order
     for (const d of defs) if (d.params.length > 0 || d.body.k === "lambda") {
@@ -769,7 +907,10 @@ export class Interp {
         if (e.name === "time") this.usesTime = true; else if (e.name === "mouse") this.usesMouse = true; else if (e.name === "viewport" || e.name === "parent") this.usesViewport = true;
         const v = env.lookup(e.name); if (v === undefined) throw err(`Unknown identifier '${e.name}'`, e.line); return v;
       }
-      case "list": { const out: Value[] = []; this.listItems(e.items, env, out); return out; }
+      case "list": {
+        if (exprMemoOn && this.memoWorthyList(e)) return this.applyExprMemo(e, env, () => { const out: Value[] = []; this.listItems(e.items, env, out); return out; });
+        const out: Value[] = []; this.listItems(e.items, env, out); return out;
+      }
       case "rec": {
         const e2 = env.child(); const r = new Rec();
         for (const s of e.spreads) { const v = this.eval(s, e2); const src = v instanceof Shape ? this.shapeRec(v) : rec(v); for (const [k, x] of src.f) { r.f.set(k, x); e2.vars.set(k, x); } }

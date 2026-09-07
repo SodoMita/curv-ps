@@ -1,4 +1,4 @@
-# Curv+solve — handoff (dev round 15)
+# Curv+solve — handoff (dev round 16)
 
 Browser playground for **Curv** (2D F-Rep, compiled to WGSL / JS) extended with
 `solve { }` constraint blocks solved by **psolve** (LP + convex QP, WebAssembly).
@@ -14,11 +14,49 @@ Headless checks (all use the JS backend, no browser needed):
 | `npx tsx scripts/warmcheck.ts` | **round-14 bridge oracle**: warm→cold drag equivalence (plan P0.2 acceptance: pixel-identity), failure degradation/recovery with **no memo pollution**, first-frame certified-infeasible error message, wall-clock **budget → STOPPED + approximate incumbent (never garbage)**, budget ladder certifies |
 | `npx tsx scripts/warmbench.ts [example …]` | cold-vs-chained solve timing, interleaved best-of-4 per width (round-12 noise lesson), warm-accept / cold-retry counters |
 | `npx tsx scripts/internbench.ts [example …]` | round-15 hash-consing A/B (inode ON/OFF, alternated in-process, best-of-6): full-eval cost vs fresh-tree key+param-walk cost, hit counters |
-| `npx tsx scripts/prof.ts [-v]` | warm eval / codegen / params-only timings, per-`solve` cache kind, call-memo hit/miss counters; `-v` prints the per-function memo decisions |
+| `npx tsx scripts/exprbench.ts [example …]` | round-16 expression-memo A/B (alternated in-process, best-of-6): full-eval cost with the list-site memo ON vs OFF |
+| `npx tsx scripts/prof.ts [-v]` | warm eval / codegen / params-only timings, per-`solve` cache kind, call-memo hit/miss counters; `-v` prints the per-site memo decisions (function bodies and «list» expression sites) |
 
-All six check scripts were green at the end of this round (`paramcheck` / `memotest` / `warmcheck` exit 1 on any failure — check the exit code).
+All seven check scripts were green at the end of this round (`paramcheck` / `memotest` / `warmcheck` exit 1 on any failure — check the exit code).
 
-## What changed in this round — the top round-13/14 gap ("per-frame cost is dominated by the program's own tree"): measured study + one shipped win
+## What changed in this round — expression-level memo (the round-15 gap, shipped) + a merged editor PR
+
+**Merge against the PR-edited origin** (parallel "round 15" line, PR #1: editor syntax highlighting +
+brace-pair matching — `src/components/highlight.ts` permissive Curv tokenizer used purely for spans,
+`Editor.tsx` overlay highlight + bracket matching, `index.css` theme).  Clean fast-forward; suites
+green on the merged tree.  This round's own work was the round-15-designated next step:
+
+1. **Expression memo for pure list literals / comprehensions** (`applyExprMemo`, interp.ts; analysis
+   `freeVarsOfExpr`, freevars.ts).  The round-15 study showed the warm-frame residual is *evaluator*
+   assembly work, not solvable by hashing trees cheaper — this memo is the mechanism at the right
+   grain: a `[nav vp, panel "x" rows, for (c in cards) card c]` site whose free variables hash
+   identically replays as ONE hit (identical immutable array returned), instead of re-hashing every
+   item's call memo every frame.  Same profile-guided election as the call memo (memo iff warm body
+   ≥ max(8 µs, 2 × warm-hash)), same flags/trace replay (`time`/`mouse`/`viewport` through closures
+   are covered by hashing the *values* of free names — a closure's captured inputs hash with it),
+   LRU per site (`EXPR_LRU` 8) inside the global cap.  `memoWorthyList` gates constant/tiny lists
+   (colour vectors, point pairs — cheaper to evaluate than to profile).  Measured (`exprbench`,
+   alternated best-of-6, all 19 examples): **total 14.0 → 5.2 ms (2.7×)**; solve/UI corpus 1.8–7.1×
+   (dashboard 5.6×, polygon 7.1×, packed 3.6×, buttons 2.7×, chart 2.7×, toolbar 2.2×); shader-only
+   programs within ±8 % (frep 0.82× worst: site profiling on tiny trees — sub-µs absolute).
+2. **Purity hardening the memo forced** (the interesting part): a list's *static* free-variable
+   purity says nothing about a *callee's* effects — `[for (i in xs) f 1]` is only as pure as `f`,
+   and memotest's three impurity gates caught it (hits on assigns-outer/prints/parametric-through-
+   closure).  Two layers: (a) at election, every closure reachable from the free values (bounded
+   scan, depth ≤ 3 / 32 values) must itself be statically pure and non-printing — over-approximate
+   skips are safe; (b) a **measure-phase tripwire** (envEpoch / `params.length` / new `printCount`
+   snapshots around each sampled run) catches host effects an unsampled callee branch could hide.
+   `memotest` negative-case assertion is now **per-site** ("no MEMO row on the impure construct"),
+   not "no hits in the frame" — a legitimately elected pure lambda beside an impure site would
+   flake the old proxy, and the λ here is semantically correct (time-keyed, verified by the
+   same/dep columns).  New positive cases: list literal / comprehension / viewport lists (values,
+   time-dependence, trace replay) and list identity across frames (same array object).
+3. `setExprMemo` bench switch; `callMemoTable()` now reports «list» rows for `prof -v`; invariants
+   section grew rules for callee purity, the tripwire, the per-site gate assertion, and the
+   `EXPR_LRU`/threshold reuse.
+
+## Round 15 recap (kept from the round-15 handoff — all still in force)
+
 
 1. **Hash-consing (`inode`, shapes.ts) — studied, measured, kept OFF.**  Design: S() hash-conses every
    constructed node through a WeakRef table keyed by a numeric content hash (`cHash`, two u32 lanes
@@ -329,7 +367,7 @@ psolve-src/             vendored upstream bridge (verbatim) + shims + build-wasm
 src/App.tsx             UI: editor, preview (camera, pause, CPU-aware quality controller, static-frame
                         skip cache, shader-time re-render path, single-eval camera fitting), solver +
                         params panels, memo hits + static badge in the status line
-scripts/                selftest, paramcheck, memotest, warmcheck, warmbench, prof, shaderbench, sheet (headless, tsx)
+scripts/                selftest, paramcheck, memotest, warmcheck, warmbench, internbench, exprbench, prof, shaderbench, sheet (headless, tsx)
 ```
 
 ## Invariants to keep (things that will silently break otherwise)
@@ -425,6 +463,16 @@ scripts/                selftest, paramcheck, memotest, warmcheck, warmbench, pr
 * `inode` is OFF by default (round-15 measured net loss at S()-level on all 19 examples); enabling
   it anywhere needs an internbench run first.  Do not diversify its hash coverage away from
   `nodeHashRaw` — the intern table's correctness argument is the same interchangeability lemma.
+* **Expression memo (round 16) is bound by callee purity, not just site purity**: any new memo site
+  must (a) reject statically impure free-variable closures *reachable from the free values* (the
+  bounded scan in `applyExprMemo`), and (b) keep the measure-phase tripwire (envEpoch /
+  `params.length` / `printCount`) armed so host effects through unsampled callee branches are
+  observed exactly once.  New host-state reads reachable from expression evaluation also need a
+  tripwire channel (or to mark the site impure statically) — a memoised site that hides an effect
+  shows stale pictures with no error.
+* `memotest` negative cases assert **per-site** (no MEMO row on the impure construct), never
+  "no hits in the frame" — unrelated pure lambdas may be elected legitimately beside an impure
+  site (JIT-dependent), and that is not a violation.
 
 ## Known gaps / next steps
 
@@ -444,13 +492,12 @@ scripts/                selftest, paramcheck, memotest, warmcheck, warmbench, pr
 * The psolve arena (`psw_arena_*`) is deliberately **not** used: upstream measured it *slower* than
   libc malloc on this QP workload (their P2.4), and an exhausted arena aborts the module; it stays a
   determinism option, not a speed one.
-* Eval of the *rest* of an animated cached frame (user-tree construction, `union` literals) is nearly
-  all that remains on warm frames (split 0.04 ms, dashboard ≈ 0.9 ms raw; static examples skip
-  evaluation entirely).  Round 15 measured the obvious cure (hash-consing — every identity memo hits
-  for free) and found the hasher costs more than the walks it saves at S()-level; the residual moved
-  to the *evaluator's own* allocation+application work, so the next honest items are an
-  expression-level memo for expensive pure literals (the call memo generalised) or a cheaper
-  tree-builder — not a better intern table.
+* Eval of the *rest* of an animated cached frame is now covered by three memo layers: block memo
+  (solve), call memo (function bodies) and the round-16 expression memo (list assembly sites);
+  exprbench totals 14.0 → 5.2 ms.  What remains below that: list *item* evaluation that was too
+  cheap to memoise individually (the honest tail), record literals (`rec` is not a memo site yet —
+  worth benching if a profile shows it), and genuinely time-varying trees (chart/frep: misses are
+  physics, not overhead — the gate keeps their extra hashing at ≤2× the would-be body cost).
 * The shader-only-time fast path keeps the quality scale while animating; settling to full resolution
   only happens on pause / interactions (a settle tick that schedules itself per frame was judged too
   finicky).
