@@ -6,7 +6,6 @@ interface Props { value: string; onChange: (v: string) => void; errorLine?: numb
 // character → the partner inserted when it is typed
 const PAIR_OF: Record<string, string> = { "(": ")", "[": "]", "{": "}", '"': '"', "'": "'" };
 const OPENERS = new Set(["(", "[", "{"]);
-const CLOSERS = new Set([")", "]", "}"]);
 const QUOTES = new Set(['"', "'"]);
 
 interface Piece { text: string; cls: string }
@@ -133,7 +132,6 @@ export function Editor({ value, onChange, errorLine }: Props) {
 
     if (plain && e.key.length === 1) {
       const k = e.key;
-      if (CLOSERS.has(k) && s === en && v[s] === k) { e.preventDefault(); moveCaret(s + 1); return; } // type over the closer
       if (QUOTES.has(k)) {
         e.preventDefault();
         if (s === en && v[s] === k) moveCaret(s + 1); // step out of an auto-closed quote
