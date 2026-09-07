@@ -19,7 +19,40 @@ html, body, #root { height: 100%; }
 body { background: var(--color-ink); color: var(--color-fg); font-family: var(--font-sans); }
 * { scrollbar-width: thin; scrollbar-color: #2e3950 transparent; }
 
-.editor-textarea { tab-size: 2; caret-color: #22d3ee; }
+/* the textarea sits over the highlighted layer with transparent glyphs — it must
+   share the layer's exact font metrics (font: inherit) and line grid */
+.editor-textarea { font: inherit; tab-size: 2; caret-color: #22d3ee; }
 .editor-textarea::selection { background: rgba(124, 92, 255, 0.35); }
 .err-line { background: rgba(251, 113, 133, 0.18); }
 kbd { font-family: var(--font-mono); font-size: 0.7rem; padding: 0.05rem 0.35rem; border: 1px solid #2e3950; border-radius: 4px; background: #1d2537; }
+
+/* ---- editor: syntax palette (dark, tuned to the app theme) ---- */
+.tok-kw       { color: #b3a1ff; }              /* let in solve var if then else …   */
+.tok-strength { color: #f0a35e; }              /* weak medium strong required min…  */
+.tok-lit      { color: #f472b6; }              /* true false null                   */
+.tok-num      { color: #22d3ee; }
+.tok-str      { color: #9ece8a; }
+.tok-qid      { color: #8ed8c6; }              /* 'quoted identifier'               */
+.tok-com      { color: #5d6b8a; }
+.tok-field    { color: #93b4f0; }              /* .w .left .bbox …                  */
+.tok-op       { color: #8b9bb8; }
+.tok-brace    { color: #c3cfe6; }
+
+/* brace matching: the bracket under the caret and its partner */
+.tok-brace--match {
+  background: rgba(34, 211, 238, 0.26);
+  color: #effcff;
+  box-shadow: 0 0 0 1px rgba(34, 211, 238, 0.55);
+  border-radius: 3px;
+}
+.tok-brace--unmatched {
+  background: rgba(251, 113, 133, 0.28);
+  color: #ffe4e9;
+  box-shadow: 0 0 0 1px rgba(251, 113, 133, 0.6);
+  border-radius: 3px;
+}
+
+/* caret line / error line bands behind the code (highlight layer) */
+.ed-band     { position: absolute; left: 0; right: 0; background: rgba(230, 235, 245, 0.045); }
+.ed-band-err { position: absolute; left: 0; right: 0; background: rgba(251, 113, 133, 0.08); }
+.gutter-current { background: rgba(230, 235, 245, 0.07); color: #e6ebf5; }
