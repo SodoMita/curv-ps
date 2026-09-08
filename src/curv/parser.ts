@@ -218,6 +218,9 @@ class Parser {
     if (t.t === "id") return !KEYWORDS.has(t.v) || t.v === "solve" || t.v === "true" || t.v === "false" || t.v === "null";
     return t.t === "op" && (t.v === "(" || t.v === "[" || t.v === "{");
   }
+  /** Field/index continuations (`e.f`, `e.[i]`) applied to `e`.  These bind tighter than
+   *  juxtaposition, so `f a.b` == `f (a.b)` — a deliberate curv-ps choice that keeps the
+   *  existing examples / prelude (written in this style) unambiguous. */
   selectors(e: Expr): Expr {
     for (;;) {
       if (this.is(".[")) { const t = this.next(); const idx = this.expr(); this.expect("]"); e = { k: "index", e, idx, line: t.line }; continue; }

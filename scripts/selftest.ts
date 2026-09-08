@@ -36,15 +36,18 @@ for (const ex of list) {
     const bb = finiteBBox(bboxOf(r.shape, atlas));
     const ui = r.usesViewport;
     const cam = ui ? { cx: 0, cy: 0, zoom: W / VW } : (() => { const b = bb ?? [-10, -10, 10, 10]; const z = 0.9 * Math.min(W / (b[2] - b[0]), H / (b[3] - b[1])); return { cx: (b[0] + b[2]) / 2, cy: (b[1] + b[3]) / 2, zoom: z }; })();
-    const body = `const zoom=cam.zoom; for (let j=0;j<H;j++) for (let i=0;i<W;i++){ const p0=[((i+0.5)-W*0.5)/zoom+cam.cx, -((j+0.5)-H*0.5)/zoom+cam.cy];\n${js.code}\nconst d=${js.d}, col=${js.c}; const aa=Math.min(1,Math.max(0,0.5-d*zoom))*col[3]; const q=(j*W+i)*4; px[q]=(bg[0]+(col[0]-bg[0])*aa)*255; px[q+1]=(bg[1]+(col[1]-bg[1])*aa)*255; px[q+2]=(bg[2]+(col[2]-bg[2])*aa)*255; px[q+3]=255; }`;
-    const fn = new Function("P", "R", "W", "H", "cam", "T", "bg", "px", body);
+    // the `d !== d` guard is the NaN check: a non-finite distance paints the pixel black and
+    // would otherwise look like a legitimate empty frame (see scripts/pdiff.ts for the gate)
+    const body = `const zoom=cam.zoom; let nan=0; for (let j=0;j<H;j++) for (let i=0;i<W;i++){ const p0=[((i+0.5)-W*0.5)/zoom+cam.cx, -((j+0.5)-H*0.5)/zoom+cam.cy, 0];\n${js.code}\nlet d=${js.d}; if (d!==d) { d=1e30; nan++; } const col=${js.c}; const aa=Math.min(1,Math.max(0,0.5-d*zoom))*col[3]; const q=(j*W+i)*4; px[q]=(bg[0]+(col[0]-bg[0])*aa)*255; px[q+1]=(bg[1]+(col[1]-bg[1])*aa)*255; px[q+2]=(bg[2]+(col[2]-bg[2])*aa)*255; px[q+3]=255; } return nan;`;
+    const fn = new Function("P", "R", "W", "H", "cam", "T", "bg", "px", body) as (...a: unknown[]) => number;
     const cv = createCanvas(W, H); const ctx = cv.getContext("2d");
     const img = ctx.createImageData(W, H);
-    fn(js.params, R, W, H, cam, 1.2, [0.055, 0.075, 0.13], img.data);
+    const nan = fn(js.params, R, W, H, cam, 1.2, [0.055, 0.075, 0.13], img.data);
     ctx.putImageData(img, 0, 0);
     const t3 = performance.now();
     writeFileSync(`/tmp/t/${ex.id}.png`, cv.toBuffer("image/png"));
-    console.log(`OK  ${ex.id.padEnd(14)} ${r.usesTime ? "anim " : wg.usesTime ? "anim(shader) " : ""}eval ${(t1 - t0).toFixed(1)}ms  codegen ${(t2 - t1).toFixed(1)}ms  cpu-render ${(t3 - t2).toFixed(0)}ms  params=${js.params.length} wgsl=${wg.code.length}b lines=${wg.code.split("\n").length} ${ui ? "ui" : "curv"} bbox=${bb ? bb.map((x) => x.toFixed(1)).join(",") : "inf"} ${r.params.length ? "sliders=" + r.params.map((p) => p.name).join(",") : ""}`);
+    console.log(`OK  ${ex.id.padEnd(14)} ${r.usesTime ? "anim " : wg.usesTime ? "anim(shader) " : ""}eval ${(t1 - t0).toFixed(1)}ms  codegen ${(t2 - t1).toFixed(1)}ms  cpu-render ${(t3 - t2).toFixed(0)}ms  params=${js.params.length} wgsl=${wg.code.length}b lines=${wg.code.split("\n").length} ${ui ? "ui" : "curv"} bbox=${bb ? bb.map((x) => x.toFixed(1)).join(",") : "inf"} ${r.params.length ? "sliders=" + r.params.map((p) => p.name).join(",") : ""}${nan ? `  *** ${nan} NON-FINITE PIXELS ***` : ""}`);
+    if (nan) { fails++; console.log(`ERR ${ex.id}: ${nan} pixels with a non-finite distance`); }
     if (want.includes("--wgsl")) console.log(wg.code);
   } catch (e: any) { fails++; console.log(`ERR ${ex.id}: ${e.message} (line ${e.line})`); if (want.includes("--stack")) console.log(e.stack); }
 }

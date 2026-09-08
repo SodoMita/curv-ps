@@ -1,8 +1,11 @@
 # Curv+solve
 
-A browser playground for [Curv](https://github.com/curv3d/curv) 2D shapes (F-Rep compiled to WGSL for WebGPU,
+A browser playground for [Curv](https://github.com/curv3d/curv) shapes (F-Rep compiled to WGSL for WebGPU,
 with a JS fallback) extended with `solve { … }` blocks: linear / convex-quadratic constraints solved by
-[psolve](https://github.com/SodoMita/psolve) compiled to WebAssembly.
+[psolve](https://github.com/SodoMita/psolve) compiled to WebAssembly.  2D is the `z = 0` slice of a 3D
+field, so the same program also renders as a raymarched solid (orbit camera) with the C++ `std.curv`
+3D vocabulary: `sphere`, `box3`, `cone`, `capsule`, `torus`, `cylinder`, `gyroid`, `extrude`, `loft`,
+`twist`, `bend`, `repeat_xyz`, `slice_xz`, `reflect_yz`, …
 
 **Live: <https://sodomita.github.io/curv-ps/>** (the single-file `dist/index.html`, rebuilt on every push to main).
 
@@ -41,5 +44,8 @@ runs inside a per-frame **wall-clock budget** that hands back an incumbent rathe
 * `npx tsx scripts/exprbench.ts [example …]` — expression-memo A/B benchmark (round-16: pure list/comprehension memo sites)
 * `npx tsx scripts/shaderbench.ts [example …]` — benchmarks the shader-generation variants (`SHADER_FLAGS`) per example: JS raster time, WGSL bytes, branch/loop counts
 * `npx tsx scripts/memotest.ts` — dependency-tracking tests for solve-block and call memoisation
+* `npx tsx scripts/threedcheck.ts` — 3D gate: solid-mode codegen on both backends, `bbox3`, `is_2d`/`is_3d`, and the CPU raymarcher's real pixels (slice/solid parity, animation)
+* `npx tsx scripts/stdcheck.ts` — C++ `std.curv` parity: prelude values, 2D/3D boxes, and the generated field sampled on a grid (no non-finite distance, nothing inside the shape outside its box)
+* `npx tsx scripts/pdiff.ts [--update]` — golden-frame gate: hashes every example's render (slice + solid) against `scripts/golden/pdiff.json` and counts non-finite distances; `--update` rewrites the goldens after an intended change
 
 See [HANDOFF.md](HANDOFF.md) for the architecture, invariants and the current state of development.

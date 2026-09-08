@@ -3,6 +3,7 @@ name: pages
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -15,6 +16,35 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Headless gates: every script here is a real oracle (they exit non-zero on failure), and they
+  # need no browser — the render gates use @napi-rs/canvas and the CPU backend.  pdiff checks the
+  # committed golden frame hashes, so a rendering regression fails the build instead of shipping.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: typecheck
+        run: npx tsc --noEmit
+      - name: selftest (every example evaluates + renders)
+        run: npx tsx scripts/selftest.ts
+      - name: threedcheck (3D codegen, bbox3, raymarch pixels)
+        run: npx tsx scripts/threedcheck.ts
+      - name: stdcheck (C++ std.curv parity)
+        run: npx tsx scripts/stdcheck.ts
+      - name: paramcheck (fast paths + memoisation)
+        run: npx tsx scripts/paramcheck.ts
+      - name: memotest (dependency tracking)
+        run: npx tsx scripts/memotest.ts
+      - name: warmcheck (solver bridge oracle)
+        run: npx tsx scripts/warmcheck.ts
+      - name: pdiff (golden pixel hashes)
+        run: npx tsx scripts/pdiff.ts
+
   build:
     runs-on: ubuntu-latest
     steps:
@@ -31,6 +61,7 @@ jobs:
           path: dist
 
   deploy:
+    if: github.ref == 'refs/heads/main'
     needs: build
     runs-on: ubuntu-latest
     environment:

@@ -1,4 +1,4 @@
-export interface Example { id: string; name: string; blurb: string; src: string; group: "solve" | "curv" }
+export interface Example { id: string; name: string; blurb: string; src: string; group: "solve" | "curv" | "3d" }
 
 // One coordinate system for everything: ordinary Curv space (y up, origin in the
 // middle, arbitrary units).  `solve { }` is just another way of producing numbers.
@@ -454,5 +454,106 @@ in union [
     name: "Peppermint",
     blurb: "curv/examples/peppermint.curv \u2014 rect{xmin}, repeat_radial, swirl, into intersection, parametric sliders.",
     src: "// demo of 'swirl' transformation\n\nparametric\n    Swirl_Strength: ss :: slider[-10,10] = 4;\n    Swirl_Diameter: sd :: slider[4,40] = 16;\nin\nunion[rect{xmin:0} >> colour red, rect{xmax:0} >> colour(sRGB[1,1,.8])]\n  >> repeat_radial 8\n  >> swirl{strength: ss, d: sd}\n  >> into intersection [circle 8]\n  >> pancake 2",
+  },
+  // ---- 3D (solid F-Rep, raymarched in the 3D view) -------------------------------------------
+  {
+    group: "3d",
+    id: "ball3d",
+    name: "Shaded ball",
+    blurb: "3D view: the F-Rep tree is raymarched (sphere d is a ball of diameter d, C++ std.curv convention, +Z up). Colour varies with height.",
+    src: `// 3D view: the shape's distance field is raymarched and shaded
+// (ambient + two lights + rim).  C++ std.curv conventions: diameters, +Z up.
+let
+    c [x,y,z,_] = sRGB.HSV ((z + 2.2) / 4.4, 0.62, 0.95);
+in
+sphere 4.4 >> colour c`,
+  },
+  {
+    group: "3d",
+    id: "rings3d",
+    name: "Gyroscope",
+    blurb: "Three tori on orthogonal planes; rotate {angle, axis} is the C++ 3D rotation (Rodrigues).",
+    src: `let
+    ring = torus {major: 3.2, minor: 0.55};
+in
+union [
+    ring >> colour (sRGB[0.92, 0.42, 0.35]),
+    ring >> rotate {angle: 90*deg, axis: X_axis} >> colour (sRGB[0.35, 0.62, 0.9]),
+    ring >> rotate {angle: 90*deg, axis: Y_axis} >> colour (sRGB[0.45, 0.82, 0.45]),
+]`,
+  },
+  {
+    group: "3d",
+    id: "molecule3d",
+    name: "Molecule",
+    blurb: "smooth 0.55 .union of balls joined by capsules — the smin blend keeps the field fast to march (C++ smooth union).",
+    src: `let
+    a = [0, 0, 0];
+    b = [2.2, 1.1, 0.7];
+    c = [-1.9, 1.3, -0.9];
+in
+smooth 0.55 .union [
+    sphere 1.9 >> colour (sRGB[0.9, 0.35, 0.45]),
+    sphere 1.4 >> move b >> colour (sRGB[0.35, 0.55, 0.92]),
+    sphere 1.1 >> move c >> colour (sRGB[0.45, 0.85, 0.5]),
+    capsule {d: 0.85, from: a, to: b},
+    capsule {d: 0.7, from: a, to: c},
+]`,
+  },
+  {
+    group: "3d",
+    id: "twist3d",
+    name: "Twisted tower",
+    blurb: "curv/examples/twist.curv — box3 (C++ [dx,dy,dz]) extruded, twisted along Z, then rotated onto its base.",
+    src: `box3 [1.1, 1.1, 5]
+>> colour (sRGB.HSV (0.78, 0.55, 0.92))
+>> twist (18*deg)
+>> rotate {angle: 90*deg, axis: Y_axis}`,
+  },
+  {
+    group: "3d",
+    id: "gyroid3d",
+    name: "Gyroid cell",
+    blurb: "curv/examples/gyroid.curv (one cell) — implicit gyroid thickened by offset, Lipschitz-bounded for stable marching, clipped to a ball.",
+    src: `// Implicit surface: the unit gyroid, thickened into a skeleton by offset,
+// Lipschitz-bounded so the raymarcher can step safely, clipped to a ball.
+let
+    bones = gyroid >> offset (-1.2) >> lipschitz 1.5 >> stretch [1.8, 1.8, 1.8];
+in
+smooth 0.6 .intersection [
+    bones,
+    sphere 15,
+] >> colour (sRGB.HSV (2/3, 0.72, 0.95))`,
+  },
+  {
+    group: "3d",
+    id: "loft3d",
+    name: "Loft vase",
+    blurb: "loft d [s1, s2] sweeps a 2D profile through 3D (full height d, centred on z=0): a circle lofted into a square, on a plinth.",
+    src: `union [
+    loft 4.5 [circle 1.5, rect [2.2, 2.2]]
+        >> colour (sRGB.HSV (0.55, 0.5, 0.9)),
+    circle 2.6 >> offset 0.5 >> extrude 0.35
+        >> colour (sRGB.HSV (0.62, 0.45, 0.55))
+        >> move [0, 0, -2.3],
+]`,
+  },
+  {
+    group: "3d",
+    id: "grad3d",
+    name: "Distance field",
+    blurb: "show_gradient [j, k] paints the field's gradient in colour (the C++ viewer's debug mode); smooth union joins the solids.",
+    src: `let
+    slab = box3 [3.4, 3.4, 1.1];
+in
+smooth 0.5 .union [slab, sphere 2.2 >> move [1.2, 0, 0.6]]
+>> show_gradient [0.55, 0.85]`,
+  },
+  {
+    group: "3d",
+    id: "pulse3d",
+    name: "Pulse (animated)",
+    blurb: "The colour function reads t (time) inside the compiled shader: the hue circulates with no re-evaluation.",
+    src: `sphere 4 >> colour ([x,y,z,t] -> sRGB.HSV [mod [t * 0.12, 1], 0.72, 0.95])`,
   },
 ];

@@ -6,9 +6,9 @@ import { ParamsPanel } from "./components/ParamsPanel";
 import { EXAMPLES } from "./curv/examples";
 import { Interp, compileTree, type CompiledTree, type SolveTrace, type ParamDesc } from "./curv/interp";
 import { CurvError } from "./curv/parser";
-import { bboxOf, finiteBBox, type SNode } from "./curv/shapes";
+import { bboxOf, bbox3Of, finiteBBox, type SNode } from "./curv/shapes";
 import { buildAtlas, type Atlas } from "./gpu/atlas";
-import { createRenderer, type Renderer, type Camera } from "./gpu/renderer";
+import { createRenderer, type Renderer, type Camera, type Camera3 } from "./gpu/renderer";
 import { loadPsolve } from "./psolve/psolve";
 import { cn } from "./utils/cn";
 
@@ -16,7 +16,9 @@ import { cn } from "./utils/cn";
 // read `viewport` are re-evaluated whenever the visible world rectangle changes.
 const BG: Record<"light" | "dark", [number, number, number]> = { light: [0.965, 0.965, 0.975], dark: [0x0e / 255, 0x13 / 255, 0x22 / 255] };
 type ParamValues = Record<string, number | boolean | number[]>;
+type ViewMode = "2d" | "3d";
 const HOME: Camera = { cx: 0, cy: 0, zoom: 1 };
+const HOME3: Camera3 = { tx: 0, ty: 0, tz: 0, dist: 14, yaw: 0.65, pitch: 0.42, fov: (38 * Math.PI) / 180 };
 const DEBOUNCE_MS = 100;
 const FRAME_BUDGET_MS = 13;   // CPU (eval + params) + GPU render pass per animated frame, leaving headroom for the compositor
 const GPU_BUDGET_MS = 8;      // upper bound of the render-pass budget the adaptive-resolution controller aims for
@@ -42,7 +44,9 @@ export default function App() {
   const [paused, setPaused] = useState(false);
   const [animated, setAnimated] = useState(false);
   const [responsive, setResponsive] = useState(false);
+  const [viewMode, setViewMode] = useState<ViewMode>("2d");
   const [camView, setCamView] = useState<Camera>(HOME);
+  const [cam3View, setCam3View] = useState<Camera3>(HOME3);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const renderer = useRef<Renderer | null>(null);
@@ -61,10 +65,19 @@ export default function App() {
   const frames = useRef({ n: 0, t: performance.now(), last: 0 });
   const debugRef = useRef(false);
   const bgRef = useRef<"light" | "dark">("light");
+  const viewModeRef = useRef<ViewMode>("2d");
   const cam = useRef<Camera>({ ...HOME });
+  const cam3 = useRef<Camera3>({ ...HOME3 });
   const needFit = useRef(true);
+  const needFit3 = useRef(true);
   const paramRef = useRef<ParamValues>({});
+  // 2D pan: one tracked pointer.  3D orbit: one pointer.  Pinch: two pointers (both views).
   const drag = useRef<{ x: number; y: number; cx: number; cy: number } | null>(null);
+  const orbit = useRef<{ x: number; y: number; yaw: number; pitch: number } | null>(null);
+  const pinch = useRef<{ d0: number; id1: number; id2: number } | null>(null);
+  const pinchCam = useRef<{ cx: number; cy: number; zoom: number; mx: number; my: number } | null>(null);
+  const pinch3 = useRef<{ dist: number; yaw: number; pitch: number } | null>(null);
+  const pts = useRef(new Map<number, { x: number; y: number }>());
   const rendering = useRef(false);
   const codeRef = useRef("");
   const quality = useRef(1); // adaptive render scale while animating
@@ -76,6 +89,21 @@ export default function App() {
   useEffect(() => { debugRef.current = debugBoxes; dirty.current = true; }, [debugBoxes]);
   useEffect(() => { bgRef.current = bgMode; dirty.current = true; }, [bgMode]);
   useEffect(() => { paramRef.current = paramValues; dirty.current = true; }, [paramValues]);
+  useEffect(() => { viewModeRef.current = viewMode; dirty.current = true; }, [viewMode]);
+
+  // ---- 2D/3D view toggle: separate cameras, never rendered simultaneously (the compile mode +
+  // pipeline are chosen per view, so only one is ever live)
+  const setMode = useCallback((m: ViewMode) => {
+    setViewMode(m);
+    if (m === "3d") needFit3.current = true; else needFit.current = true;
+    drag.current = orbit.current = pinch.current = null;
+    pts.current.clear();
+    dirty.current = true;
+  }, []);
+  const setCam3 = useCallback((c: Camera3) => {
+    cam3.current = c; dirty.current = true;
+    setCam3View((v) => (v.tx === c.tx && v.ty === c.ty && v.tz === c.tz && v.dist === c.dist && v.yaw === c.yaw && v.pitch === c.pitch ? v : c));
+  }, []);
 
   // ---- boot: psolve wasm + glyph atlas + renderer
   useEffect(() => {
@@ -136,10 +164,11 @@ export default function App() {
     const tStart = performance.now();
     const W = cv.clientWidth, H = cv.clientHeight;
     const time = now();
+    const solid = viewModeRef.current === "3d";
     const paint = (prog: CompiledTree, q: number, updateCode: boolean) => {
       if (!rendering.current) {
         rendering.current = true;
-        r.render(prog, cam.current, BG[bgRef.current], time, q)
+        r.render({ ...prog, solid }, cam.current, BG[bgRef.current], time, q, solid ? cam3.current : undefined)
           .then(() => {
             rendering.current = false;
             if (updateCode && prog.code !== codeRef.current) { codeRef.current = prog.code; setCode(prog.code); }
@@ -152,9 +181,10 @@ export default function App() {
       }
     };
     // everything below except the camera is a program input; the camera/screen size are render uniforms only
-    const fp = srcRef.current + "\u0001" + JSON.stringify(paramRef.current) + "\u0001" + debugRef.current;
+    const fp = srcRef.current + "\u0001" + JSON.stringify(paramRef.current) + "\u0001" + debugRef.current + "\u0001" + (solid ? "3d" : "2d");
     const sk = staticCache.current, prog0 = lastProg.current;
-    if (sk && sk.fp === fp && prog0 && !needFit.current) {
+    const needFitNow = solid ? needFit3.current : needFit.current;
+    if (sk && sk.fp === fp && prog0 && !needFitNow) {
       // static program, unchanged inputs: re-render the existing program, nothing else to do
       cpuMs.current = 0;
       paint(prog0, drag.current ? quality.current : 1, prog0.code !== codeRef.current);
@@ -170,7 +200,7 @@ export default function App() {
     try {
       let res = it.run(srcRef.current);
       // camera: responsive programs start at 1 unit = 1 px around the origin, everything else is fitted once
-      if (needFit.current) {
+      if (needFit.current && !solid) {
         needFit.current = false;
         if (res.usesViewport && (cam.current.cx !== 0 || cam.current.cy !== 0 || cam.current.zoom !== 1)) {
           const c = { ...HOME };
@@ -184,6 +214,18 @@ export default function App() {
           const c = { cx: (bb[0] + bb[2]) / 2, cy: (bb[1] + bb[3]) / 2, zoom: Number.isFinite(zoom) && zoom > 0 ? zoom : 1 };
           cam.current = c; setCamView(c);
         }
+      } else if (needFit3.current && solid) {
+        needFit3.current = false;
+        if (!res.usesViewport) {
+          const raw = res.shape ?? { k: "nothing" as const };
+          const bb3 = finiteBBox3(bbox3Of(raw, at)) ?? [-1, -1, -1, 1, 1, 1];
+          const tx = (bb3[0] + bb3[3]) / 2, ty = (bb3[1] + bb3[4]) / 2, tz = (bb3[2] + bb3[5]) / 2;
+          const extent = Math.max(bb3[3] - bb3[0], bb3[4] - bb3[1], bb3[5] - bb3[2], 1) / 2;
+          // frame the whole bounding box in the fov, with 1.5× headroom
+          const dist = Math.max(0.5, (extent / Math.tan(HOME3.fov / 2)) * 1.5);
+          const c = { tx, ty, tz, dist, yaw: HOME3.yaw, pitch: HOME3.pitch, fov: HOME3.fov };
+          cam3.current = c; setCam3View(c);
+        }
       }
       let node: SNode = res.shape ?? { k: "nothing" };
       if (debugRef.current) {
@@ -194,7 +236,7 @@ export default function App() {
         node = { k: "union", kids };
       }
       const t1 = performance.now();
-      const prog = compileTree(node, at, r.kind === "webgpu" ? "wgsl" : "js", lastProg.current);
+      const prog = compileTree(node, at, r.kind === "webgpu" ? "wgsl" : "js", lastProg.current, undefined, solid ? "solid" : "slice");
       lastProg.current = prog;
       const t2 = performance.now();
       cpuMs.current = t2 - tStart;
@@ -250,7 +292,9 @@ export default function App() {
         if (!wasDirty && shaderTimeOnly.current && lastProg.current && renderer.current && !rendering.current) {
           // the tree cannot change between frames: just draw it again with the new time uniform
           const r = renderer.current; rendering.current = true; cpuMs.current = 0;
-          r.render(lastProg.current, cam.current, BG[bgRef.current], now(), quality.current).then(() => { rendering.current = false; }).catch((e: Error) => { rendering.current = false; setError({ message: e.message }); });
+          const solid = viewModeRef.current === "3d";
+          r.render({ ...lastProg.current, solid }, cam.current, BG[bgRef.current], now(), quality.current, solid ? cam3.current : undefined)
+            .then(() => { rendering.current = false; }).catch((e: Error) => { rendering.current = false; setError({ message: e.message }); });
         } else evaluate(wasDirty);
         f.n++;
         if (t - f.t > 1000) { const fps = animating ? (f.n * 1000) / (t - f.t) : 0; setStats((s) => (s.fps === fps ? s : { ...s, fps })); f.n = 0; f.t = t; }
@@ -268,28 +312,86 @@ export default function App() {
     ro.observe(cv); return () => ro.disconnect();
   }, []);
 
-  // ---- pointer: mouse input (world units) + pan/zoom
+  // ---- pointer: mouse input (world units) + gestures.
+  // 2D: one finger/mouse pans, two pinch-zoom (the world point under the initial midpoint stays fixed).
+  // 3D: one finger/mouse orbits, two pinch-zoom (camera distance).
   const setMouse = (e: React.PointerEvent<HTMLCanvasElement>) => {
     const rect = e.currentTarget.getBoundingClientRect();
     mousePx.current = { x: e.clientX - rect.left, y: e.clientY - rect.top, down: e.buttons > 0 };
   };
   const onPointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
     setMouse(e); e.currentTarget.setPointerCapture(e.pointerId);
-    drag.current = { x: e.clientX, y: e.clientY, cx: cam.current.cx, cy: cam.current.cy };
+    const rect = e.currentTarget.getBoundingClientRect();
+    pts.current.set(e.pointerId, { x: e.clientX - rect.left, y: e.clientY - rect.top });
+    if (pts.current.size === 2) {
+      // second finger landed: switch from pan/orbit to pinch
+      const [a, b] = [...pts.current.values()];
+      const d0 = Math.hypot(a.x - b.x, a.y - b.y) || 1;
+      pinch.current = { d0, id1: e.pointerId, id2: e.pointerId };
+      if (viewModeRef.current === "3d") {
+        pinch3.current = { dist: cam3.current.dist, yaw: cam3.current.yaw, pitch: cam3.current.pitch };
+        orbit.current = null;
+      } else {
+        pinchCam.current = { cx: cam.current.cx, cy: cam.current.cy, zoom: cam.current.zoom, mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2 };
+        drag.current = null;
+      }
+    } else if (viewModeRef.current === "3d") {
+      orbit.current = { x: e.clientX, y: e.clientY, yaw: cam3.current.yaw, pitch: cam3.current.pitch };
+    } else {
+      drag.current = { x: e.clientX, y: e.clientY, cx: cam.current.cx, cy: cam.current.cy };
+    }
     if (dynamic.current.mouse) dirty.current = true;
   };
   const onPointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
     setMouse(e);
-    if (drag.current && e.buttons > 0) {
-      const c = cam.current; const d = drag.current;
-      if (Math.hypot(e.clientX - d.x, e.clientY - d.y) > 2) setCam({ ...c, cx: d.cx - (e.clientX - d.x) / c.zoom, cy: d.cy + (e.clientY - d.y) / c.zoom });
-    } else if (dynamic.current.mouse) dirty.current = true;
+    const cv = e.currentTarget; const rect = cv.getBoundingClientRect();
+    if (pts.current.has(e.pointerId)) pts.current.set(e.pointerId, { x: e.clientX - rect.left, y: e.clientY - rect.top });
+    if (viewModeRef.current === "3d") {
+      if (pinch.current && pts.current.size === 2 && pinch3.current) {
+        const [a, b] = [...pts.current.values()];
+        const d1 = Math.hypot(a.x - b.x, a.y - b.y) || 1;
+        const dist = Math.min(1e4, Math.max(0.05, pinch3.current.dist * (pinch.current.d0 / d1)));
+        setCam3({ ...cam3.current, dist });
+      } else if (orbit.current && pts.current.size === 1 && e.buttons > 0) {
+        const c3 = cam3.current; const o = orbit.current;
+        setCam3({ ...c3, yaw: o.yaw + (e.clientX - o.x) * 0.006, pitch: Math.min(1.55, Math.max(-1.55, o.pitch + (e.clientY - o.y) * 0.006)) });
+      } else if (dynamic.current.mouse) dirty.current = true;
+    } else {
+      if (pinch.current && pts.current.size === 2 && pinchCam.current) {
+        const [a, b] = [...pts.current.values()];
+        const d1 = Math.hypot(a.x - b.x, a.y - b.y) || 1;
+        const z = pinchCam.current;
+        const zoom = Math.min(1e6, Math.max(1e-6, z.zoom * (d1 / pinch.current.d0)));
+        const mx = z.mx - cv.clientWidth / 2, my = z.my - cv.clientHeight / 2;
+        // keep the world point under the initial pinch midpoint fixed while zooming
+        setCam({ cx: z.cx + mx / z.zoom - mx / zoom, cy: z.cy - my / z.zoom + my / zoom, zoom });
+      } else if (drag.current && pts.current.size === 1 && e.buttons > 0) {
+        const c = cam.current; const d = drag.current;
+        if (Math.hypot(e.clientX - d.x, e.clientY - d.y) > 2) setCam({ ...c, cx: d.cx - (e.clientX - d.x) / c.zoom, cy: d.cy + (e.clientY - d.y) / c.zoom });
+      } else if (dynamic.current.mouse) dirty.current = true;
+    }
   };
-  const onPointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => { setMouse(e); drag.current = null; dirty.current = true; };
+  const endPointer = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    pts.current.delete(e.pointerId);
+    if (pinch.current && pts.current.size < 2) { pinch.current = null; pinchCam.current = null; pinch3.current = null; }
+    if (pts.current.size === 1) {
+      // re-anchor the surviving finger so pan/orbit continues without a jump
+      const [a] = [...pts.current.values()];
+      const rect = e.currentTarget.getBoundingClientRect();
+      if (viewModeRef.current === "3d") orbit.current = { x: a.x + rect.left, y: a.y + rect.top, yaw: cam3.current.yaw, pitch: cam3.current.pitch };
+      else drag.current = { x: a.x + rect.left, y: a.y + rect.top, cx: cam.current.cx, cy: cam.current.cy };
+    } else if (pts.current.size === 0) { drag.current = null; orbit.current = null; }
+    dirty.current = true;
+  };
   useEffect(() => {
     const cv = canvasRef.current; if (!cv) return;
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
+      if (viewModeRef.current === "3d") {
+        const c3 = cam3.current;
+        setCam3({ ...c3, dist: Math.min(1e4, Math.max(0.05, c3.dist * Math.exp(e.deltaY * 0.0012))) });
+        return;
+      }
       const rect = cv.getBoundingClientRect(); const mx = e.clientX - rect.left - cv.clientWidth / 2, my = e.clientY - rect.top - cv.clientHeight / 2;
       const c = cam.current; const k = Math.exp(-e.deltaY * 0.0015);
       const zoom = Math.min(1e6, Math.max(1e-6, c.zoom * k));
@@ -297,11 +399,12 @@ export default function App() {
     };
     cv.addEventListener("wheel", onWheel, { passive: false });
     return () => cv.removeEventListener("wheel", onWheel);
-  }, [setCam]);
+  }, [setCam, setCam3]);
 
   const loadExample = (id: string) => {
     const ex = EXAMPLES.find((e) => e.id === id)!; setExampleId(id); setSrc(ex.src); setParamValues({});
-    clock.current = { t0: performance.now(), pausedAt: 0 }; needFit.current = true; quality.current = 1; dirty.current = true;
+    clock.current = { t0: performance.now(), pausedAt: 0 }; needFit.current = true; needFit3.current = true; quality.current = 1;
+    setMode(ex.group === "3d" ? "3d" : "2d"); // 3D examples open in the solid view
   };
   const example = EXAMPLES.find((e) => e.id === exampleId);
   const bottomCount = (params.length ? 1 : 0) + (traces.length ? 1 : 0);
@@ -340,6 +443,9 @@ export default function App() {
               <optgroup label="Curv + solve { } (constraints)">
                 {EXAMPLES.filter((e) => e.group === "solve").map((ex) => <option key={ex.id} value={ex.id}>{ex.name}</option>)}
               </optgroup>
+              <optgroup label="3D (solid raymarch)">
+                {EXAMPLES.filter((e) => e.group === "3d").map((ex) => <option key={ex.id} value={ex.id}>{ex.name}</option>)}
+              </optgroup>
               <optgroup label="Original curv/examples">
                 {EXAMPLES.filter((e) => e.group === "curv").map((ex) => <option key={ex.id} value={ex.id}>{ex.name}</option>)}
               </optgroup>
@@ -355,18 +461,24 @@ export default function App() {
           </div>
         </section>
 
-        {/* right: preview + panels */}
-        <section className={cn("grid min-h-[80vh] lg:min-h-0", bottomCount ? "grid-rows-[minmax(0,1fr)_minmax(160px,34%)]" : "grid-rows-[minmax(0,1fr)_auto]")}>
+        {/* right: preview + panels (first on mobile so the canvas is what you see and touch) */}
+        <section className={cn("order-first grid min-h-[80vh] lg:order-none lg:min-h-0", bottomCount ? "grid-rows-[minmax(0,1fr)_minmax(160px,34%)]" : "grid-rows-[minmax(0,1fr)_auto]")}>
           <div className="flex min-h-0 flex-col">
             <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 border-b border-line px-3 py-2 text-[11px] text-muted sm:px-4">
               <span className="font-semibold uppercase tracking-[0.14em]">Preview</span>
+              <div className="flex overflow-hidden rounded-md border border-line" title="Slice view (2D) vs solid raymarched view (3D) — separate cameras, one active at a time">
+                <button onClick={() => setMode("2d")} className={cn("px-2 py-0.5 font-mono transition-colors", viewMode === "2d" ? "bg-accent/80 text-white" : "hover:bg-surface-2")}>2D</button>
+                <button onClick={() => setMode("3d")} className={cn("px-2 py-0.5 font-mono transition-colors", viewMode === "3d" ? "bg-accent-2/80 text-white" : "hover:bg-surface-2")}>3D</button>
+              </div>
               <button onClick={togglePause} disabled={!animated} title="Pause / resume animation (space)"
                 className={cn("flex items-center gap-1.5 rounded-md border px-2 py-0.5 font-mono", animated ? (paused ? "border-amber-400/50 bg-amber-400/10 text-amber-200" : "border-line text-fg hover:bg-surface-2") : "border-line/50 text-muted/50")}>
                 {paused ? <><Icon d="M8 5v14l11-7z" /> resume</> : <><Icon d="M6 5h4v14H6zm8 0h4v14h-4z" /> pause</>}
               </button>
-              <button onClick={() => { needFit.current = true; dirty.current = true; }} title="Fit the shape (or reset the viewport to 1 unit = 1 px)" className="rounded-md border border-line px-2 py-0.5 hover:bg-surface-2">{responsive ? "home" : "fit"}</button>
-              <span className="hidden font-mono xl:inline" title="camera centre · zoom (px per unit)">({fmtNum(camView.cx)}, {fmtNum(camView.cy)}) · {fmtZoom(camView.zoom)}×</span>
-              <span className="hidden 2xl:inline">y up · drag to pan · wheel to zoom{responsive ? " · re-solves on viewport change" : ""}</span>
+              <button onClick={() => { (viewMode === "3d" ? needFit3 : needFit).current = true; dirty.current = true; }} title={viewMode === "3d" ? "Fit the solid in view" : "Fit the shape (or reset the viewport to 1 unit = 1 px)"} className="rounded-md border border-line px-2 py-0.5 hover:bg-surface-2">{responsive ? "home" : "fit"}</button>
+              {viewMode === "3d"
+                ? <span className="hidden font-mono xl:inline" title="orbit target · distance">({fmtNum(cam3View.tx)}, {fmtNum(cam3View.ty)}, {fmtNum(cam3View.tz)}) · {fmtZoom(cam3View.dist)} away</span>
+                : <span className="hidden font-mono xl:inline" title="camera centre · zoom (px per unit)">({fmtNum(camView.cx)}, {fmtNum(camView.cy)}) · {fmtZoom(camView.zoom)}×</span>}
+              <span className="hidden 2xl:inline">{viewMode === "3d" ? "drag to orbit · wheel or pinch to zoom" : `y up · drag to pan · wheel or pinch to zoom${responsive ? " · re-solves on viewport change" : ""}`}</span>
               <label className="ml-auto flex items-center gap-2">
                 <span className="hidden sm:inline">width</span>
                 <input type="range" min={35} max={100} value={previewPct} onChange={(e) => setPreviewPct(+e.target.value)} className="w-20 accent-[#7c5cff] sm:w-32" />
@@ -379,8 +491,9 @@ export default function App() {
             <div className="relative min-h-0 flex-1 overflow-hidden bg-[#0e1322] p-3 sm:p-4"
               style={{ backgroundImage: "radial-gradient(circle at 1px 1px, #1d2537 1px, transparent 0)", backgroundSize: "20px 20px" }}>
               <div className="mx-auto h-full transition-[width] duration-150" style={{ width: `${previewPct}%` }}>
-                <canvas ref={canvasRef} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp}
-                  onPointerLeave={() => { if (!drag.current) { mousePx.current = { x: -1e6, y: -1e6, down: false }; if (dynamic.current.mouse) dirty.current = true; } }}
+                <canvas ref={canvasRef} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={endPointer}
+                  onPointerCancel={endPointer}
+                  onPointerLeave={() => { if (pts.current.size === 0) { mousePx.current = { x: -1e6, y: -1e6, down: false }; if (dynamic.current.mouse) dirty.current = true; } }}
                   className="block h-full w-full cursor-grab touch-none rounded-xl border border-line shadow-2xl shadow-black/50 active:cursor-grabbing" />
               </div>
               {paused && <div className="pointer-events-none absolute left-6 top-6 rounded-md border border-amber-400/40 bg-ink/80 px-2 py-0.5 font-mono text-[11px] text-amber-200">paused · t = {clock.current.pausedAt.toFixed(2)} s</div>}
@@ -423,6 +536,7 @@ export default function App() {
 }
 
 const fmtNum = (v: number) => (Math.abs(v) >= 1000 ? v.toFixed(0) : Math.abs(v) >= 10 ? v.toFixed(1) : v.toFixed(2));
+const finiteBBox3 = (b: number[] | null): number[] | null => (b && b.length === 6 && b.every(Number.isFinite) ? b : null);
 
 function Icon({ d }: { d: string }) {
   return <svg viewBox="0 0 24 24" className="h-3 w-3 fill-current"><path d={d} /></svg>;
