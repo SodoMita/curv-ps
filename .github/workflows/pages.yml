@@ -34,6 +34,8 @@ jobs:
         run: npx tsx scripts/selftest.ts
       - name: threedcheck (3D codegen, bbox3, raymarch pixels)
         run: npx tsx scripts/threedcheck.ts
+      - name: wgslcheck (the WGSL the GPU sees must parse)
+        run: npx tsx scripts/wgslcheck.ts
       - name: stdcheck (C++ std.curv parity)
         run: npx tsx scripts/stdcheck.ts
       - name: paramcheck (fast paths + memoisation)

@@ -1,4 +1,4 @@
-# Curv+solve — handoff (dev round 17)
+# Curv+solve — handoff (dev round 18)
 
 Browser playground for **Curv** (2D F-Rep, compiled to WGSL / JS) extended with
 `solve { }` constraint blocks solved by **psolve** (LP + convex QP, WebAssembly).
@@ -13,6 +13,7 @@ Headless checks (all use the JS backend, no browser needed):
 | `npx tsx scripts/memotest.ts` | solve-block **and call-memo** dependency tests (time/mouse/viewport through closures, shadowing, mutations, impure bodies, `print`/`parametric`, node identity …) |
 | `npx tsx scripts/threedcheck.ts` | **round-17 3D gate**: every example evaluates; the 3D group compiles in solid mode on both backends; `bbox3` sanity; `is_2d`/`is_3d` + dimensional `bbox` of the shape record; the CPU raymarcher really draws (centre lit / background outside / slice parity / animation divergence) |
 | `npx tsx scripts/stdcheck.ts` | **C++ `std.curv` parity**: prelude values (`transpose`, `sort`, `contains`, colours …), 2D/3D boxes against the C++ formulas, and — the load-bearing part — the *generated* field sampled on a grid: no non-finite distance anywhere, and no point inside the shape outside its own `bbox3` |
+| `npx tsx scripts/wgslcheck.ts` | **round-18 WGSL gate**: parses the **whole** shader the GPU sees (`wrapWGSL`, wrapper included) for every example *and* a list of codegen corner cases, in **both** view modes (50 shaders).  Needed because the JS/CPU target accepts things WGSL does not: `if (dd > FAR) break;` in the 3D raymarch loop shipped green through every gate and failed only in the browser |
 | `npx tsx scripts/pdiff.ts [--update] [id …]` | **golden pixel gate**: renders every example headlessly (slice mode at 240×160 + solid mode at 96×64 for the 3D group), hashes the framebuffer and compares with `scripts/golden/pdiff.json`; counts non-finite distances per frame. `--update` (re)writes the goldens after an intended change |
 | `npx tsx scripts/warmcheck.ts` | **round-14 bridge oracle**: warm→cold drag equivalence (plan P0.2 acceptance: pixel-identity), failure degradation/recovery with **no memo pollution**, first-frame certified-infeasible error message, wall-clock **budget → STOPPED + approximate incumbent (never garbage)**, budget ladder certifies |
 | `npx tsx scripts/warmbench.ts [example …]` | cold-vs-chained solve timing, interleaved best-of-4 per width (round-12 noise lesson), warm-accept / cold-retry counters |
@@ -20,9 +21,48 @@ Headless checks (all use the JS backend, no browser needed):
 | `npx tsx scripts/exprbench.ts [example …]` | round-16 expression-memo A/B (alternated in-process, best-of-6): full-eval cost with the list-site memo ON vs OFF |
 | `npx tsx scripts/prof.ts [-v]` | warm eval / codegen / params-only timings, per-`solve` cache kind, call-memo hit/miss counters; `-v` prints the per-site memo decisions (function bodies and «list» expression sites) |
 
-All ten check scripts were green at the end of this round (`paramcheck` / `memotest` / `warmcheck` / `threedcheck` / `stdcheck` / `pdiff` exit 1 on any failure — check the exit code).  `pdiff` and `stdcheck` run with `setSolveBudget(0)`: the UI's 16 ms per-solve budget can hand back an incumbent that depends on machine load, which would make a golden frame flaky.
+All eleven check scripts were green at the end of this round (`paramcheck` / `memotest` / `warmcheck` / `threedcheck` / `wgslcheck` / `stdcheck` / `pdiff` exit 1 on any failure — check the exit code).  `pdiff` and `stdcheck` run with `setSolveBudget(0)`: the UI's 16 ms per-solve budget can hand back an incumbent that depends on machine load, which would make a golden frame flaky.
 
-## What changed in this round — 3D: solid raymarch view + the C++ 3D vocabulary (PR #3), then the review fixes
+## What changed in this round (18) — the 3D view never compiled on a GPU, and the gate that would have said so
+
+**The bug.**  `wrapWGSL3D`'s raymarch loop contained `if (dd > FAR) break;` and `if (tt > FAR) break;`.
+In WGSL the body of an `if` must be a *compound* statement, so both are syntax errors — naga reports
+`expected '{' for if statement`.  Every 3D shader (and every 2D example switched to the 3D view)
+failed to compile, and the app surfaced it as `error: shader: expected '{' for if statement (line 61)`.
+
+**Why nothing caught it.**  The WGSL and JS backends share the generated *body*, but the two wrappers
+are hand-written — and the JS target happily accepts a brace-less `if`.  Headless scripts use the CPU
+renderer, so `selftest`, `threedcheck` and `pdiff` all ran the JS wrapper; the WGSL wrapper was never
+parsed, compiled or executed once.  The line number in the message was also a lie: it subtracted a
+constant 20 meant to skip the preamble, which points at an arbitrary line of the body for an error
+that lives in the wrapper.
+
+**The fixes.**
+* `if (dd > FAR) { break; }` / `if (tt > FAR) { break; }` (both backends' wrappers reviewed; the 2D
+  one has no bare statements).
+* The shader error now says which view and which line *of the generated shader*
+  (`… (solid WGSL line 123)`) instead of pretending to be a line of the program.
+* **The status bar has a `copy` button** whenever there is an error: it copies the message, the
+  example id, the view mode (2D slice / 3D solid), the backend (`webgpu` + adapter, or the CPU
+  fallback) and the program — everything a bug report needs.  `navigator.clipboard` first, a hidden
+  `textarea` + `execCommand` fallback for non-secure contexts.
+* **`scripts/wgslcheck.ts`** (new gate, in CI): parses every example plus 23 hand-picked codegen
+  corner cases (`text`, `repeat_xyz [3,3,0]`, `cone {mode:"mitred"}`, `capsule`, `slice_xz`, `gyroid`,
+  `twist`, `bend`, `loft`, `morph`, `make_shape`, …) in **both** view modes with `wgsl_reflect`
+  (devDependency).  It parses the output of `wrapWGSL` — the wrapper is where the hand-written WGSL
+  lives — so `wrapWGSL` is now exported for that reason.  Verified as a real oracle: reintroducing
+  the missing brace makes it fail with the offending line and three lines of context.
+  It is a *parser*, not a validator: syntax, not types.  Real semantic validation needs a WebGPU
+  device, and headless Node has none here (`@kmamal/gpu`/Dawn hangs with no adapter).
+
+**Lesson for the next round:** any hand-written shader text is code that only one backend runs.  The
+CPU fallback is a *fallback*, not a second implementation — a gate that never touches WGSL cannot
+protect the WebGPU path.  `tsconfig.json` also type-checks only `src` and `vite.config.ts`, so the
+gate scripts themselves are unchecked (they run through `tsx`, which strips types).
+
+## Round 17 recap (kept from the round-17 handoff — all still in force)
+
+### 3D: solid raymarch view + the C++ 3D vocabulary (PR #3), then the review fixes
 
 **The 2D language is now a `z = 0` slice of a 3D field.**  `genShape` compiles one body for a `vec3`
 point; the 2D view evaluates it on the plane, the 3D view raymarches it.  One code path, two compile
@@ -476,6 +516,14 @@ scripts/                selftest, paramcheck, memotest, warmcheck, threedcheck, 
     camera fit frames `bbox3Of`, so a too-small box clips the view) — `stdcheck` asserts it by sampling;
   - nothing may produce a non-finite distance: one NaN lane poisons a pixel (`min`/`length`) or a whole
     frame.  `mod(x, 0)`, `normalize(0)`, `x/0` and vector-size mismatches are the usual suspects.
+* **Hand-written shader text is per-backend code, and only one backend ever runs it.**  `wrapWGSL2D`
+  / `wrapWGSL3D` (WGSL) and the two `new Function` bodies in `createCPU` (JS) are written by hand;
+  the headless gates use the CPU renderer and the browser uses WebGPU, so neither exercises the
+  other's wrapper.  WGSL is the stricter language — a compound statement is required after `if`/`for`
+  /`while`, there are no implicit conversions — and round 18 shipped a brace-less `if` in the 3D
+  raymarch loop that every gate passed and the browser rejected.  `scripts/wgslcheck.ts` parses the
+  wrapped source (wrapper included) of every example in both view modes; run it after touching any
+  wrapper.  It is a parser, not a validator: types still need a real device.
 * **No vector → vector broadcast**: `Gen.bcast` throws (WGSL's constructor used to truncate a `v3` to a
   `v2`, the JS runtime built a nested array and produced NaN).  Broadcast a scalar, or swizzle.
 * `bbox3Of`/`flags3Of`/`bboxOf` memoise per node in `WeakMap`s that ignore `atlas` — fine while the atlas
@@ -597,6 +645,9 @@ scripts/                selftest, paramcheck, memotest, warmcheck, threedcheck, 
   to the child's), `chamfer` folds a list instead of taking exactly two shapes, and 2D `inter` keeps
   its own AA-aware colour rule (`sel(b.d > acc.d, …)`) instead of C++'s "`colour = s1.colour`" — the
   solid-mode rule does follow C++.
+  The WGSL path is **syntax-checked only**: no headless WebGPU device exists in this environment
+  (`@kmamal/gpu` + Dawn hangs with no adapter), so type errors, uniform-layout questions and how a
+  real GPU rasterises the 3D view are unverified — the sandbox's browser preview is the only oracle.
 * `flow`/`flow_fit`/`fit_labels` need *numeric* budgets (wrapping is discrete); `hstack_fit` gives all
   items the same font size / padding.
 * Kerning is measured pairwise from the canvas font, so metrics can differ slightly between machines; the

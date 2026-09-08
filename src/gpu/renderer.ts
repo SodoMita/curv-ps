@@ -87,10 +87,14 @@ ${c.code}
   var hit = false;
   for (var i = 0u; i < 128u; i = i + 1u) {
     let dd = stepf(ro + rd * tt);
+    // WGSL needs a compound statement for the body of an if: "if (dd > FAR) break;" is a syntax
+    // error (naga: expected '{' for if statement).  The JS target accepted it, which is why this
+    // only ever failed on a real GPU: the CPU fallback kept working and ran through every
+    // headless gate.  scripts/wgslcheck.ts now parses the wrapped source, wrapper included.
     if (dd < 0.001) { hit = true; break; }
-    if (dd > FAR) break;
+    if (dd > FAR) { break; }
     tt += min(dd, FAR);
-    if (tt > FAR) break;
+    if (tt > FAR) { break; }
   }
   if (!hit) { return vec4f(u.bg.rgb, 1.0); }
   let ph = ro + rd * tt;
@@ -106,7 +110,10 @@ ${c.code}
   let lum = 0.32 + 0.75 * max(dot(n, l1), 0.0) + 0.35 * max(dot(n, l2), 0.0) + 0.3 * rim;
   return vec4f(min(cc.rgb * lum, vec3f(1.0)), 1.0);
 }`;
-const wrapWGSL = (c: Compiled) => (c.solid ? wrapWGSL3D(c) : wrapWGSL2D(c));
+/** The full shader source the GPU actually sees, for one compiled program.  Exported so the gate can
+ *  parse exactly this text: the body alone is not enough (the wrapper is where the raymarch loop
+ *  lives, and a syntax error there fails on the GPU while the CPU path keeps working). */
+export const wrapWGSL = (c: Compiled) => (c.solid ? wrapWGSL3D(c) : wrapWGSL2D(c));
 
 async function createWebGPU(canvas: HTMLCanvasElement, atlas: Atlas): Promise<Renderer | null> {
   if (!("gpu" in navigator) || !navigator.gpu) return null;
@@ -174,7 +181,9 @@ async function createWebGPU(canvas: HTMLCanvasElement, atlas: Atlas): Promise<Re
         await device.popErrorScope().catch(() => null);
         const ci = await module.getCompilationInfo();
         const errs = ci.messages.filter((m) => m.type === "error");
-        throw new Error("shader: " + (errs.length ? errs.map((m) => `${m.message} (line ${m.lineNum - 20})`).join("; ") : (e as Error).message));
+        // the line number is a line of the *generated* shader (preamble included), not of the
+        // program: say so instead of subtracting a made-up constant that pointed at nonsense
+        throw new Error("shader: " + (errs.length ? errs.map((m) => `${m.message} (${c.solid ? "solid" : "slice"} WGSL line ${m.lineNum})`).join("; ") : (e as Error).message));
       }
       const e = await device.popErrorScope(); if (e) throw new Error("shader: " + e.message);
       if (cache.size > 24) cache.delete(cache.keys().next().value!);

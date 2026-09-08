@@ -105,6 +105,30 @@ export default function App() {
     setCam3View((v) => (v.tx === c.tx && v.ty === c.ty && v.tz === c.tz && v.dist === c.dist && v.yaw === c.yaw && v.pitch === c.pitch ? v : c));
   }, []);
 
+  // ---- error reporting: a bug report is only useful with the context that produced it, so the
+  // copy button takes the error, the example, the view mode, the backend and the program
+  const [copied, setCopied] = useState(false);
+  const copyError = useCallback(async () => {
+    if (!error) return;
+    const text = [
+      `curv-ps: error${error.line ? ` (line ${error.line})` : ""}: ${error.message}`,
+      `example: ${exampleId} \u00b7 view: ${viewMode === "3d" ? "3d (solid raymarch)" : "2d (slice)"} \u00b7 renderer: ${rendererInfo?.kind ?? "unknown"}${rendererInfo?.info ? ` (${rendererInfo.info})` : ""}`,
+      "",
+      src,
+    ].join("\n");
+    let done = false;
+    try { if (navigator.clipboard?.writeText) { await navigator.clipboard.writeText(text); done = true; } } catch { /* denied or unavailable */ }
+    if (!done) { // http (not https) or a denied permission: the textarea route still works
+      const ta = document.createElement("textarea");
+      ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+      document.body.appendChild(ta); ta.select();
+      try { done = document.execCommand("copy"); } catch { /* nothing else to try */ }
+      document.body.removeChild(ta);
+    }
+    setCopied(done);
+    window.setTimeout(() => setCopied(false), 1400);
+  }, [error, exampleId, viewMode, rendererInfo, src]);
+
   // ---- boot: psolve wasm + glyph atlas + renderer
   useEffect(() => {
     let cancelled = false;
@@ -457,7 +481,15 @@ export default function App() {
             <Editor value={src} onChange={setSrc} errorLine={error?.line} />
           </div>
           <div className={cn("shrink-0 border-t border-line px-4 py-2 font-mono text-[11.5px]", error ? "bg-rose-500/10 text-rose-300" : "text-muted")}>
-            {error ? <><span className="font-semibold">error</span>{error.line ? ` (line ${error.line})` : ""}: {error.message}</> : <>✓ {src.split("\n").length} lines · eval {stats.evalMs.toFixed(1)} ms{stats.staticSkip ? <span className="text-emerald-300/90" title="The program read no time/mouse/viewport on its last evaluation and its src and parametric inputs are unchanged: the tree cannot differ, so evaluation and codegen were skipped entirely (the camera is a render uniform)"> · static</span> : ""}{stats.memoCalls > 0 ? <span title="Calls of pure user functions answered from the call memo (same function, same arguments and free variables as an earlier evaluation) / calls that were expensive enough to be memoised">{` (${stats.memoHits}/${stats.memoCalls} memo)`}</span> : ""} · {stats.reused ? <span title="Shape tree structure unchanged: shader reused, only the parameter buffer was refilled">params {stats.genMs.toFixed(1)} ms</span> : <>codegen {stats.genMs.toFixed(1)} ms</>} · shader {stats.lines} lines{stats.compiles ? ` · ${stats.compiles} compile${stats.compiles > 1 ? "s" : ""} (last ${stats.compileMs.toFixed(0)} ms)` : ""}{stats.fps > 0 ? ` · ${stats.fps.toFixed(0)} fps` : ""}{stats.timestamps && stats.gpuMs > 0 ? <span title="GPU render-pass time (WebGPU timestamp query)">{` · gpu ${stats.gpuMs.toFixed(1)} ms`}</span> : ""}{stats.quality < 1 ? ` · ${Math.round(stats.quality * 100)}% res` : ""}</>}
+            {error
+              ? <div className="flex items-start gap-2">
+                  <span className="min-w-0 flex-1"><span className="font-semibold">error</span>{error.line ? ` (line ${error.line})` : ""}: {error.message}</span>
+                  <button onClick={copyError} title="Copy the error, the view/backend it happened on, and the program — everything a bug report needs"
+                    className={cn("shrink-0 rounded border px-1.5 py-0.5 font-mono text-[10.5px] transition-colors", copied ? "border-emerald-400/50 bg-emerald-400/10 text-emerald-200" : "border-rose-400/40 text-rose-200 hover:bg-rose-400/15")}>
+                    {copied ? "copied" : "copy"}
+                  </button>
+                </div>
+              : <>✓ {src.split("\n").length} lines · eval {stats.evalMs.toFixed(1)} ms{stats.staticSkip ? <span className="text-emerald-300/90" title="The program read no time/mouse/viewport on its last evaluation and its src and parametric inputs are unchanged: the tree cannot differ, so evaluation and codegen were skipped entirely (the camera is a render uniform)"> · static</span> : ""}{stats.memoCalls > 0 ? <span title="Calls of pure user functions answered from the call memo (same function, same arguments and free variables as an earlier evaluation) / calls that were expensive enough to be memoised">{` (${stats.memoHits}/${stats.memoCalls} memo)`}</span> : ""} · {stats.reused ? <span title="Shape tree structure unchanged: shader reused, only the parameter buffer was refilled">params {stats.genMs.toFixed(1)} ms</span> : <>codegen {stats.genMs.toFixed(1)} ms</>} · shader {stats.lines} lines{stats.compiles ? ` · ${stats.compiles} compile${stats.compiles > 1 ? "s" : ""} (last ${stats.compileMs.toFixed(0)} ms)` : ""}{stats.fps > 0 ? ` · ${stats.fps.toFixed(0)} fps` : ""}{stats.timestamps && stats.gpuMs > 0 ? <span title="GPU render-pass time (WebGPU timestamp query)">{` · gpu ${stats.gpuMs.toFixed(1)} ms`}</span> : ""}{stats.quality < 1 ? ` · ${Math.round(stats.quality * 100)}% res` : ""}</>}
           </div>
         </section>
 

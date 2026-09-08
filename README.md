@@ -46,6 +46,7 @@ runs inside a per-frame **wall-clock budget** that hands back an incumbent rathe
 * `npx tsx scripts/memotest.ts` — dependency-tracking tests for solve-block and call memoisation
 * `npx tsx scripts/threedcheck.ts` — 3D gate: solid-mode codegen on both backends, `bbox3`, `is_2d`/`is_3d`, and the CPU raymarcher's real pixels (slice/solid parity, animation)
 * `npx tsx scripts/stdcheck.ts` — C++ `std.curv` parity: prelude values, 2D/3D boxes, and the generated field sampled on a grid (no non-finite distance, nothing inside the shape outside its box)
+* `npx tsx scripts/wgslcheck.ts` — parses the **whole** WGSL shader (wrapper included) of every example and a list of codegen corner cases, in both view modes: the CPU fallback compiles JS, so a WGSL-only syntax error is invisible to every other gate
 * `npx tsx scripts/pdiff.ts [--update]` — golden-frame gate: hashes every example's render (slice + solid) against `scripts/golden/pdiff.json` and counts non-finite distances; `--update` rewrites the goldens after an intended change
 
 See [HANDOFF.md](HANDOFF.md) for the architecture, invariants and the current state of development.
