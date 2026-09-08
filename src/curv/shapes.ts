@@ -38,7 +38,7 @@ export type SNode =
   | { k: "sphere"; r: number }
   | { k: "box3"; hx: number; hy: number; hz: number; r: number }
   | { k: "half3"; nx: number; ny: number; nz: number; d: number }
-  | { k: "cone"; r: number; h: number }
+  | { k: "cone"; r: number; h: number; m: "exact" | "mitred" }
   | { k: "capped_cone"; hh: number; r1: number; r2: number }
   | { k: "gyroid" }
   | { k: "extrude"; h: number; m: "exact" | "mitred"; s: SNode }
@@ -57,7 +57,9 @@ export type SNode =
   | { k: "distfield"; s: SNode }
   | { k: "showdist"; s: SNode }
   | { k: "showgrad"; j: number; k2: number; s: SNode }
-  | { k: "custom"; dist: ShaderFn | null; colour: ShaderFn | null; bbox: BBox | null; name: string; bbox3?: number[] | null };
+  | { k: "custom"; dist: ShaderFn | null; colour: ShaderFn | null; bbox: BBox | null; name: string; bbox3?: number[] | null;
+    /** is_2d / is_3d as declared by the program (make_shape); derived from the bbox when absent */
+    is2d?: boolean; is3d?: boolean };
 
 export class Shape {
   constructor(public node: SNode, public bbox3?: number[][] | null) {}
@@ -134,13 +136,14 @@ function bboxRaw(n: SNode, atlas: Atlas): BBox | null {
     case "repeat_finite": {
       const b = bboxOf(n.s, atlas); if (!b || isEmpty(b)) return b;
       const [x0, y0, x1, y1] = b;
-      const ex = n.d[0] !== 0 ? n.d[0] * Math.max(0, n.l[0] - 1) : 0, ey = n.d[1] !== 0 ? n.d[1] * Math.max(0, n.l[1] - 1) : 0;
-      return [Math.min(x0, x1 - Math.abs(ex)) - Math.min(ex, 0), Math.min(y0, y1 - Math.abs(ey)) - Math.min(ey, 0),
-              Math.max(x1, x0 + Math.abs(ex)) - Math.max(ex, 0), Math.max(y1, y0 + Math.abs(ey)) - Math.max(ey, 0)];
+      // the field places l copies at 0, d, …, d*(l-1): the span is d*(l-1) (C++ uses d*l, which
+      // is one period too generous)
+      const ex = n.d[0] * (n.l[0] - 1), ey = n.d[1] * (n.l[1] - 1);
+      return [Math.min(x0, x0 + ex), Math.min(y0, y0 + ey), Math.max(x1, x1 + ex), Math.max(y1, y1 + ey)];
     }
     case "swirl": return unionB(bboxOf(n.s, atlas), [-n.d / 2, -n.d / 2, n.d / 2, n.d / 2]);
     case "sphere": return [-n.r, -n.r, n.r, n.r];
-    case "box3": return [-Math.max(n.hx, n.hz), -Math.max(n.hy, n.hz), Math.max(n.hx, n.hz), Math.max(n.hy, n.hz)];
+    case "box3": return [-n.hx, -n.hy, n.hx, n.hy]; // z = 0 slice: hz must not inflate the footprint
     case "half3": return null;
     case "cone": return [-n.r, -n.r, n.r, n.r];
     case "capped_cone": { const r = Math.max(n.r1, n.r2); return [-r, -r, r, r]; }
@@ -154,15 +157,23 @@ function bboxRaw(n: SNode, atlas: Atlas): BBox | null {
       return [p[0] - R, p[1] - R, p[2] + R, p[3] + R];
     }
     case "twist": { const b = bboxOf(n.s, atlas); if (!b || isEmpty(b)) return b; const R = Math.max(...cornersOf(b).map(([x, y]) => Math.hypot(x, y))); return [-R, -R, R, R]; }
-    case "bend": { const b = bboxOf(n.s, atlas); if (!b || !b.every(Number.isFinite)) return null; const e = Math.max(b[2] - b[0], b[3] - b[1], 1); return [-e * 1.5, -e * 1.5, e * 1.5, e * 1.5]; }
+    // C++ bend: bbox = ±ymax in x and y, ymax = height + ry (ry = d/2)
+    case "bend": { const b = bboxOf(n.s, atlas); if (!b || !b.every(Number.isFinite)) return null; const ymax = (b[3] - b[1]) + n.ry; return [-ymax, -ymax, ymax, ymax]; }
     case "warp2": case "shear2": { const b = bboxOf(n.s, atlas); if (!b || isEmpty(b)) return b; const e = Math.max(b[2] - b[0], b[3] - b[1]) * 0.25; return grow(b, e); }
     case "taper2": case "taper3": { const b = bboxOf(n.s, atlas); if (!b || isEmpty(b)) return b; const k = Math.max((n as { kx0: number }).kx0, (n as { kx1: number }).kx1, "ky1" in n ? (n as { ky1: number }).ky1 : 1, "ky0" in n ? (n as { ky0: number }).ky0 : 1); return [b[0] * Math.max(k, 1), b[1] * Math.max(k, 1), b[2] * Math.max(k, 1), b[3] * Math.max(k, 1)]; }
     case "slice2": {
-      const b = bboxOf(n.s, atlas); if (!b || isEmpty(b)) return b;
-      // z=0 slice, projected into the view plane
-      return n.plane === 0 ? b : n.plane === 1 ? [b[0], b[3], b[2], b[1]] : [b[1], b[3], b[2], b[1]];
+      // C++ slice_xy / slice_xz / slice_yz: the 2D view shows (x,y) / (x,z) / (y,z) of the
+      // child's *3D* box — the old code reordered the 2D box, which produced inverted ranges
+      const b = bbox3Of(n.s, atlas); if (!b || !b.every(Number.isFinite)) return null;
+      return n.plane === 0 ? [b[0], b[1], b[3], b[4]] : n.plane === 1 ? [b[0], b[2], b[3], b[5]] : [b[1], b[2], b[4], b[5]];
     }
-    case "xform3": { const b = bboxOf(n.s, atlas); if (!b || isEmpty(b)) return b; const m = n.m; return ptsB(cornersOf(b).map(([x, y]) => [n.tx + m[0] * x + m[1] * y, n.ty + m[3] * x + m[4] * y])); }
+    case "xform3": {
+      // the 2D view is the z = 0 slice, so the box has to be cut by the plane: projecting the
+      // child's 2D box through the xy block alone loses every z → x / z → y coupling (a box3
+      // rotated onto the y axis collapsed to a degenerate x-range)
+      const b = bbox3Of(n.s, atlas); if (!b || !b.every(Number.isFinite)) return null;
+      return sliceBox3XY(b, mTranspose(n.m), [n.tx, n.ty, n.tz]);
+    }
     case "stretch3": { const b = bboxOf(n.s, atlas); if (!b || isEmpty(b)) return b; return [b[0] * n.sx, b[1] * n.sy, b[2] * n.sx, b[3] * n.sy]; }
     case "reflect3": {
       const b = bboxOf(n.s, atlas); if (!b || isEmpty(b)) return b;
@@ -181,6 +192,36 @@ const bb3Inter = (a: BBox3 | null, b: BBox3 | null): BBox3 | null => (!a ? b : !
 const bb3Grow = (b: BBox3 | null, k: number): BBox3 | null => (!b ? b : [b[0] - k, b[1] - k, b[2] - k, b[3] + k, b[4] + k, b[5] + k]);
 const bb3From2 = (b: BBox | null): BBox3 | null => (b && !isEmpty(b) ? [b[0], b[1], 0, b[2], b[3], 0] : null);
 const bb3Pts = (pts: [number, number, number][]): BBox3 => pts.reduce<BBox3>((b, p) => [Math.min(b[0], p[0]), Math.min(b[1], p[1]), Math.min(b[2], p[2]), Math.max(b[3], p[0]), Math.max(b[4], p[1]), Math.max(b[5], p[2])], [Infinity, Infinity, Infinity, -Infinity, -Infinity, -Infinity]);
+const bb3Pad = (b: BBox3, k: number): BBox3 => [b[0] - k, b[1] - k, b[2] - k, b[3] + k, b[4] + k, b[5] + k];
+/** Transpose of a row-major 3×3.  `xform3` matrices are either the identity (translate / box3)
+ *  or a rotation (rotate {angle, axis}), so the transpose is the inverse — and the inverse is
+ *  what maps a child box into the parent's frame (the node's matrix is the *domain* transform). */
+const mTranspose = (m: number[]): number[] => [m[0], m[3], m[6], m[1], m[4], m[7], m[2], m[5], m[8]];
+/** AABB of the z = 0 cross-section of the solid box `t + M·box`.  The section of a convex box by
+ *  a plane is a convex polygon whose vertices are corners lying on the plane plus the points
+ *  where the box's edges cross it, so that enumeration is exact (up to the box's own slack).
+ *  Returns EMPTY when the transformed box misses the plane — the shape is then invisible in the
+ *  2D slice view. */
+const sliceBox3XY = (b: BBox3, m: number[], t: [number, number, number]): BBox => {
+  const pt = (c: [number, number, number]): [number, number, number] => [
+    t[0] + m[0] * c[0] + m[1] * c[1] + m[2] * c[2],
+    t[1] + m[3] * c[0] + m[4] * c[1] + m[5] * c[2],
+    t[2] + m[6] * c[0] + m[7] * c[1] + m[8] * c[2],
+  ];
+  const v = bb3Corners(b).map(pt);
+  const eps = 1e-9 * Math.max(1, Math.abs(b[2]), Math.abs(b[5]), Math.abs(t[2]));
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  const add = (x: number, y: number) => { x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y); };
+  for (const p of v) if (Math.abs(p[2]) <= eps) add(p[0], p[1]);
+  for (let i = 0; i < 8; i++) for (const bit of [1, 2, 4]) if (!(i & bit)) {
+    const a = v[i], c = v[i | bit];
+    if ((a[2] > eps && c[2] < -eps) || (a[2] < -eps && c[2] > eps)) {
+      const s = a[2] / (a[2] - c[2]); // lerp parameter where z = 0
+      add(a[0] + (c[0] - a[0]) * s, a[1] + (c[1] - a[1]) * s);
+    }
+  }
+  return x0 > x1 || y0 > y1 ? [...EMPTY] as BBox : [x0, y0, x1, y1];
+};
 const bb3Corners = (b: BBox3): [number, number, number][] => [[b[0], b[1], b[2]], [b[3], b[1], b[2]], [b[0], b[4], b[2]], [b[3], b[4], b[2]], [b[0], b[1], b[5]], [b[3], b[1], b[5]], [b[0], b[4], b[5]], [b[3], b[4], b[5]]];
 
 const bb3Memo = new WeakMap<SNode, BBox3 | null>();
@@ -202,7 +243,7 @@ function bbox3Raw(n: SNode, atlas: Atlas): BBox3 | null {
   switch (n.k) {
     case "circle": return [-n.r, -n.r, 0, n.r, n.r, 0];
     case "rect": return bb3From2(bboxRaw(n, atlas));
-    case "seg": return bb3Pts([[n.x1, n.y1, n.z1 ?? 0], [n.x2, n.y2, n.z2 ?? 0]]);
+    case "seg": return bb3Pad(bb3Pts([[n.x1, n.y1, n.z1 ?? 0], [n.x2, n.y2, n.z2 ?? 0]]), n.th / 2);
     case "ellipse": return bb3From2(bboxRaw(n, atlas));
     case "nothing": return [...E3];
     case "everything": return null;
@@ -236,7 +277,8 @@ function bbox3Raw(n: SNode, atlas: Atlas): BBox3 | null {
     case "repeat_finite": {
       const b = c(n.s); if (!b || !b.every(Number.isFinite)) return b;
       const out = [...b];
-      const add = (i: number, dd: number, ll: number) => { if (dd === 0 || ll <= 1) return; const e = dd * (ll - 1); if (e > 0) out[i + 3] = Math.max(out[i + 3], out[i] + e); else out[i] = Math.min(out[i], out[i + 3] + e); };
+      // l copies at 0, d, …, d*(l-1): grow the max by d*(l-1) (or the min, for d < 0)
+      const add = (i: number, dd: number, ll: number) => { if (dd === 0 || ll <= 1) return; const e = dd * (ll - 1); const lo = out[i], hi = out[i + 3]; out[i] = Math.min(lo, lo + e); out[i + 3] = Math.max(hi, hi + e); };
       add(0, n.d[0], n.l[0]); add(1, n.d[1], n.l[1]); add(2, n.d[2] ?? 0, n.l[2] ?? 1);
       return out;
     }
@@ -251,20 +293,24 @@ function bbox3Raw(n: SNode, atlas: Atlas): BBox3 | null {
     case "cone": return [-n.r, -n.r, 0, n.r, n.r, n.h];
     case "capped_cone": { const r = Math.max(n.r1, n.r2); return [-r, -r, -n.hh, r, r, n.hh]; }
     case "gyroid": return null;
-    case "extrude": { const b = c(n.s); if (!b) return b; const bb = b.every(Number.isFinite) ? b : bbox3Of(n.s, atlas) ?? null; if (!bb) return null; return [bb[0], bb[1], -n.h / 2, bb[3], bb[4], n.h / 2]; }
-    case "loft": { const a = c(n.a), b = c(n.b); if (!a || !b) return null; return [Math.min(a[0], b[0]), Math.min(a[1], b[1]), -n.h / 2, Math.max(a[3], b[3]), Math.max(a[4], b[4]), n.h / 2]; }
+    // n.h is the half height: C++ `extrude d shape` computes `let h = d/2` and spans ±h
+    case "extrude": { const b = c(n.s); if (!b) return b; const bb = b.every(Number.isFinite) ? b : bbox3Of(n.s, atlas) ?? null; if (!bb) return null; return [bb[0], bb[1], -n.h, bb[3], bb[4], n.h]; }
+    case "loft": { const a = c(n.a), b = c(n.b); if (!a || !b) return null; return [Math.min(a[0], b[0]), Math.min(a[1], b[1]), -n.h, Math.max(a[3], b[3]), Math.max(a[4], b[4]), n.h]; }
     case "perex": {
       const p = c(n.a), s2 = c(n.b); if (!p || !s2 || !p.every(Number.isFinite) || !s2.every(Number.isFinite)) return null;
       const R = Math.max(s2[3] - s2[0], s2[4] - s2[1]) / 2;
       return [p[0] - R, p[1] - R, s2[2] - R, p[3] + R, p[4] + R, s2[5] + R];
     }
     case "twist": { const b = c(n.s); if (!b || !b.every(Number.isFinite)) return b; const R = Math.max(...bb3Corners(b).map((p) => Math.hypot(p[0], p[1]))); return [-R, -R, b[2], R, R, b[5]]; }
-    case "bend": { const b = c(n.s); if (!b || !b.every(Number.isFinite)) return null; const e = Math.max(b[3] - b[0], b[4] - b[1], 1) * 1.6; return [-e, -e, b[2], e, e, b[5]]; }
+    // C++ bend: bbox = ±ymax in x and y, ymax = height + ry (ry = d/2); z is untouched
+    case "bend": { const b = c(n.s); if (!b || !b.every(Number.isFinite)) return null; const ymax = (b[4] - b[1]) + n.ry; return [-ymax, -ymax, b[2], ymax, ymax, b[5]]; }
     case "warp2": case "shear2": return c(n.s);
     case "taper2": { const b = c(n.s); if (!b) return b; const kx = Math.max(n.kx0, n.kx1); return [b[0] * kx, b[1], b[2], b[3] * kx, b[4], b[5]]; }
     case "taper3": { const b = c(n.s); if (!b) return b; const kx = Math.max(n.kx0, n.kx1), ky = Math.max(n.ky0, n.ky1); return [b[0] * kx, b[1] * ky, b[2], b[3] * kx, b[4] * ky, b[5]]; }
     case "slice2": { const b = c(n.s); if (!b || !b.every(Number.isFinite)) return null; if (n.plane === 0) return [b[0], b[1], 0, b[3], b[4], 0]; if (n.plane === 1) return [b[0], b[2], 0, b[3], b[5], 0]; return [b[1], b[2], 0, b[4], b[5], 0]; }
-    case "xform3": { const b = c(n.s); if (!b || !b.every(Number.isFinite)) return b; const m = n.m; return bb3Pts(bb3Corners(b).map(([x, y, z]) => [n.tx + m[0] * x + m[1] * y + m[2] * z, n.ty + m[3] * x + m[4] * y + m[5] * z, n.tz + m[6] * x + m[7] * y + m[8] * z])); }
+    // the node's matrix is the domain transform (q = M·(p - t)), so the image box is
+    // t + M⁻¹·box = t + Mᵀ·box (M is a rotation or the identity)
+    case "xform3": { const b = c(n.s); if (!b || !b.every(Number.isFinite)) return b; const m = mTranspose(n.m); return bb3Pts(bb3Corners(b).map(([x, y, z]) => [n.tx + m[0] * x + m[1] * y + m[2] * z, n.ty + m[3] * x + m[4] * y + m[5] * z, n.tz + m[6] * x + m[7] * y + m[8] * z])); }
     case "stretch3": { const b = c(n.s); if (!b) return b; return [b[0] * n.sx, b[1] * n.sy, b[2] * n.sz, b[3] * n.sx, b[4] * n.sy, b[5] * n.sz]; }
     case "reflect3": { const b = c(n.s); if (!b) return b; const l = Math.hypot(n.nx, n.ny, n.nz) || 1, nx = n.nx / l, ny = n.ny / l, nz = n.nz / l; return bb3Pts(bb3Corners(b).map(([x, y, z]) => { const d = 2 * (x * nx + y * ny + z * nz); return [x - d * nx, y - d * ny, z - d * nz]; })); }
     case "distfield": case "showdist": case "showgrad": return null;
@@ -294,9 +340,17 @@ export function flags3Of(n: SNode): { is2d: boolean; is3d: boolean } {
     case "reflect3": { const cf = f(n.s); out = { is2d: n.nz === 0 && cf.is2d, is3d: cf.is3d || n.nz !== 0 }; break; }
     case "repeat": { const cf = f(n.s); out = n.kind === "xyz" ? { is2d: cf.is2d, is3d: cf.is3d } : cf; break; }
     case "repeat_finite": { const cf = f(n.s); const dz = n.d[2] !== 0 && (n.l[2] ?? 1) > 1; out = { is2d: !dz && cf.is2d, is3d: cf.is3d || dz }; break; }
-    case "custom": { const b3 = n.bbox3; const flat = !b3 || (b3[2] === 0 && b3[5] === 0); out = { is2d: flat, is3d: !flat }; break; }
-    case "circle": case "rect": case "seg": case "ellipse": case "half": case "ngon": case "poly": case "text":
+    case "custom": {
+      // a make_shape record may declare the flags itself (C++ copies them verbatim into the
+      // shape record); only when it does not are they derived from the bbox, as before
+      if (n.is2d !== undefined || n.is3d !== undefined) { out = { is2d: n.is2d ?? !(n.is3d ?? false), is3d: n.is3d ?? !(n.is2d ?? false) }; break; }
+      const b3 = n.bbox3; const flat = !b3 || (b3[2] === 0 && b3[5] === 0); out = { is2d: flat, is3d: !flat }; break;
+    }
+    case "circle": case "rect": case "ellipse": case "half": case "ngon": case "poly": case "text":
       out = { is2d: true, is3d: false }; break;
+    // `stroke {from, to}` has no z coordinates; `capsule` — which shares the node — always sets
+    // them, and C++'s capsule is a 3D solid (is_3d = true) even when the segment lies in z = 0
+    case "seg": out = n.z1 === undefined && n.z2 === undefined ? { is2d: true, is3d: false } : { is2d: false, is3d: true }; break;
     case "union": case "sunion": case "cuunion": case "inter": case "sinter": case "cinter": out = AND(n.kids); break;
     case "morph": out = AND([n.a, n.b]); break;
     case "diff": case "sdiff": case "cdiff": { const cf = f(n.a); out = { is2d: cf.is2d, is3d: cf.is3d }; break; }
@@ -517,7 +571,7 @@ function nodeHashRaw(n: SNode): string | null {
     case "sphere": return hashStr("sp" + n.r);
     case "box3": return hashStr("b3" + n.hx + "," + n.hy + "," + n.hz + "," + n.r);
     case "half3": return hashStr("h3" + n.nx + "," + n.ny + "," + n.nz + "," + n.d);
-    case "cone": return hashStr("cn" + n.r + "," + n.h);
+    case "cone": return hashStr("cn" + n.r + "," + n.h + ":" + n.m);
     case "capped_cone": return hashStr("cc" + n.hh + "," + n.r1 + "," + n.r2);
     case "gyroid": return hashStr("gy");
     case "extrude": return one(n.s, "ex" + n.h + ":" + n.m);
@@ -607,7 +661,7 @@ function cHashRaw(n: HNode): CHash | null {
     case "sphere": mTag(h, 33); mNum(h, n.r); break;
     case "box3": mTag(h, 34); mNum(h, n.hx); mNum(h, n.hy); mNum(h, n.hz); mNum(h, n.r); break;
     case "half3": mTag(h, 35); mNum(h, n.nx); mNum(h, n.ny); mNum(h, n.nz); mNum(h, n.d); break;
-    case "cone": mTag(h, 36); mNum(h, n.r); mNum(h, n.h); break;
+    case "cone": mTag(h, 36); mNum(h, n.r); mNum(h, n.h); mStr(h, n.m); break;
     case "capped_cone": mTag(h, 37); mNum(h, n.hh); mNum(h, n.r1); mNum(h, n.r2); break;
     case "gyroid": mTag(h, 38); break;
     case "extrude": mTag(h, 39); mNum(h, n.h); mStr(h, n.m); if (!kid(n.s)) return null; break;
@@ -793,7 +847,14 @@ function skRaw(n: SNode, atlas: Atlas, cull: boolean): number {
         h1 = Math.imul(h1 ^ MK_PLAIN, 0x01000193); h1 = Math.imul(h1 ^ (a1 ^ (a2 >>> 3)), 0x01000193);
         h2 = Math.imul(h2 ^ MK_PLAIN, 0x5bd1e995) ^ (h2 >>> 15); h2 = Math.imul(h2 ^ (a2 ^ ((a1 << 5) | (a1 >>> 27))), 0x5bd1e995) ^ (h2 >>> 15); break; }
     case "repeat":
-      { h1 = Math.imul(h1 ^ (400 + REPEAT_TAGS[n.kind]), 0x01000193);
+      { // The generated code omits the modulo on the lanes whose spacing is 0 (mod(x, 0) is NaN),
+        // so that mask is part of the *structure* the shader cache keys on — two repeat nodes
+        // with the same kind but different zero lanes must not share a shader.
+        const lanes = n.kind === "x" ? [1, 0, 0] : n.kind === "y" ? [0, 1, 0] : n.kind === "xy" ? [1, 1, 0] : n.kind === "xyz" ? [1, 1, 1] : [0, 0, 0];
+        const sp = [n.a, n.b, n.c ?? n.a];
+        let zm = 0;
+        for (let i = 0; i < 3; i++) if (lanes[i] && sp[i] === 0) zm |= 1 << i;
+        h1 = Math.imul(h1 ^ (400 + REPEAT_TAGS[n.kind] + 16 * zm), 0x01000193);
         a1 = skNum(n.s, atlas, false); a2 = skOut2; if (a1 === 0 && a2 === 0) return skFail();
         h1 = Math.imul(h1 ^ MK_PLAIN, 0x01000193); h1 = Math.imul(h1 ^ (a1 ^ (a2 >>> 3)), 0x01000193);
         h2 = Math.imul(h2 ^ MK_PLAIN, 0x5bd1e995) ^ (h2 >>> 15); h2 = Math.imul(h2 ^ (a2 ^ ((a1 << 5) | (a1 >>> 27))), 0x5bd1e995) ^ (h2 >>> 15); break; }
@@ -820,7 +881,8 @@ function skRaw(n: SNode, atlas: Atlas, cull: boolean): number {
         a1 = skNum(nn.s, atlas, cull); a2 = skOut2; if (a1 === 0 && a2 === 0) return skFail();
         h1 = Math.imul(h1 ^ MK_WRAP, 0x01000193); h1 = Math.imul(h1 ^ (a1 ^ (a2 >>> 3)), 0x01000193);
         h2 = Math.imul(h2 ^ MK_WRAP, 0x5bd1e995) ^ (h2 >>> 15); h2 = Math.imul(h2 ^ (a2 ^ ((a1 << 5) | (a1 >>> 27))), 0x5bd1e995) ^ (h2 >>> 15); break; }
-    case "sphere": case "box3": case "half3": case "cone": case "capped_cone": case "gyroid": break;
+    case "sphere": case "box3": case "half3": case "capped_cone": case "gyroid": break;
+    case "cone": { h1 = Math.imul(h1 ^ (n.m === "exact" ? 3 : 4), 0x01000193); break; }
     case "cuunion": case "cinter":
       for (const k of n.kids) {
         a1 = skNum(k, atlas, cull); a2 = skOut2; if (a1 === 0 && a2 === 0) return skFail();
@@ -1048,7 +1110,9 @@ export function genShape(g: Gen, n: SNode, p: E, ctx: GenCtx): DC {
           const lp = g.let(g.bin("-", p, g.vec([at(0), qyE, g.num(0)])));
           const bd = g.let(sdBox(g, g.bin("-", lp, half), half, half, g.num(0)));
           g.if(g.cmp("<", bd, pad), () => {
-            const q = g.fn("clamp", [g.bin("/", lp, qsE), g.num(0), g.num(1)]);
+            // clamp the 2-slice: lp is a vec3 (the point is 3D now), and mix(v2, v2, v3) would
+            // broadcast the third lane into every component (NaN glyphs on the JS backend)
+            const q = g.fn("clamp", [g.bin("/", g.swz(lp, [0, 1]), qsE), g.num(0), g.num(1)]);
             const uv = g.fn("mix", [g.vec([at(1), at(2)]), g.vec([at(3), at(4)]), q]);
             const dg = g.bin("*", g.bin("*", g.bin("-", g.num(0.5), g.tex(uv)), g.num(2 * 8)), sE);
             g.assign(dv, g.fn("min", [dv, g.fn("max", [dg, bd])]));
@@ -1068,13 +1132,17 @@ export function genShape(g: Gen, n: SNode, p: E, ctx: GenCtx): DC {
         const bd = g.let(sdBox(g, g.bin("-", lp, half), half, half, g.num(0)));
         if (SHADER_FLAGS.textBranchless) {
           // branchless: always sample, select the result — no divergence, more texture traffic
-          const q = g.fn("clamp", [g.bin("/", lp, qsE), g.num(0), g.num(1)]);
+          // clamp the 2-slice: lp is a vec3 (the point is 3D now), and mix(v2, v2, v3) would
+            // broadcast the third lane into every component (NaN glyphs on the JS backend)
+            const q = g.fn("clamp", [g.bin("/", g.swz(lp, [0, 1]), qsE), g.num(0), g.num(1)]);
           const uv = g.fn("mix", [g.vec([at(1), at(2)]), g.vec([at(3), at(4)]), q]);
           const dg = g.bin("*", g.bin("*", g.bin("-", g.num(0.5), g.tex(uv)), g.num(2 * 8)), sE);
           g.assign(dv, g.fn("min", [dv, g.sel(g.cmp("<", bd, pad), g.fn("max", [dg, bd]), g.bin("+", bd, pad))]));
         } else {
           g.if(g.cmp("<", bd, pad), () => {
-            const q = g.fn("clamp", [g.bin("/", lp, qsE), g.num(0), g.num(1)]);
+            // clamp the 2-slice: lp is a vec3 (the point is 3D now), and mix(v2, v2, v3) would
+            // broadcast the third lane into every component (NaN glyphs on the JS backend)
+            const q = g.fn("clamp", [g.bin("/", g.swz(lp, [0, 1]), qsE), g.num(0), g.num(1)]);
             const uv = g.fn("mix", [g.vec([at(1), at(2)]), g.vec([at(3), at(4)]), q]);
             const dg = g.bin("*", g.bin("*", g.bin("-", g.num(0.5), g.tex(uv)), g.num(2 * 8)), sE);
             g.assign(dv, g.fn("min", [dv, g.fn("max", [dg, bd])]));
@@ -1170,12 +1238,20 @@ export function genShape(g: Gen, n: SNode, p: E, ctx: GenCtx): DC {
     }
     case "repeat": {
       const a = g.param(n.a), b = g.param(n.b);
+      // C++ repeats one axis at a time (repeat_xy / repeat_xyz are per-component modulos).
+      // A shared vec3 spacing would take mod(z, 0) on the lanes that are not being repeated,
+      // and one NaN lane poisons length()/min() for the whole pixel.
+      const lane = (pi: E, d: E, sp: number): E => {
+        if (sp === 0) return pi; // spacing 0 = that axis is not repeated (C++ would divide by 0)
+        const h = g.let(g.bin("*", d, g.num(0.5)));
+        return g.bin("-", g.bin("%", g.bin("+", pi, h), d), h);
+      };
       let q: E;
       switch (n.kind) {
-        case "x": q = g.vec([g.bin("-", g.bin("%", g.bin("+", px(), g.bin("*", a, g.num(0.5))), a), g.bin("*", a, g.num(0.5))), py(), pz()]); break;
-        case "y": q = g.vec([px(), g.bin("-", g.bin("%", g.bin("+", py(), g.bin("*", b, g.num(0.5))), b), g.bin("*", b, g.num(0.5))), pz()]); break;
-        case "xy": { const c = g.let(g.vec([a, b, g.num(0)])); q = g.bin("-", g.bin("%", g.bin("+", p, g.bin("*", c, g.num(0.5))), c), g.bin("*", c, g.num(0.5))); break; }
-        case "xyz": { const c = g.let(g.vec([a, b, g.param(n.c ?? n.a)])); q = g.bin("-", g.bin("%", g.bin("+", p, g.bin("*", c, g.num(0.5))), c), g.bin("*", c, g.num(0.5))); break; }
+        case "x": q = g.vec([lane(px(), a, n.a), py(), pz()]); break;
+        case "y": q = g.vec([px(), lane(py(), b, n.b), pz()]); break;
+        case "xy": q = g.vec([lane(px(), a, n.a), lane(py(), b, n.b), pz()]); break;
+        case "xyz": { const c = g.param(n.c ?? n.a); q = g.vec([lane(px(), a, n.a), lane(py(), b, n.b), lane(pz(), c, n.c ?? n.a)]); break; }
         case "mirror_x": q = g.vec([g.fn("abs", [px()]), py(), pz()]); break;
         case "mirror_y": q = g.vec([px(), g.fn("abs", [py()]), pz()]); break;
         case "mirror_xy": q = g.fn("abs", [p]); break;
@@ -1211,13 +1287,26 @@ export function genShape(g: Gen, n: SNode, p: E, ctx: GenCtx): DC {
     }
     case "half3": return prim(g.bin("-", g.fn("dot", [p, g.fn("normalize", [V3(g, n.nx, n.ny, n.nz)])]), g.param(n.d)));
     case "cone": {
-      // C++: base at z = 0, apex at z = h (mitred)
+      // C++ cone: base at z = 0, apex at z = h.  q = (radial, z) in the 2D (rho, z) plane —
+      // all of C++'s cone math is 2D there.  `exact` is the Euclidean field (MERCURY / hg_sdf),
+      // which is what C++'s `cone` calls; `mitred` is the cheaper mitred cone.
       const r = g.param(n.r), h = g.param(n.h);
-      // q = (radial, z) in the 2D (rho, z) plane — all C++ cone math is 2D there
       const q = g.let(g.vec([g.fn("length", [g.vec([px(), py()])]), pz()]));
-      const tip = g.let(g.bin("-", q, g.vec([g.num(0), h])));
+      const apex = g.let(g.bin("-", q, g.vec([g.num(0), h])));
       const md = g.let(g.fn("normalize", [g.vec([h, r])]));
-      return prim(g.fn("max", [g.fn("dot", [tip, md]), g.neg(g.idx(q, 1))]));
+      const mantle = g.let(g.fn("dot", [apex, md]));
+      let d = g.let(g.fn("max", [mantle, g.neg(g.idx(q, 1))]));
+      if (n.m === "exact") {
+        // apex correction (above the tip, on the far side of the apex plane) …
+        const proj = g.let(g.fn("dot", [apex, g.vec([g.idx(md, 1), g.neg(g.idx(md, 0))])]));
+        const apexD = g.let(g.fn("length", [apex]));
+        d = g.let(g.sel(g.logic("&&", g.cmp(">", g.idx(q, 1), h), g.cmp("<", proj, g.num(0))), g.fn("max", [d, apexD]), d));
+        // … and base-ring correction (outside the base circle, past the mantle's foot)
+        const ringD = g.let(g.fn("length", [g.bin("-", q, g.vec([r, g.num(0)]))]));
+        const hyp = g.let(g.fn("length", [g.vec([h, r])]));
+        d = g.let(g.sel(g.logic("&&", g.cmp(">", g.idx(q, 0), r), g.cmp(">", proj, hyp)), g.fn("max", [d, ringD]), d));
+      }
+      return prim(d);
     }
     case "capped_cone": {
       // exact C++ port (sdCappedCone after Inigo Quilez); r1 at z = -hh (bottom), r2 at z = +hh (top)
@@ -1272,7 +1361,10 @@ export function genShape(g: Gen, n: SNode, p: E, ctx: GenCtx): DC {
       return { d: a.d, c: a.c };
     }
     case "bend": {
-      const rx = g.param(n.rx); g.param(n.ry); const ox = g.param(n.ox), oy = g.param(n.oy);
+      // C++ bend: f[x,y,z,t] = [(mod[phase[x,y]/pi+1.5, 2]-1)*rx + offset.X, offset.Y - mag[x,y], z, t]
+      // n.ry is not used by the field (it only sets offset.Y, computed at bind time) but the
+      // parameter slot is still emitted: walkSeg pushes it and the two must stay in lockstep.
+      const rx = g.param(n.rx); void g.param(n.ry); const ox = g.param(n.ox), oy = g.param(n.oy);
       const m = g.let(g.fn("length", [g.vec([px(), py()])]));
       const nx = g.let(g.bin("+", g.bin("*", g.bin("-", g.bin("%", g.bin("+", g.bin("/", g.fn("atan2", [py(), px()]), g.num(Math.PI)), g.num(1.5)), g.num(2)), g.num(1)), rx), ox));
       const a = kid(n.s, g.vec([nx, g.bin("-", oy, m), pz()]), { cull: false });

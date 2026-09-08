@@ -198,8 +198,11 @@ const PROBLEM_LRU = 8;
 // count would shift ids).
 const warmCache = new Map<number, { names: string[]; values: number[] }>();
 /** Wall-clock budget handed to each psolve call: one 60 fps frame.  A binding budget reports
- *  STOPPED + incumbent (approximate) instead of hanging the UI on a pathological model. */
-export const SOLVE_BUDGET_MS = 16;
+ *  STOPPED + incumbent (approximate) instead of hanging the UI on a pathological model — and an
+ *  incumbent depends on machine load, so a gate that compares pixels runs with `setSolveBudget(0)`
+ *  (0 or a negative budget = none) to get the certified optimum every time. */
+export let SOLVE_BUDGET_MS = 16;
+export function setSolveBudget(ms: number): void { SOLVE_BUDGET_MS = ms; }
 // Whole-block memo: keyed by the block's AST identity plus the values of its free variables.  A hit
 // skips *everything* (constraint construction included) and returns the previous result record.
 interface BlockHit { key: string; out: Rec; trace: SolveTrace; flags: { time: boolean; mouse: boolean; viewport: boolean } }
@@ -383,6 +386,9 @@ function staticBuiltins(atlas: Atlas): Map<string, Value> {
     b("phi", (Math.sqrt(5) + 1) / 2); // golden ratio, as in C++ std.curv
     b("rem", scList(fn1("rem", (a, l) => { if (!isList(a) || a.length !== 2) throw err("rem expects [a, m]", l); const x = num(a[0], "a", l), m = num(a[1], "m", l); return x - m * Math.trunc(x / m); }), 2, (sc, [x, m]) => sc.g.bin("-", x, sc.g.bin("*", m, sc.g.fn("trunc", [sc.g.bin("/", x, m)])))));
     { // C++ std.curv: sec/csc/cot (not in WGSL — compiled as compositions)
+      // NOTE: C++ std.curv defines `sec a = 1 / sin a` and `csc a = 1 / cos a` — the two are
+      // swapped with respect to the usual convention.  Kept byte-for-byte for parity, so
+      // `sec 0` is inf and `csc 0` is 1: do not "fix" this without dropping C++ compatibility.
       const deriv = (name: string, f: (x: number) => number, build: (sc: SC, x: E) => E) => { const fn = fn1(name, (a, l) => mapNum(f, a, l)); fn.sc = (sc, a, l) => (sc.allStatic([a]) ? sc.static(fn.call(sc.staticValue(a, l), l)) : sc.dyn(build(sc, sc.toE(a, l)))); b(name, fn); };
       deriv("sec", (x) => 1 / Math.sin(x), (sc, x) => sc.g.bin("/", sc.g.num(1), sc.g.fn("sin", [x])));
       deriv("csc", (x) => 1 / Math.cos(x), (sc, x) => sc.g.bin("/", sc.g.num(1), sc.g.fn("cos", [x])));
@@ -556,7 +562,11 @@ function staticBuiltins(atlas: Atlas): Map<string, Value> {
         if (ax.length !== 3) throw err("axis expects (x, y, z)", l);
         const ml = Math.hypot(ax[0], ax[1], ax[2]) || 1; const u = ax[0] / ml, v = ax[1] / ml, w = ax[2] / ml;
         const c = Math.cos(ang), sn = Math.sin(ang), oc = 1 - c;
-        return S({ k: "xform3", tx: 0, ty: 0, tz: 0, m: [c + oc * u * u, oc * u * v - sn * w, oc * u * w + sn * v, oc * u * v + sn * w, c + oc * v * v, oc * v * w - sn * u, oc * u * w - sn * v, oc * v * w + sn * u, c + oc * w * w], s: shape(s, l) });
+        // C++ rot3[a, axis, p] = p*cos a - cross[axis,p]*sin a + axis*dot[axis,p]*(1-cos a),
+        // i.e. the *domain* matrix is R(-angle), so the solid turns by +angle (counter-clockwise
+        // looking down the axis) — the same sense as this repo's 2D `rotate`.  bbox3Of("xform3")
+        // maps the child's box through the transpose (= inverse) of this matrix.
+        return S({ k: "xform3", tx: 0, ty: 0, tz: 0, m: [c + oc * u * u, oc * u * v + sn * w, oc * u * w - sn * v, oc * u * v - sn * w, c + oc * v * v, oc * v * w + sn * u, oc * u * w + sn * v, oc * v * w - sn * u, c + oc * w * w], s: shape(s, l) });
       }
       if (a instanceof Rec) a = a.get("angle") ?? 0;
       return S({ k: "xform", tx: 0, ty: 0, rot: num(a, "angle", l), sc: 1, s: shape(s, l) });
@@ -613,12 +623,16 @@ function staticBuiltins(atlas: Atlas): Map<string, Value> {
       let d: number, h: number, m: "exact" | "mitred" = "exact";
       if (v instanceof Rec) { d = num(v.get("d") ?? 2, "d", l); h = num(v.get("h") ?? 2, "h", l); if (v.get("mode") === "mitred") m = "mitred"; }
       else { d = num(v, "diameter", l); h = 2; }
-      return S({ k: "extrude", h, m, s: { k: "circle", r: d / 2 } });
+      // C++: cylinder = extrude.exact h (circle d); extrude halves its argument (let h = d/2),
+      // so the extrude node stores the *half* height.
+      return S({ k: "extrude", h: h / 2, m, s: { k: "circle", r: d / 2 } });
     }));
     b("cone", fn1("cone", (v, l) => {
       const d = v instanceof Rec ? num(v.get("d") ?? 2, "d", l) : num(v, "diameter", l);
       const h = v instanceof Rec ? num(v.get("h") ?? 2, "h", l) : 2;
-      return S({ k: "cone", r: d / 2, h }); // base centred on the origin at z = 0, apex at +Z
+      // C++ `cone.call = exact` (Euclidean); `mode: "mitred"` asks for the cheaper mitred field
+      const m = v instanceof Rec && v.get("mode") === "mitred" ? "mitred" : "exact";
+      return S({ k: "cone", r: d / 2, h, m }); // base centred on the origin at z = 0, apex at +Z
     }));
     b("capped_cone", fn1("capped_cone", (v, l) => {
       const q = rec(v, l);
@@ -628,7 +642,9 @@ function staticBuiltins(atlas: Atlas): Map<string, Value> {
       const q = rec(v, l);
       const a = nums(q.get("from") ?? [0, 0, 0], l), b2 = nums(q.get("to") ?? [0, 0, 2], l);
       if (a.length < 3 || b2.length < 3) throw err("capsule expects from/to 3-points", l);
-      return S({ k: "seg", x1: a[0], y1: a[1], z1: a[2], x2: b2[0], y2: b2[1], z2: b2[2], th: num(q.get("d") ?? 2, "d", l) / 2 });
+      // C++ capsule: r = d/2 and the endpoints are centres.  The seg node's `th` is the
+      // *diameter* (as in `stroke {d, from, to}`), so it takes d — not d/2.
+      return S({ k: "seg", x1: a[0], y1: a[1], z1: a[2], x2: b2[0], y2: b2[1], z2: b2[2], th: num(q.get("d") ?? 2, "d", l) });
     }));
     b("torus", fn1("torus", (v, l) => {
       const q = rec(v, l);
@@ -786,8 +802,11 @@ export class Interp {
     return r;
   }
   makeShape(r: Rec, line?: number): Shape {
+    // C++ make_shape only asserts is_2d || is_3d: `nothing`, `everything`, `show_dist` and
+    // `show_gradient` legitimately report *both* (a flat shape can be viewed as a 3D slab and
+    // vice versa), and `set_bbox` forwards the flags verbatim.  Round 17 used to reject that
+    // combination, which broke set_bbox over every 2D/3D-agnostic shape.
     const is3 = r.get("is_3d") === true;
-    if (is3 && r.get("is_2d") === true) throw err("a shape cannot be both is_2d and is_3d", line);
     const d = r.get("dist"), c = r.get("colour");
     let bbox: BBox | null = null;
     let bbox3: number[] | null | undefined = undefined;
@@ -795,11 +814,16 @@ export class Interp {
     if (isList(bv) && bv.length === 2 && isList(bv[0]) && isList(bv[1])) {
       const lo = nums(bv[0], line), hi = nums(bv[1], line);
       if (is3) {
+        // a 2-point bbox on a 3D shape is a z = 0 slab (C++ 2D shapes are slabs too), which is
+        // what `set_bbox [[-5,-5],[5,5]] everything` means; C++ asserts is_bbox3 there
         if (lo.length >= 3 && hi.length >= 3) { bbox3 = [lo[0], lo[1], lo[2], hi[0], hi[1], hi[2]]; if (!bbox3.every(Number.isFinite)) bbox3 = null; }
+        else if (lo.length === 2 && hi.length === 2) { bbox3 = [lo[0], lo[1], 0, hi[0], hi[1], 0]; if (!bbox3.every(Number.isFinite)) bbox3 = null; }
         if (bbox3) bbox = [bbox3[0], bbox3[1], bbox3[3], bbox3[4]]; // x,y footprint for 2D-view culling
       } else { bbox = [lo[0], lo[1], hi[0], hi[1]]; if (!bbox.every(Number.isFinite)) bbox = null; }
     }
-    return S({ k: "custom", dist: d === undefined ? null : this.shaderFn(d, "dist", line), colour: c === undefined ? null : this.shaderFn(c, "colour", line), bbox, bbox3: is3 ? (bbox3 ?? null) : undefined, name: "make_shape" });
+    const has2 = r.f.has("is_2d"), has3 = r.f.has("is_3d");
+    return S({ k: "custom", dist: d === undefined ? null : this.shaderFn(d, "dist", line), colour: c === undefined ? null : this.shaderFn(c, "colour", line), bbox,
+      bbox3: is3 ? (bbox3 ?? null) : undefined, is2d: has2 ? r.get("is_2d") === true : undefined, is3d: has3 ? r.get("is_3d") === true : undefined, name: "make_shape" });
   }
 
 

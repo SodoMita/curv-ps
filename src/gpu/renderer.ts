@@ -18,7 +18,9 @@ export interface Renderer {
   render(prog: Compiled, cam: Camera, bg: [number, number, number], time: number, scale?: number, cam3?: Camera3): Promise<void>;
   resize(scale?: number): void;
   destroy(): void;
-  stats: { compiles: number; lastCompileMs: number; cached: number; gpuMs: number; timestamps: boolean };
+  stats: { compiles: number; lastCompileMs: number; cached: number; gpuMs: number; timestamps: boolean;
+    /** non-finite distances seen by the CPU raster loops (a NaN distance paints a black pixel);
+     *  always 0 on the WebGPU path, which cannot report per-pixel values back */ nan: number };
 }
 
 export async function createRenderer(canvas: HTMLCanvasElement, atlas: Atlas, mode: "auto" | "cpu" = "auto"): Promise<Renderer> {
@@ -148,7 +150,7 @@ async function createWebGPU(canvas: HTMLCanvasElement, atlas: Atlas): Promise<Re
 
   const cache = new Map<string, GPURenderPipeline>();
   const pending = new Map<string, Promise<GPURenderPipeline>>();
-  const stats = { compiles: 0, lastCompileMs: 0, cached: 0, gpuMs: 0, timestamps: hasTs };
+  const stats = { compiles: 0, lastCompileMs: 0, cached: 0, gpuMs: 0, timestamps: hasTs, nan: 0 };
   // timestamp query: begin/end of the render pass → resolve → copy to a mappable buffer (skipped while a readback is in flight)
   const qs = hasTs ? device.createQuerySet({ type: "timestamp", count: 2 }) : null;
   const qResolve = hasTs ? device.createBuffer({ size: 16, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC }) : null;
@@ -231,11 +233,13 @@ type PixelFn = (P: Float32Array, R: unknown, W: number, H: number, scale: number
 const HOME3: Camera3 = { tx: 0, ty: 0, tz: 0, dist: 14, yaw: 0.65, pitch: 0.42, fov: (38 * Math.PI) / 180 };
 
 // shared 3D raymarcher (CPU path); `step`/`col` evaluate the generated body at a ray position
+let nanCount = 0; // non-finite distances seen by march3 (mirrored into renderer stats.nan)
 function march3(step: (q: number[]) => number, col: (q: number[]) => number[], ro: number[], rd: number[], e: number, bg: number[]): number[] {
   const FAR = 400;
   let tt = 0.02; let hit = false;
   for (let i = 0; i < 128; i++) {
     const dd = step([ro[0] + rd[0] * tt, ro[1] + rd[1] * tt, ro[2] + rd[2] * tt]);
+    if (dd !== dd) { nanCount++; break; }   // non-finite distance: stop marching, paint background
     if (dd < 0.001) { hit = true; break; }
     if (dd > FAR) break;
     tt += Math.min(dd, FAR);
@@ -264,6 +268,7 @@ function createCPU(canvas: HTMLCanvasElement, atlas: Atlas): Renderer {
   });
   const cache = new Map<string, PixelFn>();
   const cache3 = new Map<string, { step: (P: Float32Array, T: number, q: number[]) => number; col: (P: Float32Array, T: number, q: number[]) => number[] }>();
+  const stats = { compiles: 0, lastCompileMs: 0, cached: 0, gpuMs: 0, timestamps: false, nan: 0 };
   const compile3 = (c: Compiled) => {
     let f = cache3.get(c.code); if (f) return f;
     const t0 = performance.now();
@@ -276,7 +281,6 @@ function createCPU(canvas: HTMLCanvasElement, atlas: Atlas): Renderer {
     cache3.set(c.code, f); stats.compiles++; stats.lastCompileMs = performance.now() - t0;
     return f;
   };
-  const stats = { compiles: 0, lastCompileMs: 0, cached: 0, gpuMs: 0, timestamps: false };
   const compile = (c: Compiled): PixelFn => {
     let f = cache.get(c.code); if (f) return f;
     const t0 = performance.now();
@@ -286,14 +290,18 @@ function createCPU(canvas: HTMLCanvasElement, atlas: Atlas): Renderer {
         // 3D-native body expects a vec3 point; the 2D view is the z = 0 slice
         const p0 = [((i + 0.5) / scale - RW * 0.5) / zoom + cam.cx, -((j + 0.5) / scale - RH * 0.5) / zoom + cam.cy, 0];
 ${c.code}
-        const d = ${c.d}, col = ${c.c};
+        // NaN guard: a single non-finite distance paints the pixel black and, worse, hides a
+        // real bug in the field.  Count it and treat it as "far away" (background) instead.
+        let d = ${c.d};
+        if (d !== d) { d = 1e30; NAN.nan++; }
+        const col = ${c.c};
         const aa = Math.min(1, Math.max(0, 0.5 - d * zoom)) * col[3];
         const q = (j * W + i) * 4;
         px[q] = (bg[0] + (col[0] - bg[0]) * aa) * 255; px[q + 1] = (bg[1] + (col[1] - bg[1]) * aa) * 255; px[q + 2] = (bg[2] + (col[2] - bg[2]) * aa) * 255; px[q + 3] = 255;
       }`;
-    f = new Function("P", "R", "W", "H", "scale", "cam", "T", "bg", "px", "RW", "RH", body) as unknown as PixelFn;
+    f = new Function("P", "R", "W", "H", "scale", "cam", "T", "bg", "px", "RW", "RH", "NAN", body) as unknown as PixelFn;
     const raw = f;
-    f = (P, R2, W, H, scale, cam, T, bg, px) => (raw as unknown as (...a: unknown[]) => void)(P, R2, W, H, scale, cam, T, bg, px, W / scale, H / scale);
+    f = (P, R2, W, H, scale, cam, T, bg, px) => (raw as unknown as (...a: unknown[]) => void)(P, R2, W, H, scale, cam, T, bg, px, W / scale, H / scale, stats);
     if (cache.size > 24) cache.delete(cache.keys().next().value!);
     cache.set(c.code, f); stats.compiles++; stats.lastCompileMs = performance.now() - t0; stats.cached = cache.size;
     return f;
@@ -340,6 +348,7 @@ ${c.code}
             const rl2 = Math.hypot(rd0[0], rd0[1], rd0[2]) || 1;
             const rd = [rd0[0] / rl2, rd0[1] / rl2, rd0[2] / rl2];
             const rgb = march3((q) => step(P, time, q), (q) => col(P, time, q), ro, rd, e, bgpx);
+            if (nanCount) { stats.nan += nanCount; nanCount = 0; }
             const q = (j * w + i) * 4;
             img.data[q] = rgb[0]; img.data[q + 1] = rgb[1]; img.data[q + 2] = rgb[2]; img.data[q + 3] = 255;
           }

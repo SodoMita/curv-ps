@@ -87,6 +87,12 @@ export abstract class Gen {
   swz(a: E, ids: number[]): E { const t = this.let(a); return this.vec(ids.map((i) => this.idx(t, i))); }
   // broadcast a scalar to a vector type
   abstract bcast(e: E, t: Ty): E;
+  /** Scalar → vector only.  A vector → vector call is always a bug in the caller: WGSL silently
+   *  truncated (vec2f(vec3f…)) while the JS `R.bc` is scalar-only and built a nested array,
+   *  i.e. NaN.  Throw loudly instead — see the `text` glyph clamp (round 17). */
+  protected bcastGuard(e: E, t: Ty): void {
+    if (e.t !== "f" && e.t !== t) throw new GenError(`Cannot broadcast a ${DIM[e.t]}-component vector to ${DIM[t]} components`);
+  }
   unify(a: E, b: E): [E, E] {
     if (a.t === b.t) return [a, b];
     if (a.t === "f") return [this.bcast(a, b.t), b];
@@ -108,7 +114,7 @@ export class WGSL extends Gen {
   num(v: number): E { return { t: "f", s: fmtW(v) }; }
   paramAt(i: E): E { return { t: "f", s: `P[u32(${i.s})]` }; }
   bool(v: boolean): E { return { t: "b", s: v ? "true" : "false" }; }
-  bcast(e: E, t: Ty): E { return e.t === t ? e : { t, s: `${WTY[t]}(${e.s})` }; }
+  bcast(e: E, t: Ty): E { if (e.t === t) return e; this.bcastGuard(e, t); return { t, s: `${WTY[t]}(${e.s})` }; }
   bin(op: string, a: E, b: E): E {
     if (a.t === "b" || b.t === "b") throw new GenError(`Cannot apply '${op}' to a boolean`);
     const t = a.t === "f" ? b.t : a.t;
@@ -182,7 +188,7 @@ export class JS extends Gen {
   num(v: number): E { return { t: "f", s: fmtJ(v) }; }
   paramAt(i: E): E { return { t: "f", s: `P[${i.s}]` }; }
   bool(v: boolean): E { return { t: "b", s: v ? "true" : "false" }; }
-  bcast(e: E, t: Ty): E { return e.t === t ? e : { t, s: `R.bc(${e.s}, ${DIM[t]})` }; }
+  bcast(e: E, t: Ty): E { if (e.t === t) return e; this.bcastGuard(e, t); return { t, s: `R.bc(${e.s}, ${DIM[t]})` }; }
   bin(op: string, a: E, b: E): E {
     if (a.t === "b" || b.t === "b") throw new GenError(`Cannot apply '${op}' to a boolean`);
     const t = a.t === "f" ? b.t : a.t;

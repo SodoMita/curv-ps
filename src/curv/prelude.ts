@@ -185,17 +185,21 @@ export const PRELUDE = `
     in [...sort [for (e in rest) if (e < first) e], first, ...sort [for (e in rest) if (e >= first) e]];
   perp [x, y] = [-y, x];
   idmatrix n = [for (i in 1..n) [for (j in 1..n) if (i == j) 1 else 0]];
+  // C++ std.curv: [for (i in indices a.[0]) [for (j in indices a) a.[j, i]]] — a.[j, i] is a
+  // two-index lookup; a.[[j, i]] would index *by the list* [j, i] and return the whole matrix.
   transpose a =
     if count a == 0 then a
-    else [for (i in indices a.[0]) [for (j in indices a) a.[[j, i]]]];
+    else [for (i in indices a.[0]) [for (j in indices a) a.[j].[i]]];
   encode = ucode;
   decode = char;
-  // C++-named colours the palette did not have (sRGB.hue as in std.curv)
+  // C++-named colours the palette did not have (std.curv: sRGB.hue for all five).  These are
+  // NOT the web-colour names of lib/curv/lib/web_colour.curv (azure = rgb[240,255,255] etc.);
+  // std.curv does not define those, so a program that wants them has to spell out the sRGB.
   azure = sRGB.hue (7/12);
   indigo = sRGB.hue (3/4);
   rose = sRGB.hue (11/12);
-  chartreuse = sRGB [1, 1, 0];
-  spring_green = sRGB [0, 1, 0.5];
+  chartreuse = sRGB.hue (1/4);
+  spring_green = sRGB.hue (5/12);
   // implicit fields
   i_linear d p = mod [p.[X]/d, 1];
   i_radial n p = mod [(phase [p.[X], p.[Y]]/tau - 0.25)*n, 1];
@@ -216,7 +220,10 @@ export const PRELUDE = `
       is_3d = s.is_3d;
       is_2d = s.is_2d;
     };
-  // 2D polyline: a rounded polyline through points v of thickness d (C++ std.curv, crossing-number)
+  // 2D polyline: a closed polyline through points v, stroked to thickness d.  NOTE: this is the
+  // *polygon* field (closed path, crossing-number winding — C++ polygon, after IQ's shadertoy),
+  // not C++ polyline, which is an open stroke of num-1 segments with no winding test: the closed
+  // version is what you want for a filled outline; the name is kept for C++ compatibility.
   polyline {d, v} =
     make_shape {
       dist p =
@@ -238,7 +245,7 @@ export const PRELUDE = `
             j := i;
           );
         in s * sqrt d2 - d/2;
-      bbox = [[min (map (q -> q.[X]) v), min (map (q -> q.[Y]) v)], [max (map (q -> q.[X]) v), max (map (q -> q.[Y]) v)]];
+      bbox = [[min (map (q -> q.[X]) v) - d/2, min (map (q -> q.[Y]) v) - d/2], [max (map (q -> q.[X]) v) + d/2, max (map (q -> q.[Y]) v) + d/2]];
       is_2d = true;
     };
   // C++ aliases

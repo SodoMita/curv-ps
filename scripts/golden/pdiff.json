@@ -1,0 +1,202 @@
+{
+  "config": {
+    "W": 240,
+    "H": 160,
+    "W3": 96,
+    "H3": 64,
+    "VW": 900,
+    "VH": 600,
+    "TIME": 1.2,
+    "BG": [
+      0.055,
+      0.075,
+      0.13
+    ],
+    "CAM3": {
+      "tx": 0,
+      "ty": 0,
+      "tz": 0,
+      "dist": 8,
+      "yaw": 0.65,
+      "pitch": 0.42,
+      "fov": 0.6632251157578452
+    }
+  },
+  "shots": {
+    "packed": {
+      "hash": "a498ff40",
+      "lit": 4399,
+      "nan": 0
+    },
+    "split": {
+      "hash": "073c8b11",
+      "lit": 34142,
+      "nan": 0
+    },
+    "dashboard": {
+      "hash": "74d6c458",
+      "lit": 32858,
+      "nan": 0
+    },
+    "stacks": {
+      "hash": "b61c8068",
+      "lit": 33647,
+      "nan": 0
+    },
+    "buttons": {
+      "hash": "c415d4e2",
+      "lit": 4921,
+      "nan": 0
+    },
+    "toolbar": {
+      "hash": "96b53da5",
+      "lit": 14078,
+      "nan": 0
+    },
+    "wrapfit": {
+      "hash": "1a7e9ae2",
+      "lit": 13026,
+      "nan": 0
+    },
+    "tooltip": {
+      "hash": "0d8d14d6",
+      "lit": 33470,
+      "nan": 0
+    },
+    "chart": {
+      "hash": "54d0a66f",
+      "lit": 33911,
+      "nan": 0
+    },
+    "frep": {
+      "hash": "501a80bf",
+      "lit": 9095,
+      "nan": 0
+    },
+    "mandelbrot": {
+      "hash": "27b0f039",
+      "lit": 38400,
+      "nan": 0
+    },
+    "liquid_paint": {
+      "hash": "889b8348",
+      "lit": 38400,
+      "nan": 0
+    },
+    "log_spiral": {
+      "hash": "74b88745",
+      "lit": 13005,
+      "nan": 0
+    },
+    "plot": {
+      "hash": "c9c786cd",
+      "lit": 19682,
+      "nan": 0
+    },
+    "polygon": {
+      "hash": "99cb2d1a",
+      "lit": 5215,
+      "nan": 0
+    },
+    "smoke": {
+      "hash": "d2ca37f7",
+      "lit": 16489,
+      "nan": 0
+    },
+    "voronoi": {
+      "hash": "3bad5b52",
+      "lit": 38400,
+      "nan": 0
+    },
+    "circlattice": {
+      "hash": "ab63796d",
+      "lit": 27128,
+      "nan": 0
+    },
+    "peppermint": {
+      "hash": "1fe41355",
+      "lit": 16492,
+      "nan": 0
+    },
+    "ball3d": {
+      "hash": "8cae8d9d",
+      "lit": 16492,
+      "nan": 0
+    },
+    "ball3d@solid": {
+      "hash": "ebcd0edf",
+      "lit": 2572,
+      "nan": 0
+    },
+    "rings3d": {
+      "hash": "f38a4045",
+      "lit": 8516,
+      "nan": 0
+    },
+    "rings3d@solid": {
+      "hash": "bf2345cb",
+      "lit": 1575,
+      "nan": 0
+    },
+    "molecule3d": {
+      "hash": "194fb62f",
+      "lit": 4836,
+      "nan": 0
+    },
+    "molecule3d@solid": {
+      "hash": "a59d3faa",
+      "lit": 1303,
+      "nan": 0
+    },
+    "twist3d": {
+      "hash": "dcf9d10d",
+      "lit": 11744,
+      "nan": 0
+    },
+    "twist3d@solid": {
+      "hash": "bd080115",
+      "lit": 1173,
+      "nan": 0
+    },
+    "gyroid3d": {
+      "hash": "eb1ab615",
+      "lit": 1275,
+      "nan": 0
+    },
+    "gyroid3d@solid": {
+      "hash": "a7f33b5b",
+      "lit": 6144,
+      "nan": 0
+    },
+    "loft3d": {
+      "hash": "e02cbf4d",
+      "lit": 13052,
+      "nan": 0
+    },
+    "loft3d@solid": {
+      "hash": "b469a1e7",
+      "lit": 2306,
+      "nan": 0
+    },
+    "grad3d": {
+      "hash": "c4381e11",
+      "lit": 38400,
+      "nan": 0
+    },
+    "grad3d@solid": {
+      "hash": "99b68842",
+      "lit": 6144,
+      "nan": 0
+    },
+    "pulse3d": {
+      "hash": "8fc966b5",
+      "lit": 16492,
+      "nan": 0
+    },
+    "pulse3d@solid": {
+      "hash": "022ddd70",
+      "lit": 2104,
+      "nan": 0
+    }
+  }
+}
