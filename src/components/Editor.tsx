@@ -7,7 +7,7 @@ const PAIR_OF: Record<string, string> = { "(": ")", "[": "]", "{": "}", '"': '"'
 const OPENERS = new Set(["(", "[", "{"]);
 const CLOSERS = new Set([")", "]", "}"]);
 const QUOTES = new Set(['"', "'"]);
-const WORD = /[A-Za-z0-9_]/;
+const canPairBefore = (ch: string | undefined) => !ch || ch === " " || ch === "\t" || ch === "\n" || ch === "\r";
 
 interface Piece { text: string; cls: string }
 interface Row { spans: Piece[] }
