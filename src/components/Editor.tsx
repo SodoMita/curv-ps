@@ -7,7 +7,7 @@ const PAIR_OF: Record<string, string> = { "(": ")", "[": "]", "{": "}", '"': '"'
 const OPENERS = new Set(["(", "[", "{"]);
 const CLOSERS = new Set([")", "]", "}"]);
 const QUOTES = new Set(['"', "'"]);
-const WORD = /[A-Za-z0-9_]/;
+const canPairBefore = (ch: string | undefined) => !ch || ch === " " || ch === "\t" || ch === "\n" || ch === "\r";
 
 interface Piece { text: string; cls: string }
 interface Row { spans: Piece[] }
@@ -209,27 +209,25 @@ export function Editor({ value, onChange, errorLine }: Props) {
       const k = e.key;
       if (CLOSERS.has(k) && s === en && v[s] === k) { e.preventDefault(); el.selectionStart = el.selectionEnd = s + 1; syncCursor(el); return; }
       if (QUOTES.has(k)) {
-        // skip-over a closer quote; wrap a selection; otherwise pair only when not inside a word
         if (s === en && v[s] === k) { e.preventDefault(); el.selectionStart = el.selectionEnd = s + 1; syncCursor(el); return; }
         if (s !== en) { e.preventDefault(); typeText(k + v.slice(s, en) + k); requestAnimationFrame(() => { el.selectionStart = s + 1; el.selectionEnd = en + 1; syncCursor(el); }); return; }
-        const left = v[s - 1], right = v[s];
-        if ((left && WORD.test(left)) || (right && WORD.test(right))) return; // type a single quote
+        if (!canPairBefore(v[s])) return;
         e.preventDefault();
         typeText(k + k);
         requestAnimationFrame(() => { el.selectionStart = el.selectionEnd = s + 1; syncCursor(el); });
         return;
       }
       if (OPENERS.has(k)) {
-        e.preventDefault();
         if (s !== en) {
+          e.preventDefault();
           typeText(k + v.slice(s, en) + PAIR_OF[k]);
           requestAnimationFrame(() => { el.selectionStart = s + 1; el.selectionEnd = en + 1; syncCursor(el); });
-        } else {
-          // don't pair if the next char is a word (typing (foo) by hand)
-          if (v[s] && WORD.test(v[s])) { typeText(k); return; }
-          typeText(k + PAIR_OF[k]);
-          requestAnimationFrame(() => { el.selectionStart = el.selectionEnd = s + 1; syncCursor(el); });
+          return;
         }
+        if (!canPairBefore(v[s]) || !canPairBefore(v[s - 1])) return;
+        e.preventDefault();
+        typeText(k + PAIR_OF[k]);
+        requestAnimationFrame(() => { el.selectionStart = el.selectionEnd = s + 1; syncCursor(el); });
         return;
       }
     }
