@@ -3,7 +3,7 @@
 // shader code by subcurv.ts; `solve { ... }` blocks compile to a psolve problem.
 import { parse, CurvError, type Expr, type Def, type Pat, type ListItem, type Stmt } from "./parser";
 import { Lin, Quad, Cons, Problem, STRENGTH, type Rel, type ConstraintResult } from "../psolve/constraints";
-import { Shape, type SNode, type RGBA, type BBox, type ShaderFn, type GenCtx, genShape, bboxOf, structKey, walkParams, nodeHash, inode } from "./shapes";
+import { Shape, type SNode, type RGBA, type BBox, type ShaderFn, type GenCtx, type ViewMode, genShape, bboxOf, bbox3Of, finiteBBox, structKey, walkParams, nodeHash, inode, flags3Of } from "./shapes";
 import { measureText, type Atlas } from "../gpu/atlas";
 import { PRELUDE } from "./prelude";
 import { JS, WGSL, ParamsOnly, makeJSRuntime, type Gen, type E } from "../gpu/gen";
@@ -380,6 +380,24 @@ function staticBuiltins(atlas: Atlas): Map<string, Value> {
     b("lerp", scList(fn1("lerp", (a, l) => { if (!isList(a) || a.length !== 3) throw err("lerp expects [a, b, t]", l); const [x, y, t] = a; return arith("+", x, arith("*", arith("-", y, x, l), t, l), l); }), 3, (sc, [x, y, t]) => sc.g.fn("mix", [x, y, t])));
     b("smoothstep", scList(fn1("smoothstep", (a, l) => { const [lo, hi, x] = nums(a, l); const t = Math.min(1, Math.max(0, (x - lo) / (hi - lo))); return t * t * (3 - 2 * t); }), 3, (sc, [lo, hi, x]) => sc.g.fn("smoothstep", [lo, hi, x])));
     b("mod", scList(fn1("mod", (a, l) => { if (!isList(a) || a.length !== 2) throw err("mod expects [a, b]", l); return arith("%", a[0], a[1], l); }), 2, (sc, [x, y]) => sc.g.bin("%", x, y)));
+    b("phi", (Math.sqrt(5) + 1) / 2); // golden ratio, as in C++ std.curv
+    b("rem", scList(fn1("rem", (a, l) => { if (!isList(a) || a.length !== 2) throw err("rem expects [a, m]", l); const x = num(a[0], "a", l), m = num(a[1], "m", l); return x - m * Math.trunc(x / m); }), 2, (sc, [x, m]) => sc.g.bin("-", x, sc.g.bin("*", m, sc.g.fn("trunc", [sc.g.bin("/", x, m)])))));
+    { // C++ std.curv: sec/csc/cot (not in WGSL — compiled as compositions)
+      const deriv = (name: string, f: (x: number) => number, build: (sc: SC, x: E) => E) => { const fn = fn1(name, (a, l) => mapNum(f, a, l)); fn.sc = (sc, a, l) => (sc.allStatic([a]) ? sc.static(fn.call(sc.staticValue(a, l), l)) : sc.dyn(build(sc, sc.toE(a, l)))); b(name, fn); };
+      deriv("sec", (x) => 1 / Math.sin(x), (sc, x) => sc.g.bin("/", sc.g.num(1), sc.g.fn("sin", [x])));
+      deriv("csc", (x) => 1 / Math.cos(x), (sc, x) => sc.g.bin("/", sc.g.num(1), sc.g.fn("cos", [x])));
+      deriv("cot", (x) => Math.cos(x) / Math.sin(x), (sc, x) => sc.g.bin("/", sc.g.fn("cos", [x]), sc.g.fn("sin", [x])));
+    }
+    const sminJS = (a: number, bb: number, k: number): number => { if (a === Infinity) return bb; const h = Math.min(1, Math.max(0, 0.5 + 0.5 * (bb - a) / k)); return bb + (a - bb) * h - k * h * (1 - h); };
+    { // C++ std.curv: smooth_min[a,b,k] / smooth_max (number-level smin)
+      const smArgs = (a: Value, l?: number): [number, number, number] => { if (!isList(a) || a.length !== 3) throw err("smooth_min expects [a, b, k]", l); return a.map((v) => num(v, "number", l)) as [number, number, number]; };
+      const f = fn1("smooth_min", (a, l) => { const [x, y, k] = smArgs(a, l); return sminJS(x, y, k); });
+      f.sc = (sc, a, l) => { if (sc.allStatic([a])) return sc.static(f.call(sc.staticValue(a, l), l)); const items = sc.items(a, l); if (!items || items.length !== 3) throw err("smooth_min expects [a, b, k]", l); const [x, y, k] = items.map((v) => sc.toE(v, l)); const h = sc.g.let(sc.g.fn("clamp", [sc.g.bin("+", sc.g.num(0.5), sc.g.bin("/", sc.g.bin("*", sc.g.num(0.5), sc.g.bin("-", y, x)), k)), sc.g.num(0), sc.g.num(1)])); return sc.dyn(sc.g.bin("-", sc.g.fn("mix", [y, x, h]), sc.g.bin("*", k, sc.g.bin("*", h, sc.g.bin("-", sc.g.num(1), h))))); };
+      b("smooth_min", f);
+      const g2 = fn1("smooth_max", (a, l) => { const [x, y, k] = smArgs(a, l); return -sminJS(-x, -y, k); });
+      g2.sc = (sc, a, l) => { if (sc.allStatic([a])) return sc.static(g2.call(sc.staticValue(a, l), l)); const items = sc.items(a, l); if (!items || items.length !== 3) throw err("smooth_max expects [a, b, k]", l); const [x, y, k] = items.map((v) => sc.toE(v, l)); const h = sc.g.let(sc.g.fn("clamp", [sc.g.bin("+", sc.g.num(0.5), sc.g.bin("/", sc.g.bin("*", sc.g.num(0.5), sc.g.bin("-", sc.g.neg(y), sc.g.neg(x))), k)), sc.g.num(0), sc.g.num(1)])); return sc.dyn(sc.g.neg(sc.g.bin("-", sc.g.fn("mix", [sc.g.neg(x), sc.g.neg(y), h]), sc.g.bin("*", k, sc.g.bin("*", h, sc.g.bin("-", sc.g.num(1), h)))))); };
+      b("smooth_max", g2);
+    }
     b("dot", scList(fn1("dot", (a, l) => { if (!isList(a) || a.length !== 2) throw err("dot expects [a, b]", l); const x = nums(a[0], l), y = nums(a[1], l); return x.reduce((s, v, i) => s + v * y[i], 0); }), 2, (sc, [x, y]) => sc.g.fn("dot", [x, y])));
     b("cross", scList(fn1("cross", (a, l) => { const [x, y] = (a as Value[]).map((v) => nums(v, l)); return [x[1] * y[2] - x[2] * y[1], x[2] * y[0] - x[0] * y[2], x[0] * y[1] - x[1] * y[0]]; }), 2, (sc, [x, y]) => sc.g.fn("cross", [x, y])));
     b("mag", scUnary(fn1("mag", (a, l) => Math.hypot(...nums(a, l))), "length"));
@@ -403,6 +421,14 @@ function staticBuiltins(atlas: Atlas): Map<string, Value> {
     b("indices", fn1("indices", (a, l) => { if (!isList(a)) throw err("indices expects a list", l); return a.map((_, i) => i); }));
     b("str", fn1("str", (a) => (typeof a === "string" ? a : show(a))));
     b("strcat", fn1("strcat", (a) => (isList(a) ? a : [a]).map((x) => (typeof x === "string" ? x : show(x))).join("")));
+    b("char", fn1("char", (n, l) => String.fromCharCode(num(n, "code point", l)))); // C++ std.curv
+    b("ucode", fn1("ucode", (s, l) => { if (typeof s !== "string" || s.length === 0) throw err("ucode expects a string", l); return s.codePointAt(0) ?? 0; }));
+    b("merge", fn1("merge", (rs, l) => { // C++ std.curv: {for (r in rs) ...r}
+      if (!isList(rs)) throw err("merge expects a list of records", l);
+      const out = new Map<string, Value>();
+      for (const r of rs) { if (!(r instanceof Rec)) throw err("merge expects a list of records", l); for (const [k, v] of r.f) out.set(k, v); }
+      return new Rec(out);
+    }));
     b("repr", fn1("repr", (a) => show(a)));
     b("fields", fn1("fields", (a, l) => [...rec(a, l).f.keys()]));
     b("text_width", fn2("text_width", (t, s, l) => measureText(atlas, typeof t === "string" ? t : show(t), num(s, "font size", l))));
@@ -517,12 +543,39 @@ function staticBuiltins(atlas: Atlas): Map<string, Value> {
     b("opacity", fn2("opacity", (a, s, l) => S({ k: "opacity", a: num(a, "opacity", l), s: shape(s, l) })));
     b("gradient", fn3("gradient", (cs, pts, s, l) => { if (!isList(cs) || cs.length !== 2 || !isList(pts) || pts.length !== 2) throw err("gradient expects (c1,c2) (p0,p1) shape", l); const [x0, y0] = vec2(pts[0], "point", l), [x1, y1] = vec2(pts[1], "point", l); return S({ k: "grad", c1: colour(cs[0], l), c2: colour(cs[1], l), x0, y0, x1, y1, s: shape(s, l) }); }));
     b("shadow", fn3("shadow", (o, bl, s, l) => { const [dx, dy] = vec2(o, "offset", l); return S({ k: "shadow", dx, dy, blur: num(bl, "blur", l), a: 0.45, s: shape(s, l) }); }));
-    b("translate", fn2("translate", (v, s, l) => { const [tx, ty] = vec2(v, "offset", l); return S({ k: "xform", tx, ty, rot: 0, sc: 1, s: shape(s, l) }); }));
+    b("translate", fn2("translate", (v, s, l) => {
+      if (isList(v) && v.length === 3 && v.every(isNum)) return S({ k: "xform3", tx: num(v[0], "dx", l), ty: num(v[1], "dy", l), tz: num(v[2], "dz", l), m: [1, 0, 0, 0, 1, 0, 0, 0, 1], s: shape(s, l) });
+      const [tx, ty] = vec2(v, "offset", l);
+      return S({ k: "xform", tx, ty, rot: 0, sc: 1, s: shape(s, l) });
+    }));
     b("move", vars.get("translate")!);
-    b("rotate", fn2("rotate", (a, s, l) => { if (a instanceof Rec) { if (a.f.has("axis")) throw err("rotate {angle, axis} is 3D – use rotate angle", l); a = a.get("angle") ?? 0; } return S({ k: "xform", tx: 0, ty: 0, rot: num(a, "angle", l), sc: 1, s: shape(s, l) }); }));
-    b("scale", fn2("scale", (k, s, l) => { if (isList(k)) { const [sx, sy] = vec2(k, "scale", l); return S({ k: "stretch", sx, sy, s: shape(s, l) }); } return S({ k: "xform", tx: 0, ty: 0, rot: 0, sc: num(k, "scale factor", l), s: shape(s, l) }); }));
-    b("stretch", fn2("stretch", (k, s, l) => { const [sx, sy] = vec2(k, "scale", l); return S({ k: "stretch", sx, sy, s: shape(s, l) }); }));
-    b("reflect", fn2("reflect", (v, s, l) => { const [nx, ny] = vec2(v, "axis", l); return S({ k: "reflect", nx, ny, s: shape(s, l) }); }));
+    b("rotate", fn2("rotate", (a, s, l) => {
+      if (a instanceof Rec && a.f.has("axis")) { // C++ std.curv: rotate {angle, axis} shape (3D, Rodrigues)
+        const ang = num(a.get("angle") ?? 0, "angle", l);
+        const ax = nums(a.get("axis")!, l);
+        if (ax.length !== 3) throw err("axis expects (x, y, z)", l);
+        const ml = Math.hypot(ax[0], ax[1], ax[2]) || 1; const u = ax[0] / ml, v = ax[1] / ml, w = ax[2] / ml;
+        const c = Math.cos(ang), sn = Math.sin(ang), oc = 1 - c;
+        return S({ k: "xform3", tx: 0, ty: 0, tz: 0, m: [c + oc * u * u, oc * u * v - sn * w, oc * u * w + sn * v, oc * u * v + sn * w, c + oc * v * v, oc * v * w - sn * u, oc * u * w - sn * v, oc * v * w + sn * u, c + oc * w * w], s: shape(s, l) });
+      }
+      if (a instanceof Rec) a = a.get("angle") ?? 0;
+      return S({ k: "xform", tx: 0, ty: 0, rot: num(a, "angle", l), sc: 1, s: shape(s, l) });
+    }));
+    b("scale", fn2("scale", (k, s, l) => {
+      if (isList(k) && k.length === 3 && k.every(isNum)) return S({ k: "stretch3", sx: num(k[0], "scale", l), sy: num(k[1], "scale", l), sz: num(k[2], "scale", l), s: shape(s, l) });
+      if (isList(k)) { const [sx, sy] = vec2(k, "scale", l); return S({ k: "stretch", sx, sy, s: shape(s, l) }); }
+      return S({ k: "xform", tx: 0, ty: 0, rot: 0, sc: num(k, "scale factor", l), s: shape(s, l) });
+    }));
+    b("stretch", fn2("stretch", (k, s, l) => {
+      if (isList(k) && k.length === 3 && k.every(isNum)) return S({ k: "stretch3", sx: num(k[0], "scale", l), sy: num(k[1], "scale", l), sz: num(k[2], "scale", l), s: shape(s, l) });
+      const [sx, sy] = vec2(k, "scale", l);
+      return S({ k: "stretch", sx, sy, s: shape(s, l) });
+    }));
+    b("reflect", fn2("reflect", (v, s, l) => {
+      if (isList(v) && v.length === 3 && v.every(isNum)) return S({ k: "reflect3", nx: num(v[0], "normal", l), ny: num(v[1], "normal", l), nz: num(v[2], "normal", l), s: shape(s, l) });
+      const [nx, ny] = vec2(v, "axis", l);
+      return S({ k: "reflect", nx, ny, s: shape(s, l) });
+    }));
     b("repeat_x", fn2("repeat_x", (d, s, l) => S({ k: "repeat", kind: "x", a: num(d, "spacing", l), b: 0, s: shape(s, l) })));
     b("repeat_y", fn2("repeat_y", (d, s, l) => S({ k: "repeat", kind: "y", a: 0, b: num(d, "spacing", l), s: shape(s, l) })));
     b("repeat_xy", fn2("repeat_xy", (d, s, l) => { const [a, bb] = vec2(d, "spacing", l); return S({ k: "repeat", kind: "xy", a, b: bb, s: shape(s, l) }); }));
@@ -531,6 +584,117 @@ function staticBuiltins(atlas: Atlas): Map<string, Value> {
     b("repeat_mirror_y", fn1("repeat_mirror_y", (s, l) => S({ k: "repeat", kind: "mirror_y", a: 0, b: 0, s: shape(s, l) })));
     b("repeat_mirror_xy", fn1("repeat_mirror_xy", (s, l) => S({ k: "repeat", kind: "mirror_xy", a: 0, b: 0, s: shape(s, l) })));
     b("swirl", fn2("swirl", (r, s, l) => { const q = rec(r, l); return S({ k: "swirl", strength: num(q.get("strength") ?? 1, "strength", l), d: num(q.get("d") ?? 1, "d", l), s: shape(s, l) }); }));
+    // ---- C++ (curv3d/curv std.curv) parity: 3D primitives + operators (diameters, +Z up) ----
+    const d3 = (v: Value, what: string, l?: number): [number, number, number] => {
+      if (isNum(v)) { const d = num(v, what, l); return [d, d, d]; }
+      const xs = nums(v, l);
+      if (xs.length !== 3) throw err(`Expected ${what} (a number or (x, y, z)), got ${show(v)}`, l);
+      return [xs[0], xs[1], xs[2]];
+    };
+    b("sphere", fn1("sphere", (d, l) => {
+      if (isNum(d)) return S({ k: "sphere", r: num(d, "diameter", l) / 2 });
+      const [sx, sy, sz] = d3(d, "diameters", l);
+      return S({ k: "stretch3", sx, sy, sz, s: { k: "sphere", r: 0.5 } });
+    }));
+    b("ellipsoid", fn1("ellipsoid", (d, l) => { const [sx, sy, sz] = d3(d, "diameters (dx,dy,dz)", l); return S({ k: "stretch3", sx, sy, sz, s: { k: "sphere", r: 0.5 } }); }));
+    b("box3", fn1("box3", (d, l) => {
+      if (d instanceof Rec) {
+        const g = (k: string, dv: number) => (d.f.has(k) ? num(d.get(k)!, k, l) : dv);
+        const x0 = g("xmin", -Infinity), x1 = g("xmax", Infinity), y0 = g("ymin", -Infinity), y1 = g("ymax", Infinity), z0 = g("zmin", -Infinity), z1 = g("zmax", Infinity);
+        if (![x0, x1, y0, y1, z0, z1].every(Number.isFinite)) throw err("box3 {xmin: …} needs finite bounds", l);
+        return S({ k: "xform3", tx: (x0 + x1) / 2, ty: (y0 + y1) / 2, tz: (z0 + z1) / 2, m: [1, 0, 0, 0, 1, 0, 0, 0, 1], s: { k: "box3", hx: (x1 - x0) / 2, hy: (y1 - y0) / 2, hz: (z1 - z0) / 2, r: 0 } });
+      }
+      if (isList(d) && d.length === 2 && isList(d[0])) { const lo = nums(d[0], l), hi = nums(d[1], l); if (lo.length !== 3 || hi.length !== 3) throw err("box3 expects (lo, hi) 3-points", l); return S({ k: "xform3", tx: (lo[0] + hi[0]) / 2, ty: (lo[1] + hi[1]) / 2, tz: (lo[2] + hi[2]) / 2, m: [1, 0, 0, 0, 1, 0, 0, 0, 1], s: { k: "box3", hx: (hi[0] - lo[0]) / 2, hy: (hi[1] - lo[1]) / 2, hz: (hi[2] - lo[2]) / 2, r: 0 } }); }
+      const [dx, dy, dz] = d3(d, "diameter", l);
+      return S({ k: "box3", hx: dx / 2, hy: dy / 2, hz: dz / 2, r: 0 });
+    }));
+    b("cube", vars.get("box3")!);
+    b("cylinder", fn1("cylinder", (v, l) => {
+      let d: number, h: number, m: "exact" | "mitred" = "exact";
+      if (v instanceof Rec) { d = num(v.get("d") ?? 2, "d", l); h = num(v.get("h") ?? 2, "h", l); if (v.get("mode") === "mitred") m = "mitred"; }
+      else { d = num(v, "diameter", l); h = 2; }
+      return S({ k: "extrude", h, m, s: { k: "circle", r: d / 2 } });
+    }));
+    b("cone", fn1("cone", (v, l) => {
+      const d = v instanceof Rec ? num(v.get("d") ?? 2, "d", l) : num(v, "diameter", l);
+      const h = v instanceof Rec ? num(v.get("h") ?? 2, "h", l) : 2;
+      return S({ k: "cone", r: d / 2, h }); // base centred on the origin at z = 0, apex at +Z
+    }));
+    b("capped_cone", fn1("capped_cone", (v, l) => {
+      const q = rec(v, l);
+      return S({ k: "capped_cone", hh: num(q.get("h") ?? 2, "h", l) / 2, r1: num(q.get("bottom") ?? 2, "bottom", l) / 2, r2: num(q.get("top") ?? 2, "top", l) / 2 });
+    }));
+    b("capsule", fn1("capsule", (v, l) => {
+      const q = rec(v, l);
+      const a = nums(q.get("from") ?? [0, 0, 0], l), b2 = nums(q.get("to") ?? [0, 0, 2], l);
+      if (a.length < 3 || b2.length < 3) throw err("capsule expects from/to 3-points", l);
+      return S({ k: "seg", x1: a[0], y1: a[1], z1: a[2], x2: b2[0], y2: b2[1], z2: b2[2], th: num(q.get("d") ?? 2, "d", l) / 2 });
+    }));
+    b("torus", fn1("torus", (v, l) => {
+      const q = rec(v, l);
+      return S({ k: "perex", a: { k: "circle", r: num(q.get("major") ?? 2, "major", l) / 2 }, b: { k: "circle", r: num(q.get("minor") ?? 2, "minor", l) / 2 } });
+    }));
+    b("revolve", fn1("revolve", (s, l) => S({ k: "perex", a: { k: "circle", r: 0 }, b: shape(s, l) })));
+    b("perimeter_extrude", fn2("perimeter_extrude", (p, cs, l) => S({ k: "perex", a: shape(p, l), b: shape(cs, l) })));
+    b("gyroid", S({ k: "gyroid" }));
+    b("loft", fn2("loft", (d, v, l) => { const ks = shapes(v, l); if (ks.length !== 2) throw err("loft expects [shape1, shape2]", l); return S({ k: "loft", h: num(d, "distance", l) / 2, a: ks[0], b: ks[1] }); }));
+    b("extrude", fn2("extrude", (d, s, l) => S({ k: "extrude", h: num(d, "height", l) / 2, m: "exact", s: shape(s, l) })));
+    b("extrude_mitred", fn2("extrude_mitred", (d, s, l) => S({ k: "extrude", h: num(d, "height", l) / 2, m: "mitred", s: shape(s, l) })));
+    b("twist", fn2("twist", (tr, s, l) => S({ k: "twist", tr: num(tr, "twist rate", l), s: shape(s, l) })));
+    b("bend", fn2("bend", (v, s, l) => {
+      const q = rec(v, l);
+      const n2 = shape(s, l);
+      const bb = finiteBBox(bboxOf(n2, atlas));
+      if (!bb) throw err("bend needs a shape with a finite bbox", l);
+      const ang = num(q.get("angle") ?? Math.PI * 2, "angle", l);
+      const dd = q.get("d");
+      const width = bb[2] - bb[0];
+      return S({ k: "bend", rx: width / 2 / (ang / (Math.PI * 2)), ry: dd === undefined ? width / (Math.PI * 2) : num(dd, "d", l) / 2, ox: (bb[0] + bb[2]) / 2, oy: bb[3] + (dd === undefined ? width / (Math.PI * 2) : num(dd, "d", l) / 2), s: n2 });
+    }));
+    b("local_taper_x", fn2("local_taper_x", (v, s, l) => {
+      const q = rec(v, l);
+      const [y0, y1] = nums(q.get("range") ?? [0, 2], l) as [number, number];
+      const [kx0, kx1] = nums(q.get("scale") ?? [1, 1], l) as [number, number];
+      if (kx0 <= 0 || kx1 <= 0 || y0 >= y1) throw err("local_taper_x needs scale > 0 and range[0] < range[1]", l);
+      return S({ k: "taper2", y0, y1, kx0, kx1, s: shape(s, l) });
+    }));
+    b("local_taper_xy", fn2("local_taper_xy", (v, s, l) => {
+      const q = rec(v, l);
+      const [z0, z1] = nums(q.get("range") ?? [0, 2], l) as [number, number];
+      const sc = q.get("scale");
+      if (sc === undefined || !isList(sc) || sc.length !== 2 || !isList(sc[0]) || !isList(sc[1])) throw err("local_taper_xy needs scale: [[kx0,ky0], [kx1,ky1]]", l);
+      const [kx0, ky0] = nums(sc[0], l) as [number, number], [kx1, ky1] = nums(sc[1], l) as [number, number];
+      if (z0 >= z1 || kx0 <= 0 || ky0 <= 0 || kx1 <= 0 || ky1 <= 0) throw err("local_taper_xy needs positive scale and range[0] < range[1]", l);
+      return S({ k: "taper3", z0, z1, kx0, ky0, kx1, ky1, s: shape(s, l) });
+    }));
+    b("shear_x", fn2("shear_x", (kx, s, l) => S({ k: "shear2", kx: num(kx, "shear", l), s: shape(s, l) })));
+    b("slice_xy", fn1("slice_xy", (s, l) => S({ k: "slice2", plane: 0, s: shape(s, l) })));
+    b("slice_xz", fn1("slice_xz", (s, l) => S({ k: "slice2", plane: 1, s: shape(s, l) })));
+    b("slice_yz", fn1("slice_yz", (s, l) => S({ k: "slice2", plane: 2, s: shape(s, l) })));
+    b("slice", vars.get("slice_xy")!);
+    b("repeat_xyz", fn2("repeat_xyz", (d, s, l) => { const [a, b2, c2] = d3(d, "spacing (dx,dy,dz)", l); return S({ k: "repeat", kind: "xyz", a, b: b2, c: c2, s: shape(s, l) }); }));
+    b("repeat_finite", fn3("repeat_finite", (d, n2, s, l) => {
+      const dd = d3(d, "spacing (dx,dy,dz)", l), ll = d3(n2, "repeats (lx,ly,lz)", l);
+      if (ll.some((x) => x < 1 || !Number.isFinite(x))) throw err("repeat_finite repeats must be ≥ 1", l);
+      return S({ k: "repeat_finite", d: dd, l: ll, s: shape(s, l) });
+    }));
+    b("distance_field", fn1("distance_field", (s, l) => S({ k: "distfield", s: shape(s, l) })));
+    b("show_gradient", fn2("show_gradient", (v, s, l) => { const [j, k] = vec2(v, "[j, k]", l); return S({ k: "showgrad", j, k2: k, s: shape(s, l) }); }));
+    b("show_dist", fn1("show_dist", (s, l) => S({ k: "showdist", s: shape(s, l) })));
+    b("chamfer", fn1("chamfer", (r, l) => {
+      const rad = num(r, "chamfer radius", l);
+      return new Rec(new Map<string, Value>([
+        ["union", fn1("chamfer.union", (v, l2) => S({ k: "cuunion", s: rad, kids: shapes(v, l2) }))],
+        ["intersection", fn1("chamfer.intersection", (v, l2) => S({ k: "cinter", s: rad, kids: shapes(v, l2) }))],
+        ["difference", fn1("chamfer.difference", (v, l2) => { const ks = shapes(v, l2); if (ks.length < 2) throw err("chamfer.difference expects [a, b]", l2); return S({ k: "cdiff", s: rad, a: ks[0], b: { k: "union", kids: ks.slice(1) } }); })],
+      ]));
+    }));
+    b("warp_domain_xy", fn2("warp_domain_xy", (v, s, l) => {
+      const q = rec(v, l);
+      const it = activeInterp ?? (() => { throw err("warp_domain_xy is only available while evaluating"); })();
+      if (q.get("inverse") === undefined) throw err("warp_domain_xy needs a record with an inverse[x, y] function", l);
+      return S({ k: "warp2", f: it.shaderFn(q.get("inverse")!, "inverse", l), fix: q.get("fix_distance") !== undefined ? it.shaderFn(q.get("fix_distance")!, "fix_distance", l) : null, s: shape(s, l) });
+    }));
     b("pancake", fn2("pancake", (_d, s, l) => S(shape(s, l))));
     b("into", fn2("into", (f, l1, l) => { if (!(f instanceof Fn) || !isList(l1)) throw err("into expects a function and a list", l); return fn1("into'", (s, l2) => f.call([s, ...l1], l2)); }));
     const rowF = (gap: number, v: Value, l?: number): Value => {
@@ -575,8 +739,9 @@ export class Interp {
     });
     f.sc = (sc, arg, line) => {
       const p4 = sc.g.let(sc.toE(arg, line));
-      const p2 = p4.t === "v2" ? p4 : sc.g.vec([sc.g.idx(p4, 0), sc.g.idx(p4, 1)]);
-      const r = genShape(sc.g, node, sc.g.let(p2), { ...sc.ctx, cull: false });
+      // round 17: genShape works in 3D (v3 point) — user code still sees [x,y,z,t]
+      const p3 = sc.g.vec([sc.g.idx(p4, 0), sc.g.idx(p4, 1), p4.t === "v4" ? sc.g.idx(p4, 2) : sc.g.num(0)]);
+      const r = genShape(sc.g, node, sc.g.let(p3), { ...sc.ctx, cull: false });
       return sc.dyn(which === "dist" ? r.d : sc.g.swz(r.c, [0, 1, 2]));
     };
     // hashable by content (plain nodes do not read host state), so a function receiving `s.dist` can still be memoised
@@ -588,9 +753,9 @@ export class Interp {
     let c = this.cpuFns.get(node);
     if (!c) {
       const g = new JS();
-      const ctx: GenCtx = { atlas: this.atlas, zoom: { t: "f", s: "1" }, time: { t: "f", s: "T" }, cull: false, defaultColour: DEFAULT_COLOUR };
-      const r = genShape(g, node, { t: "v2", s: "p0" }, ctx);
-      const body = `const p0 = [x, y];\n${g.code()}\nreturn [${r.d.s}, ${r.c.s}];`;
+      const ctx: GenCtx = { atlas: this.atlas, zoom: { t: "f", s: "1" }, time: { t: "f", s: "T" }, cull: false, defaultColour: DEFAULT_COLOUR, mode: "slice", aa: { t: "f", s: "1.5" } };
+      const r = genShape(g, node, { t: "v3", s: "p0" }, ctx);
+      const body = `const p0 = [x, y, 0];\n${g.code()}\nreturn [${r.d.s}, ${r.c.s}];`;
       const fn = new Function("P", "R", "x", "y", "T", body) as (P: number[], R: unknown, x: number, y: number, T: number) => [number, number[]];
       const R = makeJSRuntime(() => 0.5); const P = g.finalParams();
       c = { dist: (x, y, t) => fn(P, R, x, y, t)[0], colour: (x, y, t) => fn(P, R, x, y, t)[1].slice(0, 3) };
@@ -605,19 +770,36 @@ export class Interp {
   shapeRec(s: Shape): Rec {
     const hit = shapeRecMemo.get(s.node); // memoised per node: values are static and accessors are frame-independent
     if (hit) return hit;
-    const b = bboxOf(s.node, this.atlas);
-    const bb: Value = b ? [[b[0], b[1], 0], [b[2], b[3], 0]] : [[-Infinity, -Infinity, 0], [Infinity, Infinity, 0]];
-    const r = new Rec(new Map<string, Value>([["dist", this.shapeFn(s.node, "dist")], ["colour", this.shapeFn(s.node, "colour")], ["bbox", bb], ["is_2d", true], ["is_3d", false]]));
+    // C++ parity: is_2d / is_3d follow the shape's true dimensionality, and a 3D shape reports a
+    // full 3D bbox (a 2D shape is a z = 0 slab, as in Curv's own 3D boxes for flat shapes)
+    const f3 = flags3Of(s.node);
+    let bb: Value;
+    if (f3.is3d) {
+      const b3 = bbox3Of(s.node, this.atlas);
+      bb = b3 ? [[b3[0], b3[1], b3[2]], [b3[3], b3[4], b3[5]]] : [[-Infinity, -Infinity, -Infinity], [Infinity, Infinity, Infinity]];
+    } else {
+      const b = bboxOf(s.node, this.atlas);
+      bb = b ? [[b[0], b[1], 0], [b[2], b[3], 0]] : [[-Infinity, -Infinity, 0], [Infinity, Infinity, 0]];
+    }
+    const r = new Rec(new Map<string, Value>([["dist", this.shapeFn(s.node, "dist")], ["colour", this.shapeFn(s.node, "colour")], ["bbox", bb], ["is_2d", f3.is2d], ["is_3d", f3.is3d]]));
     shapeRecMemo.set(s.node, r);
     return r;
   }
   makeShape(r: Rec, line?: number): Shape {
-    if (r.get("is_3d") === true && r.get("is_2d") !== true) throw err("3D shapes are not supported in this 2D playground (only is_2d shapes)", line);
+    const is3 = r.get("is_3d") === true;
+    if (is3 && r.get("is_2d") === true) throw err("a shape cannot be both is_2d and is_3d", line);
     const d = r.get("dist"), c = r.get("colour");
     let bbox: BBox | null = null;
+    let bbox3: number[] | null | undefined = undefined;
     const bv = r.get("bbox") ?? null;
-    if (isList(bv) && bv.length === 2 && isList(bv[0]) && isList(bv[1])) { const lo = nums(bv[0], line), hi = nums(bv[1], line); bbox = [lo[0], lo[1], hi[0], hi[1]]; if (!bbox.every(Number.isFinite)) bbox = null; }
-    return S({ k: "custom", dist: d === undefined ? null : this.shaderFn(d, "dist", line), colour: c === undefined ? null : this.shaderFn(c, "colour", line), bbox, name: "make_shape" });
+    if (isList(bv) && bv.length === 2 && isList(bv[0]) && isList(bv[1])) {
+      const lo = nums(bv[0], line), hi = nums(bv[1], line);
+      if (is3) {
+        if (lo.length >= 3 && hi.length >= 3) { bbox3 = [lo[0], lo[1], lo[2], hi[0], hi[1], hi[2]]; if (!bbox3.every(Number.isFinite)) bbox3 = null; }
+        if (bbox3) bbox = [bbox3[0], bbox3[1], bbox3[3], bbox3[4]]; // x,y footprint for 2D-view culling
+      } else { bbox = [lo[0], lo[1], hi[0], hi[1]]; if (!bbox.every(Number.isFinite)) bbox = null; }
+    }
+    return S({ k: "custom", dist: d === undefined ? null : this.shaderFn(d, "dist", line), colour: c === undefined ? null : this.shaderFn(c, "colour", line), bbox, bbox3: is3 ? (bbox3 ?? null) : undefined, name: "make_shape" });
   }
 
 
@@ -1205,21 +1387,26 @@ export interface CompiledTree { code: string; d: string; c: string; params: Floa
 const codeLru = new Map<string, { d: string; c: string; code: string; usesTime: boolean }>();
 const CODE_LRU_MAX = 32;
 
-export function compileTree(node: SNode, atlas: Atlas, target: "wgsl" | "js", prev: CompiledTree | null = null, defaultColour: RGBA = DEFAULT_COLOUR): CompiledTree {
-  const key = structKey(node, atlas);
+export function compileTree(node: SNode, atlas: Atlas, target: "wgsl" | "js", prev: CompiledTree | null = null, defaultColour: RGBA = DEFAULT_COLOUR, mode: ViewMode = "slice"): CompiledTree {
+  const cull = mode === "slice"; // bbox culling + coverage AA only make sense in the 2D (slice) view
+  const key = structKey(node, atlas, cull);
   // (buffer length may legitimately differ: text / polygon blocks use parameterised offsets)
-  if (prev && key !== null && prev.key === key) return { ...prev, params: collectParamsFast(node, atlas, defaultColour), reused: true };
+  if (prev && key !== null && prev.key === key) return { ...prev, params: collectParamsFast(node, atlas, defaultColour, cull), reused: true };
   if (key !== null) {
     const lk = target + "|" + key;
     const hit = codeLru.get(lk);
     if (hit) {
       codeLru.delete(lk); codeLru.set(lk, hit); // refresh
-      return { code: hit.code, d: hit.d, c: hit.c, params: collectParamsFast(node, atlas, defaultColour), key, reused: true, usesTime: hit.usesTime };
+      return { code: hit.code, d: hit.d, c: hit.c, params: collectParamsFast(node, atlas, defaultColour, cull), key, reused: true, usesTime: hit.usesTime };
     }
   }
   const g: Gen = target === "wgsl" ? new WGSL() : new JS();
-  const ctx: GenCtx = { atlas, zoom: { t: "f", s: target === "wgsl" ? "u.cam.z" : "zoom" }, time: { t: "f", s: target === "wgsl" ? "u.time" : "T" }, cull: true, defaultColour };
-  const r = genShape(g, node, { t: "v2", s: "p0" }, ctx);
+  const ctx: GenCtx = {
+    atlas, zoom: { t: "f", s: target === "wgsl" ? "u.cam.z" : "zoom" }, time: { t: "f", s: target === "wgsl" ? "u.time" : "T" },
+    cull, defaultColour, mode,
+    aa: mode === "slice" ? { t: "f", s: target === "wgsl" ? "(1.5 / u.cam.z)" : "(1.5 / zoom)" } : { t: "f", s: "0.3" },
+  };
+  const r = genShape(g, node, { t: "v3", s: "p0" }, ctx);
   const out: CompiledTree = { code: g.code(), d: r.d.s, c: r.c.s, params: new Float32Array(g.finalParams()), key, reused: false, usesTime: g.usesTime };
   if (key !== null) {
     const lk = target + "|" + key;
@@ -1229,14 +1416,14 @@ export function compileTree(node: SNode, atlas: Atlas, target: "wgsl" | "js", pr
   return out;
 }
 /** Only the parameter buffer of a tree, in codegen order, via the generic ParamsOnly backend (reference implementation). */
-export function collectParams(node: SNode, atlas: Atlas, defaultColour: RGBA = DEFAULT_COLOUR): Float32Array {
+export function collectParams(node: SNode, atlas: Atlas, defaultColour: RGBA = DEFAULT_COLOUR, cull = true): Float32Array {
   const g = new ParamsOnly();
-  genShape(g, node, { t: "v2", s: "" }, { atlas, zoom: { t: "f", s: "" }, time: { t: "f", s: "" }, cull: true, defaultColour });
+  genShape(g, node, { t: "v3", s: "" }, { atlas, zoom: { t: "f", s: "" }, time: { t: "f", s: "" }, cull, defaultColour, mode: cull ? "slice" : "solid", aa: { t: "f", s: "" } });
   return new Float32Array(g.finalParams());
 }
 /** Same buffer through the dedicated tree walk (`walkParams`); falls back to the generic backend for trees with user shader functions. */
-export function collectParamsFast(node: SNode, atlas: Atlas, defaultColour: RGBA = DEFAULT_COLOUR): Float32Array {
-  const p = walkParams(node, atlas);
-  return p ? new Float32Array(p) : collectParams(node, atlas, defaultColour);
+export function collectParamsFast(node: SNode, atlas: Atlas, defaultColour: RGBA = DEFAULT_COLOUR, cull = true): Float32Array {
+  const p = walkParams(node, atlas, cull);
+  return p ? new Float32Array(p) : collectParams(node, atlas, defaultColour, cull);
 }
 export { Shape, DEFAULT_COLOUR };

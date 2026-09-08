@@ -36,7 +36,7 @@ for (const ex of list) {
     const bb = finiteBBox(bboxOf(r.shape, atlas));
     const ui = r.usesViewport;
     const cam = ui ? { cx: 0, cy: 0, zoom: W / VW } : (() => { const b = bb ?? [-10, -10, 10, 10]; const z = 0.9 * Math.min(W / (b[2] - b[0]), H / (b[3] - b[1])); return { cx: (b[0] + b[2]) / 2, cy: (b[1] + b[3]) / 2, zoom: z }; })();
-    const body = `const zoom=cam.zoom; for (let j=0;j<H;j++) for (let i=0;i<W;i++){ const p0=[((i+0.5)-W*0.5)/zoom+cam.cx, -((j+0.5)-H*0.5)/zoom+cam.cy];\n${js.code}\nconst d=${js.d}, col=${js.c}; const aa=Math.min(1,Math.max(0,0.5-d*zoom))*col[3]; const q=(j*W+i)*4; px[q]=(bg[0]+(col[0]-bg[0])*aa)*255; px[q+1]=(bg[1]+(col[1]-bg[1])*aa)*255; px[q+2]=(bg[2]+(col[2]-bg[2])*aa)*255; px[q+3]=255; }`;
+    const body = `const zoom=cam.zoom; for (let j=0;j<H;j++) for (let i=0;i<W;i++){ const p0=[((i+0.5)-W*0.5)/zoom+cam.cx, -((j+0.5)-H*0.5)/zoom+cam.cy, 0];\n${js.code}\nconst d=${js.d}, col=${js.c}; const aa=Math.min(1,Math.max(0,0.5-d*zoom))*col[3]; const q=(j*W+i)*4; px[q]=(bg[0]+(col[0]-bg[0])*aa)*255; px[q+1]=(bg[1]+(col[1]-bg[1])*aa)*255; px[q+2]=(bg[2]+(col[2]-bg[2])*aa)*255; px[q+3]=255; }`;
     const fn = new Function("P", "R", "W", "H", "cam", "T", "bg", "px", body);
     const cv = createCanvas(W, H); const ctx = cv.getContext("2d");
     const img = ctx.createImageData(W, H);

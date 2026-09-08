@@ -154,4 +154,101 @@ export const PRELUDE = `
     circle (b.h - 6) >> colour white >> translate ((if on then b.right - b.h/2 else b.x + b.h/2), b.cy) ];
   bar b = frame_r 6 b;
   layout_debug b = frame b >> stroke 1 >> colour accent_3;
+
+  // ---- C++ std.curv parity: constants, math, lists, colours, shapes ----
+  // index constants (X/Y/Z/T are builtins) and unit axes
+  MIN = 0;
+  MAX = 1;
+  RE = 0;   // [RE, IM] complex convention
+  IM = 1;
+  X_axis = [1, 0, 0];
+  Y_axis = [0, 1, 0];
+  Z_axis = [0, 0, 1];
+  // characters
+  dol = char 36;
+  tab = char 9;
+  nl  = char 10;
+  quot = char 34;
+  // list / matrix helpers (C++ names)
+  id x = x;
+  product = reduce [1, [x, y] -> x*y];
+  contains [list, x] =
+    do
+      local i = 0;
+      while (i < count list && list.[i] != x) i := i + 1;
+    in i < count list;
+  sort a =
+    if count a == 0 then []
+    else do
+      local first = a.[0];
+      local rest = [for (i in 1..<count a) a.[i]];
+    in [...sort [for (e in rest) if (e < first) e], first, ...sort [for (e in rest) if (e >= first) e]];
+  perp [x, y] = [-y, x];
+  idmatrix n = [for (i in 1..n) [for (j in 1..n) if (i == j) 1 else 0]];
+  transpose a =
+    if count a == 0 then a
+    else [for (i in indices a.[0]) [for (j in indices a) a.[[j, i]]]];
+  encode = ucode;
+  decode = char;
+  // C++-named colours the palette did not have (sRGB.hue as in std.curv)
+  azure = sRGB.hue (7/12);
+  indigo = sRGB.hue (3/4);
+  rose = sRGB.hue (11/12);
+  chartreuse = sRGB [1, 1, 0];
+  spring_green = sRGB [0, 1, 0.5];
+  // implicit fields
+  i_linear d p = mod [p.[X]/d, 1];
+  i_radial n p = mod [(phase [p.[X], p.[Y]]/tau - 0.25)*n, 1];
+  i_concentric d p = mod [mag [p.[X], p.[Y]]/d, 1];
+  i_gyroid p = (cos p.[X]*sin p.[Y] + cos p.[Y]*sin p.[Z] + cos p.[Z]*sin p.[X] + 1.5)/3;
+  i_animate period ifield p = mod [ifield p + p.[T]/period, 1];
+  show_ifield ifield = colour [ifield, sRGB.grey] everything;
+  show_colour c = colour c everything;
+  show_cmap f = union [
+    rect [4.05, 1.05] >> colour grey,
+    rect [4, 1] >> colour (p -> f ((p.[X]+2)/4)) ];
+  // set the rendered bbox (C++ set_bbox, via a make_shape wrapper)
+  set_bbox bbox s =
+    make_shape {
+      dist p = s.dist [p.[X], p.[Y], p.[Z], p.[T]];
+      colour p = s.colour [p.[X], p.[Y], p.[Z], p.[T]];
+      bbox = bbox;
+      is_3d = s.is_3d;
+      is_2d = s.is_2d;
+    };
+  // 2D polyline: a rounded polyline through points v of thickness d (C++ std.curv, crossing-number)
+  polyline {d, v} =
+    make_shape {
+      dist p =
+        do
+          local p2 = [p.[X], p.[Y]];
+          local num = count v;
+          local d2 = dot [p2 - v.[0], p2 - v.[0]];
+          local s = 1;
+          local j = num - 1;
+          for (i in 0..<num) (
+            local e = v.[j] - v.[i];
+            local w = p2 - v.[i];
+            local b = w - e*clamp [dot [w, e]/dot [e, e], 0, 1];
+            d2 := min [d2, dot [b, b]];
+            local c1 = p2.[Y] >= v.[i].[Y];
+            local c2 = p2.[Y] < v.[j].[Y];
+            local c3 = e.[X]*w.[Y] > e.[Y]*w.[X];
+            if ((c1 && c2 && c3) || (!c1 && !c2 && !c3)) s := -s;
+            j := i;
+          );
+        in s * sqrt d2 - d/2;
+      bbox = [[min (map (q -> q.[X]) v), min (map (q -> q.[Y]) v)], [max (map (q -> q.[X]) v), max (map (q -> q.[Y]) v)]];
+      is_2d = true;
+    };
+  // C++ aliases
+  convex_polygon pts = polygon pts;
+  prism n d h = regular_polygon_d n d >> extrude h;
+  symmetric_difference shapes = difference [union shapes, intersection shapes];
+  reflect_x s = reflect [1, 0] s;
+  reflect_y s = reflect [0, 1] s;
+  reflect_z s = reflect [0, 0, 1] s;
+  reflect_xy s = reflect [1, -1] s;
+  reflect_xz s = reflect [1, 0, -1] s;
+  reflect_yz s = reflect [0, 1, -1] s;
 `;

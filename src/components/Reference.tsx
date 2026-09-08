@@ -46,6 +46,24 @@ const sections: { title: string; rows: [string, string][] }[] = [
     ],
   },
   {
+    title: "3D shapes (solid raymarch view)",
+    rows: [
+      ["Preview bar: 2D ⇄ 3D toggle", "2D = the z = 0 slice of the tree; 3D = solid raymarch of the same tree — separate cameras, only one ever renders; drag orbits, wheel/pinch zooms, fit frames the 3D bounding box"],
+      ["sphere d|[dx,dy,dz] · ellipsoid [dx,dy,dz] · box3 [w,h,d] | (lo,hi) | {xmin,…} · cube", "primitives take DIAMETERS (C++ std.curv convention); cube = box3 alias"],
+      ["cylinder d | {d,h,mode} · cone d | {d,h} · capped_cone {h,bottom,top} · capsule {from,to,d} · torus {major,minor}", "d = diameter, h = full height (mode: 'mitred'); capsule from/to are 3-points; capped_cone bottom/top = base diameters"],
+      ["revolve s · perimeter_extrude p c · loft h [a,b] · extrude h s · extrude_mitred h s", "surface of revolution · sweep cross-section c around profile p · interpolate a→b over distance h · lift a 2D shape to height h (mitred caps optional)"],
+      ["twist a s · bend {angle,d} s · shear_x k s · local_taper_x {range,scale} s · local_taper_xy {range,scale} s", "warp operators: twist rate around Z · roll into a cylinder of diameter d over `angle` · x-shear · x(x,y)-taper across a y-range"],
+      ["gyroid", "cos x sin y + cos y sin z + cos z sin x; period 2π, field ∈ [−3,3], Lipschitz 4/3 (C++ reference)"],
+      ["slice_xy s · slice_xz s · slice_yz s", "a 2D shape: the coordinate-plane section of s (is_2d — draws in the 2D view)"],
+      ["repeat_xyz [dx,dy,dz] s · repeat_finite [dx,dy,dz] [nx,ny,nz] s", "periodic tiling · the same, bounded to an n box"],
+      ["distance_field s · show_gradient [j,k] s · show_dist s", "diagnostics: raw field · gradient magnitude as a rainbow (black ≤ j, white ≥ k, HSV between) · field as grey; with a 3D child they union the shape in the solid view (C++ semantics)"],
+      ["chamfer r .union [..] · .intersection · .difference", "CSG with a fillet/chamfer radius r"],
+      ["warp_domain_xy {inverse, fix_distance} s", "domain warp: inverse (x,y)→(x',y') remaps the shape, fix_distance rescales the warped field"],
+      ["translate [x,y,z] · rotate {angle, axis} s · scale [sx,sy,sz] · stretch [sx,sy,sz] · reflect [nx,ny,nz] s", "3D transforms; rotate = Rodrigues rotation about an arbitrary axis"],
+      ["s.is_2d · s.is_3d · s.bbox", "shape-record fields follow the true dimensionality (3D shapes report a 3D bbox; show_dist/show_gradient are both, as in C++)"],
+    ],
+  },
+  {
     title: "Layout helpers (same Curv space, y up)",
     rows: [
       ["circle d · rect (w,h) · rrect (w,h) r · ellipse (w,h)", "centred primitives"],

@@ -59,4 +59,19 @@ for (const ex of EXAMPLES) {
     console.log(`${ok && staticOk ? "OK " : "ERR"} ${ex.id.padEnd(14)} params=${full.params.length} sameParams=${same}${walkSame ? "" : " (WALK DIFFERS)"} key=${ka === null ? "none (custom)" : ka === kb ? "stable" : "CHANGED"} reused=${second.reused} codeSame=${codeSame} paramsB=${paramsB} memo=${memo}${memoSame ? (warmΔ > 0 ? ` (warmΔ=${warmΔ.toExponential(1)})` : "") : ` MISMATCH${replaySame ? "" : " REPLAY"} (warmΔ=${Number.isFinite(warmΔ) ? warmΔ.toExponential(1) : "len"})`} skip=${isStatic ? (staticOk ? "safe" : "NOT SAFE") : "-"}  codegen ${(tf / N).toFixed(2)}ms → params-only ${(tp / N).toFixed(2)}ms → walk ${(tw / N).toFixed(2)}ms`);
   } catch (e: any) { fails++; console.log(`ERR ${ex.id}: ${e.message}`); }
 }
+// SOLID mode (cull = false) is what the 3D view compiles — the LRU fast path feeds it
+// collectParamsFast(cull=false), so that buffer must match solid codegen bit-for-bit too.
+for (const ex of EXAMPLES) {
+  try {
+    const vw = ex.group === "3d" ? 96 : 900;
+    const r = new Interp(atlas, { viewport: { x: -vw / 2, y: -300, w: vw, h: 600 }, time: 0.5, mouse: { x: -1e6, y: -1e6, down: false }, params: {} }).run(ex.src);
+    if (!r.shape) continue;
+    const full = compileTree(r.shape, atlas, "js", null, undefined, "solid");
+    const walk = collectParamsFast(r.shape, atlas, undefined, false);
+    let same = full.params.length === walk.length;
+    for (let i = 0; same && i < walk.length; i++) if (full.params[i] !== walk[i]) same = false;
+    if (!same) fails++;
+    if (!same) console.log(`ERR solid ${ex.id}: codegen ${full.params.length} vs walk ${walk.length}`);
+  } catch (e: any) { fails++; console.log(`ERR solid ${ex.id}: ${e.message}`); }
+}
 if (fails) process.exitCode = 1;
