@@ -4,7 +4,7 @@
 // code, so animation / re-solving only re-uploads the parameter buffer.  The
 // CPU fallback runs the JS flavour of the same generated code.
 import { ATLAS_W, ATLAS_H, type Atlas } from "./atlas";
-import { makeJSRuntime } from "./gen";
+import { makeJSRuntime, SHADER_FLAGS } from "./gen";
 
 export interface Compiled { code: string; d: string; c: string; params: Float32Array; solid?: boolean }
 /** World-space camera: centre in world units, zoom = device-independent px per world unit.  y is always up. */
@@ -23,12 +23,17 @@ export interface Renderer {
      *  always 0 on the WebGPU path, which cannot report per-pixel values back */ nan: number };
 }
 
-export async function createRenderer(canvas: HTMLCanvasElement, atlas: Atlas, mode: "auto" | "cpu" = "auto"): Promise<Renderer> {
+export interface RendererOptions {
+  /** Pin the CPU fallback's adaptive resolution (0..1] instead of letting it settle from frame
+   *  time — used by the gates so two builds can be timed on exactly the same pixel count. */
+  fixedScale?: number;
+}
+export async function createRenderer(canvas: HTMLCanvasElement, atlas: Atlas, mode: "auto" | "cpu" = "auto", opts: RendererOptions = {}): Promise<Renderer> {
   if (mode === "auto") {
     try { const r = await createWebGPU(canvas, atlas); if (r) return r; }
     catch (e) { console.warn("WebGPU init failed, using CPU fallback", e); }
   }
-  return createCPU(canvas, atlas);
+  return createCPU(canvas, atlas, opts.fixedScale);
 }
 
 // cam: 2D slice camera (cx, cy, zoom); cam3a: 3D target + distance; cam3b: yaw, pitch, tan(fov/2), aspect
@@ -47,6 +52,11 @@ fn hsv2rgb(c: vec3f) -> vec3f {
   return c.z - c.z * c.y * max(vec3f(0.0), min(min(k, 4.0 - k), vec3f(1.0)));
 }
 `;
+/** Which flavour of the 3D wrapper is in force: with `branchless3D` (or the master `branchless`
+ *  flag) the raymarch loop has no `if` and no `break`, so every ray runs all 128 steps and is shaded
+ *  even when it hits nothing — same pixels, strictly more work. */
+const solidBranchless = () => SHADER_FLAGS.branchless3D || SHADER_FLAGS.branchless;
+
 const wrapWGSL2D = (c: Compiled) => `${PREAMBLE}
 @fragment fn fs(@builtin(position) fc: vec4f) -> @location(0) vec4f {
   let px = fc.xy / u.atlas.w;
@@ -88,9 +98,8 @@ ${c.code}
   for (var i = 0u; i < 128u; i = i + 1u) {
     let dd = stepf(ro + rd * tt);
     // WGSL needs a compound statement for the body of an if: "if (dd > FAR) break;" is a syntax
-    // error (naga: expected '{' for if statement).  The JS target accepted it, which is why this
-    // only ever failed on a real GPU: the CPU fallback kept working and ran through every
-    // headless gate.  scripts/wgslcheck.ts now parses the wrapped source, wrapper included.
+    // error (naga: expected '{' for if statement), which is how round 17 shipped a 3D view that
+    // only ever worked on the CPU fallback.
     if (dd < 0.001) { hit = true; break; }
     if (dd > FAR) { break; }
     tt += min(dd, FAR);
@@ -110,10 +119,68 @@ ${c.code}
   let lum = 0.32 + 0.75 * max(dot(n, l1), 0.0) + 0.35 * max(dot(n, l2), 0.0) + 0.3 * rim;
   return vec4f(min(cc.rgb * lum, vec3f(1.0)), 1.0);
 }`;
+const wrapWGSL3Db = (c: Compiled) => `${PREAMBLE}
+fn stepf(q: vec3f) -> f32 {
+  let p0 = q;
+${c.code}
+  return ${c.d};
+}
+fn colf(q: vec3f) -> vec4f {
+  let p0 = q;
+${c.code}
+  return ${c.c};
+}
+@fragment fn fs(@builtin(position) fc: vec4f) -> @location(0) vec4f {
+  let tgt = u.cam3a.xyz;
+  let rad = max(u.cam3a.w, 0.001);
+  let cy = cos(u.cam3b.x); let sy = sin(u.cam3b.x);
+  let cp = cos(u.cam3b.y); let sp = sin(u.cam3b.y);
+  let ro = tgt + rad * vec3f(sy * cp, sp, cy * cp);
+  let fw = normalize(tgt - ro);
+  let rt = normalize(cross(fw, vec3f(0.0, 1.0, 0.0)));
+  let up = cross(rt, fw);
+  let nd = vec2f(1.0, -1.0) * (fc.xy / u.atlas.w - u.res * 0.5) * 2.0;
+  let rd = normalize(fw + rt * (nd.x * u.cam3b.z * u.cam3b.w) + up * (nd.y * u.cam3b.z));
+  const FAR = 400.0;
+  var tt = 0.02;
+  var hit = 0.0;    // 1 once the ray reached a surface
+  var live = 1.0;   // 1 while the ray is still marching (0 after a hit, an escape or a NaN)
+  for (var i = 0u; i < 128u; i = i + 1u) {
+    let dd = stepf(ro + rd * tt);
+    // branchless: no break, no if.  near stops the advance, gone retires the ray (a NaN
+    // distance is a retire too: it would otherwise poison tt and the normal).  Every iteration
+    // runs; once live is 0 the updates are no-ops, so the result is the same as breaking out.
+    let near = select(0.0, 1.0, dd < 0.001);
+    let gone = select(0.0, 1.0, (dd > FAR) | (tt > FAR) | !(dd == dd));
+    hit = max(hit, live * near);
+    // select, not a 0 factor: min(NaN, FAR) is NaN and 0 * NaN is still NaN
+    let adv = select(min(dd, FAR), 0.0, gone > 0.5);
+    tt = tt + live * (1.0 - near) * adv;
+    live = live * (1.0 - near) * (1.0 - gone);
+  }
+  let ph = ro + rd * tt;
+  let e = max(0.0012, rad * 0.0006);
+  // gradient length instead of normalize(): a background pixel has a zero gradient, and
+  // normalize(0) is NaN - and mix(bg, NaN, 0.0) is NaN too, because 0 * NaN is NaN.
+  let gv = vec3f(
+    stepf(ph + vec3f(e, 0.0, 0.0)) - stepf(ph - vec3f(e, 0.0, 0.0)),
+    stepf(ph + vec3f(0.0, e, 0.0)) - stepf(ph - vec3f(0.0, e, 0.0)),
+    stepf(ph + vec3f(0.0, 0.0, e)) - stepf(ph - vec3f(0.0, 0.0, e)));
+  let n = gv / max(length(gv), 1e-20);
+  let cc = colf(ph);
+  let l1 = normalize(vec3f(0.55, 0.8, 0.5));
+  let l2 = normalize(vec3f(-0.5, -0.25, -0.6));
+  let rim = pow(1.0 - clamp(dot(n, -rd), 0.0, 1.0), 3.0);
+  let lum = 0.32 + 0.75 * max(dot(n, l1), 0.0) + 0.35 * max(dot(n, l2), 0.0) + 0.3 * rim;
+  // select, not mix: the shaded colour is computed for every pixel (background included) and a
+  // mix() would drag its NaN/Inf into the result even at t = 0
+  return vec4f(select(u.bg.rgb, min(cc.rgb * lum, vec3f(1.0)), hit > 0.5), 1.0);
+}`;
 /** The full shader source the GPU actually sees, for one compiled program.  Exported so the gate can
  *  parse exactly this text: the body alone is not enough (the wrapper is where the raymarch loop
  *  lives, and a syntax error there fails on the GPU while the CPU path keeps working). */
-export const wrapWGSL = (c: Compiled) => (c.solid ? wrapWGSL3D(c) : wrapWGSL2D(c));
+export const wrapWGSL = (c: Compiled) => (c.solid ? (solidBranchless() ? wrapWGSL3Db(c) : wrapWGSL3D(c)) : wrapWGSL2D(c));
+
 
 async function createWebGPU(canvas: HTMLCanvasElement, atlas: Atlas): Promise<Renderer | null> {
   if (!("gpu" in navigator) || !navigator.gpu) return null;
@@ -164,7 +231,8 @@ async function createWebGPU(canvas: HTMLCanvasElement, atlas: Atlas): Promise<Re
   const qRead = hasTs ? device.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }) : null;
   let qBusy = false;
   // the same generated body compiles to different frames per view mode, so the mode is part of the cache key
-  const keyOf = (c: Compiled) => (c.solid ? "3|" : "2|") + c.code;
+  // the wrapper is hand-written and depends on the branchless flag, so the cache key does too
+  const keyOf = (c: Compiled) => (SHADER_FLAGS.branchless3D || SHADER_FLAGS.branchless ? "b" : "") + (c.solid ? "3|" : "2|") + c.code;
   const getPipeline = (c: Compiled): Promise<GPURenderPipeline> => {
     const k = keyOf(c);
     const hit = cache.get(k); if (hit) return Promise.resolve(hit);
@@ -255,6 +323,10 @@ function march3(step: (q: number[]) => number, col: (q: number[]) => number[], r
     if (tt > FAR) break;
   }
   if (!hit) return bg;
+  return shade3(step, col, ro, rd, tt, e);
+}
+/** Shading for a ray that reached a surface at `tt` (shared by both marchers). */
+function shade3(step: (q: number[]) => number, col: (q: number[]) => number[], ro: number[], rd: number[], tt: number, e: number): number[] {
   const ph = [ro[0] + rd[0] * tt, ro[1] + rd[1] * tt, ro[2] + rd[2] * tt];
   const nx = step([ph[0] + e, ph[1], ph[2]]) - step([ph[0] - e, ph[1], ph[2]]);
   const ny = step([ph[0], ph[1] + e, ph[2]]) - step([ph[0], ph[1] - e, ph[2]]);
@@ -268,8 +340,30 @@ function march3(step: (q: number[]) => number, col: (q: number[]) => number[], r
   const lum = 0.32 + 0.75 * Math.max(0, (n[0] * l1[0] + n[1] * l1[1] + n[2] * l1[2]) / n1) + 0.35 * Math.max(0, (n[0] * l2[0] + n[1] * l2[1] + n[2] * l2[2]) / n2) + 0.3 * rim;
   return [Math.min(1, cc[0] * lum) * 255, Math.min(1, cc[1] * lum) * 255, Math.min(1, cc[2] * lum) * 255];
 }
+/**
+ * Branchless twin of `march3` (SHADER_FLAGS.branchless, mirroring the WGSL wrapper): no `if`, no
+ * `break` — a `live` factor retires the ray, so all 128 steps run and the shading is computed for
+ * every pixel and then discarded with a select.  Same pixels, no divergence, more work.
+ */
+function march3b(step: (q: number[]) => number, col: (q: number[]) => number[], ro: number[], rd: number[], e: number, bg: number[]): number[] {
+  const FAR = 400;
+  let tt = 0.02, hit = 0, live = 1;
+  for (let i = 0; i < 128; i++) {
+    const dd = step([ro[0] + rd[0] * tt, ro[1] + rd[1] * tt, ro[2] + rd[2] * tt]);
+    const bad = dd !== dd ? 1 : 0;                              // non-finite distance: retire
+    const near = dd < 0.001 ? 1 : 0;
+    const gone = dd > FAR || tt > FAR || bad ? 1 : 0;
+    nanCount += bad * live;
+    hit = hit + live * near;                                    // at most one: live drops to 0
+    const adv = gone ? 0 : Math.min(dd, FAR);                   // select, not a 0 factor (0 * NaN)
+    tt = tt + live * (1 - near) * adv;
+    live = live * (1 - near) * (1 - gone);
+  }
+  const rgb = shade3(step, col, ro, rd, tt, e);
+  return [hit ? rgb[0] : bg[0], hit ? rgb[1] : bg[1], hit ? rgb[2] : bg[2]];
+}
 
-function createCPU(canvas: HTMLCanvasElement, atlas: Atlas): Renderer {
+function createCPU(canvas: HTMLCanvasElement, atlas: Atlas, fixedScale?: number): Renderer {
   const ctx2d = canvas.getContext("2d")!;
   const R = makeJSRuntime((u, v) => {
     const x = Math.min(ATLAS_W - 1, Math.max(0, Math.round(u * ATLAS_W - 0.5))), y = Math.min(ATLAS_H - 1, Math.max(0, Math.round(v * ATLAS_H - 0.5)));
@@ -320,8 +414,8 @@ ${c.code}
     if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
   };
   resize();
-  let scale = 0.5;   // 2D slice view
-  let scale3 = 0.35; // 3D raymarch (much heavier: starts coarser)
+  let scale = fixedScale ?? 0.5;   // 2D slice view
+  let scale3 = fixedScale ?? 0.35; // 3D raymarch (much heavier: starts coarser)
   return {
     kind: "cpu", resize, stats,
     async render(prog, cam, bg, time, _scale, cam3) {
@@ -356,7 +450,8 @@ ${c.code}
             ];
             const rl2 = Math.hypot(rd0[0], rd0[1], rd0[2]) || 1;
             const rd = [rd0[0] / rl2, rd0[1] / rl2, rd0[2] / rl2];
-            const rgb = march3((q) => step(P, time, q), (q) => col(P, time, q), ro, rd, e, bgpx);
+            const march = SHADER_FLAGS.branchless3D || SHADER_FLAGS.branchless ? march3b : march3;
+            const rgb = march((q) => step(P, time, q), (q) => col(P, time, q), ro, rd, e, bgpx);
             if (nanCount) { stats.nan += nanCount; nanCount = 0; }
             const q = (j * w + i) * 4;
             img.data[q] = rgb[0]; img.data[q + 1] = rgb[1]; img.data[q + 2] = rgb[2]; img.data[q + 3] = 255;
@@ -367,10 +462,12 @@ ${c.code}
         f(prog.params, R, w, h, s, cam, time, bg, img.data);
       }
       const ms = performance.now() - t0;
-      // adapt resolution to keep the CPU path interactive
-      const cur = prog.solid ? scale3 : scale;
-      const next = ms > 120 && cur > 0.2 ? Math.max(0.2, cur * 0.7) : ms < 30 && cur < 1 ? Math.min(1, cur * 1.25) : cur;
-      if (prog.solid) scale3 = next; else scale = next;
+      // adapt resolution to keep the CPU path interactive (pinned when the caller fixed the scale)
+      if (fixedScale === undefined) {
+        const cur = prog.solid ? scale3 : scale;
+        const next = ms > 120 && cur > 0.2 ? Math.max(0.2, cur * 0.7) : ms < 30 && cur < 1 ? Math.min(1, cur * 1.25) : cur;
+        if (prog.solid) scale3 = next; else scale = next;
+      }
       const off = document.createElement("canvas"); off.width = w; off.height = h; off.getContext("2d")!.putImageData(img, 0, 0);
       ctx2d.imageSmoothingEnabled = true; ctx2d.drawImage(off, 0, 0, W, H);
     },

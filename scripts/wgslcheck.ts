@@ -18,6 +18,7 @@ import { Interp, compileTree } from "../src/curv/interp";
 import { buildAtlas } from "../src/gpu/atlas";
 import { EXAMPLES } from "../src/curv/examples";
 import { wrapWGSL } from "../src/gpu/renderer";
+import { SHADER_FLAGS } from "../src/gpu/gen";
 import { createCanvas } from "@napi-rs/canvas";
 
 const { WgslReflect } = (await import("wgsl_reflect/wgsl_reflect.module.js")) as unknown as
@@ -68,6 +69,21 @@ const EXTRA: string[] = [
 const modes = ["slice", "solid"] as const;
 type Mode = (typeof modes)[number];
 
+/**
+ * Branch census: `if (`/`}`else`/`break`/`continue` and short-circuit `&&`/`||` are divergent
+ * control flow; `for (` is a uniform loop and is reported separately.  In the branchless build the
+ * first four must all be zero — that is what "no branching" means, and it is asserted below.
+ */
+const census = (src: string) => {
+  const code = src.replace(/\/\/[^\n]*/g, ""); // the wrapper's own comments mention if/break
+  return {
+  ifs: (code.match(/\bif\s*\(/g) ?? []).length,
+  brks: (code.match(/\bbreak\b|\bcontinue\b/g) ?? []).length,
+  logic: (code.match(/&&|\|\|/g) ?? []).length,
+  loops: (code.match(/\bfor\s*\(/g) ?? []).length,
+  };
+};
+
 const parse = (id: string, mode: Mode, code: string): boolean => {
   try {
     new WgslReflect(code);
@@ -90,14 +106,26 @@ const check = (id: string, src: string): void => {
   const sizes: string[] = [];
   let bad = false;
   for (const mode of modes) {
-    try {
-      const r = interp(900, 600, 0).run(src);
-      if (!r.shape) { console.log(`ERR ${id} [${mode}] no shape`); bad = true; continue; }
-      const c = compileTree(r.shape, atlas, "wgsl", null, undefined, mode);
-      const code = wrapWGSL({ ...c, solid: mode === "solid" });
-      if (!parse(id, mode, code)) { bad = true; continue; }
-      sizes.push(`${mode} ${code.split("\n").length}L`);
-    } catch (e: any) { console.log(`ERR ${id} [${mode}] ${e.message}`); bad = true; }
+    // the 3D wrapper has two flavours (with and without control flow); validate both, and check
+    // the branchless one really has no branches left
+    for (const bl of [false, true]) {
+      const save = { ...SHADER_FLAGS };
+      Object.assign(SHADER_FLAGS, { branchless: bl, branchless3D: bl, noShortCircuit: bl, cullSelect: bl });
+      try {
+        const r = interp(900, 600, 0).run(src);
+        if (!r.shape) { console.log(`ERR ${id} [${mode}] no shape`); bad = true; continue; }
+        const c = compileTree(r.shape, atlas, "wgsl", null, undefined, mode);
+        const code = wrapWGSL({ ...c, solid: mode === "solid" });
+        if (!parse(id, mode, code)) { bad = true; continue; }
+        const b = census(code);
+        if (bl && (b.ifs || b.brks || b.logic)) {
+          console.log(`ERR ${id} [${mode}] branchless build still branches: ${b.ifs} if / ${b.brks} break / ${b.logic} short-circuit`);
+          bad = true; continue;
+        }
+        sizes.push(`${mode}${bl ? "(bl)" : ""} ${code.split("\n").length}L ${b.ifs}i/${b.brks}b/${b.logic}s/${b.loops}L`);
+      } catch (e: any) { console.log(`ERR ${id} [${mode}] ${e.message}`); bad = true; }
+      finally { Object.assign(SHADER_FLAGS, save); }
+    }
   }
   if (bad) fails++;
   else console.log(`OK  ${id.padEnd(24)} ${sizes.join(" / ")}`);

@@ -1,4 +1,4 @@
-# Curv+solve — handoff (dev round 18)
+# Curv+solve — handoff (dev round 19)
 
 Browser playground for **Curv** (2D F-Rep, compiled to WGSL / JS) extended with
 `solve { }` constraint blocks solved by **psolve** (LP + convex QP, WebAssembly).
@@ -13,6 +13,7 @@ Headless checks (all use the JS backend, no browser needed):
 | `npx tsx scripts/memotest.ts` | solve-block **and call-memo** dependency tests (time/mouse/viewport through closures, shadowing, mutations, impure bodies, `print`/`parametric`, node identity …) |
 | `npx tsx scripts/threedcheck.ts` | **round-17 3D gate**: every example evaluates; the 3D group compiles in solid mode on both backends; `bbox3` sanity; `is_2d`/`is_3d` + dimensional `bbox` of the shape record; the CPU raymarcher really draws (centre lit / background outside / slice parity / animation divergence) |
 | `npx tsx scripts/stdcheck.ts` | **C++ `std.curv` parity**: prelude values (`transpose`, `sort`, `contains`, colours …), 2D/3D boxes against the C++ formulas, and — the load-bearing part — the *generated* field sampled on a grid: no non-finite distance anywhere, and no point inside the shape outside its own `bbox3` |
+| `npx tsx scripts/branchbench.ts [id …]` | **round-19 branch-vs-branchless benchmark**: times five builds (`branching`, `noShortCircuit`, `+cullSelect`, `branchless` bodies, `branchless` raymarch) on the CPU fallback at a pinned resolution, interleaved, and counts the `if`/`break`/`&&` that remain in the WGSL |
 | `npx tsx scripts/wgslcheck.ts` | **round-18 WGSL gate**: parses the **whole** shader the GPU sees (`wrapWGSL`, wrapper included) for every example *and* a list of codegen corner cases, in **both** view modes (50 shaders).  Needed because the JS/CPU target accepts things WGSL does not: `if (dd > FAR) break;` in the 3D raymarch loop shipped green through every gate and failed only in the browser |
 | `npx tsx scripts/pdiff.ts [--update] [id …]` | **golden pixel gate**: renders every example headlessly (slice mode at 240×160 + solid mode at 96×64 for the 3D group), hashes the framebuffer and compares with `scripts/golden/pdiff.json`; counts non-finite distances per frame. `--update` (re)writes the goldens after an intended change |
 | `npx tsx scripts/warmcheck.ts` | **round-14 bridge oracle**: warm→cold drag equivalence (plan P0.2 acceptance: pixel-identity), failure degradation/recovery with **no memo pollution**, first-frame certified-infeasible error message, wall-clock **budget → STOPPED + approximate incumbent (never garbage)**, budget ladder certifies |
@@ -23,7 +24,62 @@ Headless checks (all use the JS backend, no browser needed):
 
 All eleven check scripts were green at the end of this round (`paramcheck` / `memotest` / `warmcheck` / `threedcheck` / `wgslcheck` / `stdcheck` / `pdiff` exit 1 on any failure — check the exit code).  `pdiff` and `stdcheck` run with `setSolveBudget(0)`: the UI's 16 ms per-solve budget can hand back an incumbent that depends on machine load, which would make a golden frame flaky.
 
-## What changed in this round (18) — the 3D view never compiled on a GPU, and the gate that would have said so
+## What changed in this round (19) — branchless shaders: built, measured, and mostly *not* shipped
+
+The round-18 bug (a brace-less `if` in the hand-written WGSL wrapper) invited the obvious cure:
+generate **no branching at all**.  `Gen` can now lower control flow instead of emitting it:
+
+* `assign` under a condition → `x = select(x, v, cond)` (WGSL) / `x = (cond ? v : x)` (JS);
+* `if`/`else` → **both** arms emitted, each guarded by the condition (or its negation) — no control
+  flow, and assignments compose, so nesting works without any special case;
+* `break` → a per-loop `live` flag cleared *at the break site* (clearing it only at the end of the
+  iteration lets one more body run — that bug cost an afternoon and showed up as a wrong Mandelbrot);
+* `&&`/`||` → non-short-circuiting `&`/`|`, which WGSL also defines for `bool`;
+* loops stay: a `for` whose trip count is a parameter is uniform, not divergent.
+
+Four flags (`src/gpu/gen.ts`): `branchless` (master: masked `if`s/`break`s *and* the 3D raymarch),
+`noShortCircuit`, `cullSelect` (only the bbox-cull bracket), `branchless3D` (only the raymarch).
+All are in `flagsKey()`, so cached code is never confused across them.
+
+**Result: zero `if`, `else`, `break`, `continue` and zero short-circuit operators** in the
+branchless build — every example and every corner case, in both view modes — and `wgslcheck`
+now *asserts* that (it parses both flavours and fails if the branchless one still branches).
+`pdiff` is 35/35 identical with **either** build, as are `threedcheck` and `stdcheck`: the two
+builds are the same program, only the price differs.
+
+### Measured (`scripts/branchbench.ts`, CPU fallback, best-of-N, resolution pinned)
+
+| build | 2D slice | 3D solid (3D group) |
+|---|---|---|
+| branching (round-18 default) | 1.00× | 1.00× |
+| `noShortCircuit` (`&&`→`&`) | **1.00×** | **1.02×** |
+| `+cullSelect` | 2.79× | 1.01× |
+| `branchless` (bodies + raymarch) | **3.05×** | **9.72×** |
+
+Worst cases, all from removing a branch that was *doing work*: a text-heavy 2D tree rendered in the
+3D view (`buttons` 19.3×, `split` 17.9×, `dashboard` 17.7× — the glyph loop samples the atlas for
+every glyph of every label at every pixel once `if (inside cell)` is gone), and the raymarch
+(9.7× — every ray now runs all 128 steps and is shaded even when it hits nothing).
+
+**Why it cannot be cheap:** two of the branches are load-bearing optimisations, not artefacts.
+The bbox-cull branch *skips a whole subtree* for pixels outside its box, and the raymarch's
+early-out *stops marching*.  A branchless build must evaluate both sides, so it is ≥ the branching
+build in ALU work by construction; what it buys is warp coherence, which here is worth far less
+than the work it costs.
+
+**Shipped:** `noShortCircuit: true` (measured free, and it removes every `&&`/`||` from the
+generated code — on a GPU that is a real branch removed for one AND).  `branchless`, `cullSelect`
+and `branchless3D` stay off: implemented, documented, benchable with one flag, and shown above.
+`polygon` is the one example that got *faster* branchless (0.72×, `polySelect` replaces a `%`),
+which is a nudge towards measuring `polySelect` on its own.
+
+Caveat, stated plainly: **these are CPU-fallback numbers.**  Headless Node here has no WebGPU
+device (`@kmamal/gpu`/Dawn hangs with no adapter), so the GPU side of the trade is unmeasured —
+the ALU increase is the same, the coherence win is not, and the browser preview is the only oracle.
+
+## Round 18 recap (kept from the round-18 handoff — all still in force)
+
+### The 3D view never compiled on a GPU, and the gate that would have said so
 
 **The bug.**  `wrapWGSL3D`'s raymarch loop contained `if (dd > FAR) break;` and `if (tt > FAR) break;`.
 In WGSL the body of an `if` must be a *compound* statement, so both are syntax errors — naga reports
@@ -516,6 +572,14 @@ scripts/                selftest, paramcheck, memotest, warmcheck, threedcheck, 
     camera fit frames `bbox3Of`, so a too-small box clips the view) — `stdcheck` asserts it by sampling;
   - nothing may produce a non-finite distance: one NaN lane poisons a pixel (`min`/`length`) or a whole
     frame.  `mod(x, 0)`, `normalize(0)`, `x/0` and vector-size mismatches are the usual suspects.
+* **Two branches are load-bearing, do not "optimise" them away.**  The bbox-cull bracket in
+  `kidCulled` skips a whole subtree for pixels outside its box, and the 3D raymarch's `break` stops
+  marching when a ray hits or escapes.  Round 19 measured the branchless lowering of both: 2.8–3.0×
+  slower in the 2D view and 9.7× in the 3D view (up to 19× for label-heavy trees in the 3D view).
+  A branchless build is ≥ the branching build in ALU work *by construction* — it computes both
+  sides — so only measure it, never assume it.  The one branch that is free to remove is
+  short-circuit: `&&`/`||` → `&`/`|` measured 1.00× and is the shipped default
+  (`SHADER_FLAGS.noShortCircuit`).
 * **Hand-written shader text is per-backend code, and only one backend ever runs it.**  `wrapWGSL2D`
   / `wrapWGSL3D` (WGSL) and the two `new Function` bodies in `createCPU` (JS) are written by hand;
   the headless gates use the CPU renderer and the browser uses WebGPU, so neither exercises the
@@ -645,6 +709,9 @@ scripts/                selftest, paramcheck, memotest, warmcheck, threedcheck, 
   to the child's), `chamfer` folds a list instead of taking exactly two shapes, and 2D `inter` keeps
   its own AA-aware colour rule (`sel(b.d > acc.d, …)`) instead of C++'s "`colour = s1.colour`" — the
   solid-mode rule does follow C++.
+  A GPU-side branch-vs-branchless measurement is **missing**: `scripts/branchbench.ts` can only
+  time the CPU fallback (no WebGPU device in headless Node), so the round-19 3×/9.7× numbers are
+  CPU numbers — the ALU half of the trade is the same on a GPU, the coherence half is not.
   The WGSL path is **syntax-checked only**: no headless WebGPU device exists in this environment
   (`@kmamal/gpu` + Dawn hangs with no adapter), so type errors, uniform-layout questions and how a
   real GPU rasterises the 3D view are unverified — the sandbox's browser preview is the only oracle.
