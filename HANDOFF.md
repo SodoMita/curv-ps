@@ -159,7 +159,8 @@ window cannot squeeze a panel down to its title).  **Every seam between two regi
 (`src/components/Splitter.tsx`): the one between the canvas and the row takes an explicit height,
 the vertical one between the editor column and the preview column takes an explicit width, the seam
 between two open panels trades height between just those two (the pair's total is untouched, so the
-third panel never moves), and the reference drawer has one on its top edge.  Double-click — or Enter —
+third panel never moves), the reference drawer has one on its top edge, and the code view (the WGSL/JS
+overlay) has one on its bottom edge, so it can be made short enough to keep the picture in sight.  Double-click — or Enter —
 hands any of them back to the layout, the arrow keys nudge a focused seam by 16px, and each drag is
 floored (a panel keeps 44px, the editor column 280px, the preview 360px) and clamped to the window, so
 no region can be dragged out of existence; a dragged size is re-clamped when the window changes under

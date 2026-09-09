@@ -534,6 +534,13 @@ export default function App() {
   const [refPx, setRefPx] = useState<number | null>(null);
   const refRef = useRef<HTMLDivElement>(null);
   const refSt = useRef(0);
+
+  // the code view floats over the canvas: its bottom edge is draggable, so it can be made short
+  // enough to keep an eye on the picture it is describing
+  const [codeH, setCodeH] = useState<number | null>(null);
+  const codePanelRef = useRef<HTMLDivElement>(null);
+  const codeBoxRef = useRef<HTMLDivElement>(null);
+  const codeSt = useRef({ h: 0, max: 0 });
   const fmtZoom = (z: number) => (z >= 100 ? z.toFixed(0) : z >= 1 ? z.toFixed(z >= 10 ? 1 : 2) : z.toPrecision(2));
 
   return (
@@ -636,7 +643,7 @@ export default function App() {
                 <input type="checkbox" checked={debugBoxes} onChange={(e) => setDebugBoxes(e.target.checked)} className={cn(debugBoxes ? "accent-[#ff73b5]" : "accent-[#7c5cff]")} />debug boxes</label>
               <button onClick={() => setShowCode((s) => !s)} className={cn("rounded-md border border-line px-2 py-0.5 hover:bg-surface-2", showCode && "bg-surface-3 text-fg")}>{renderer.current?.kind === "cpu" ? "JS" : "WGSL"}</button>
             </div>
-            <div className="relative min-h-0 flex-1 overflow-hidden bg-[#0e1322] p-3 sm:p-4"
+            <div ref={codeBoxRef} className="relative min-h-0 flex-1 overflow-hidden bg-[#0e1322] p-3 sm:p-4"
               style={{ backgroundImage: "radial-gradient(circle at 1px 1px, #1d2537 1px, transparent 0)", backgroundSize: "20px 20px" }}>
               <div className="mx-auto h-full transition-[width] duration-150" style={{ width: `${previewPct}%` }}>
                 <canvas ref={canvasRef} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={endPointer}
@@ -651,7 +658,9 @@ export default function App() {
                 </div>
               )}
               {showCode && (
-                <div className="absolute inset-3 flex flex-col overflow-hidden rounded-xl border border-line bg-ink/95 sm:inset-4">
+                <div ref={codePanelRef} style={{ bottom: codeH ?? undefined }}
+                  className={cn("absolute left-3 right-3 top-3 sm:left-4 sm:right-4 sm:top-4", codeH === null && "bottom-3 sm:bottom-4")}>
+                <div className="flex h-full min-h-0 flex-col overflow-hidden rounded-xl border border-line bg-ink/95">
                   <div className="flex items-center gap-2 border-b border-line px-3 py-1 font-mono text-[10.5px] text-muted">
                     <span className="text-fg">{renderer.current?.kind === "cpu" ? "JS · CPU fallback" : "WGSL"}</span>
                     <div className="flex overflow-hidden rounded border border-line">
@@ -664,6 +673,12 @@ export default function App() {
                     <span className="ml-auto">{((codeView === "whole" ? whole : code) || "").split("\n").length} lines</span>
                   </div>
                   <pre className="min-h-0 flex-1 overflow-auto p-3 font-mono text-[10.5px] leading-snug text-fg/80">{(codeView === "whole" ? whole : code) || "// nothing compiled yet"}</pre>
+                </div>
+                <Splitter dir="row" variant="overlay" className="-bottom-[4px] left-0 right-0 h-[8px]"
+                  title="Drag to give the code view more or less height · double-click to hand it back to the layout"
+                  onBegin={() => { codeSt.current = { h: codePanelRef.current?.getBoundingClientRect().height ?? 0, max: Math.max(140, (codeBoxRef.current?.clientHeight ?? 600) - 40) }; }}
+                  onMove={(d) => setCodeH(Math.max(120, Math.min(codeSt.current.max, codeSt.current.h + d)))}
+                  onReset={() => setCodeH(null)} />
                 </div>
               )}
             </div>
