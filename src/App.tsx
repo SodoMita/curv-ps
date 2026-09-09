@@ -471,14 +471,15 @@ export default function App() {
   // are wide tables, and three of them side by side are three narrow tables.
   const [folded, setFolded] = useState({ params: false, solver: false, gen: false });
   const fold = (k: "params" | "solver" | "gen") => setFolded((f) => ({ ...f, [k]: !f[k] }));
-  const col = (open: boolean, w: string) => (open ? w : "30px");
-  const cols = [
-    params.length ? col(!folded.params, "minmax(200px,24%)") : null,
-    traces.length ? col(!folded.solver, "minmax(0,1fr)") : null,
-    col(!folded.gen, "minmax(230px,28%)"),
+  // stacked, not side by side: a folded panel is a bar (auto), an open one takes a share of the row
+  const rows = [
+    params.length ? (folded.params ? "auto" : "minmax(0,1fr)") : null,
+    traces.length ? (folded.solver ? "auto" : "minmax(0,1fr)") : null,
+    folded.gen ? "auto" : "minmax(0,1fr)",
   ].filter(Boolean).join(" ");
-  const bottomCount = 1 + (params.length ? 1 : 0) + (traces.length ? 1 : 0);
-  const anyOpen = (params.length && !folded.params) || (traces.length && !folded.solver) || !folded.gen;
+  const openCount = (params.length && !folded.params ? 1 : 0) + (traces.length && !folded.solver ? 1 : 0) + (!folded.gen ? 1 : 0);
+  // the row grows with what is open, and shrinks to a stack of bars when nothing is
+  const rowH = openCount === 0 ? "auto" : openCount === 1 ? "minmax(160px,28%)" : openCount === 2 ? "minmax(210px,38%)" : "minmax(260px,48%)";
   const fmtZoom = (z: number) => (z >= 100 ? z.toFixed(0) : z >= 1 ? z.toFixed(z >= 10 ? 1 : 2) : z.toPrecision(2));
 
   return (
@@ -541,7 +542,7 @@ export default function App() {
         </section>
 
         {/* right: preview + panels (first on mobile so the canvas is what you see and touch) */}
-        <section className={cn("order-first grid min-h-[80vh] lg:order-none lg:min-h-0", !anyOpen ? "grid-rows-[minmax(0,1fr)_auto]" : bottomCount > 1 ? "grid-rows-[minmax(0,1fr)_minmax(170px,34%)]" : "grid-rows-[minmax(0,1fr)_minmax(150px,26%)]")}>
+        <section className={cn("order-first grid min-h-[80vh] lg:order-none lg:min-h-0", `grid-rows-[minmax(0,1fr)_${rowH}]`)}>
           <div className="flex min-h-0 flex-col">
             <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 border-b border-line px-3 py-2 text-[11px] text-muted sm:px-4">
               <span className="font-semibold uppercase tracking-[0.14em]">Preview</span>
@@ -604,10 +605,10 @@ export default function App() {
               )}
             </div>
           </div>
-          <div className="grid min-h-0 border-t border-line bg-ink" style={{ gridTemplateColumns: cols }}>
-            {params.length > 0 && <div className="min-h-0 overflow-auto border-r border-line"><ParamsPanel params={params} values={paramValues} onChange={(n, v) => setParamValues((p) => ({ ...p, [n]: v }))} onReset={() => setParamValues({})} collapsed={folded.params} onToggle={() => fold("params")} /></div>}
-            {traces.length > 0 && <div className="min-h-0 border-r border-line"><SolverPanel traces={traces} evalMs={stats.evalMs} fps={stats.fps} collapsed={folded.solver} onToggle={() => fold("solver")} /></div>}
-            <div className="min-h-0 bg-surface/40"><GenOptions flags={gen} onChange={applyGen} census={census} collapsed={folded.gen} onToggle={() => fold("gen")} /></div>
+          <div className="grid min-h-0 border-t border-line bg-ink" style={{ gridTemplateRows: rows }}>
+            {params.length > 0 && <div className="min-h-0 overflow-hidden border-b border-line"><ParamsPanel params={params} values={paramValues} onChange={(n, v) => setParamValues((p) => ({ ...p, [n]: v }))} onReset={() => setParamValues({})} collapsed={folded.params} onToggle={() => fold("params")} /></div>}
+            {traces.length > 0 && <div className="min-h-0 overflow-hidden border-b border-line"><SolverPanel traces={traces} evalMs={stats.evalMs} fps={stats.fps} collapsed={folded.solver} onToggle={() => fold("solver")} /></div>}
+            <div className="min-h-0 overflow-hidden bg-surface/40"><GenOptions flags={gen} onChange={applyGen} census={census} collapsed={folded.gen} onToggle={() => fold("gen")} /></div>
           </div>
         </section>
       </div>

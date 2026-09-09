@@ -1,11 +1,11 @@
 import type { ParamDesc } from "../curv/interp";
-import { CollapseButton, CollapsedStrip } from "./Panel";
+import { CollapseButton, CollapsedBar } from "./Panel";
 
 type V = number | boolean | number[];
 interface Props { params: ParamDesc[]; values: Record<string, V>; onChange: (name: string, v: V) => void; onReset: () => void; collapsed?: boolean; onToggle?: () => void }
 
 export function ParamsPanel({ params, values, onChange, onReset, collapsed, onToggle }: Props) {
-  if (collapsed) return <CollapsedStrip title="parametric" sub={`${params.length}`} onOpen={onToggle ?? (() => {})} />;
+  if (collapsed) return <CollapsedBar title="parametric" sub={`${params.length}`} onOpen={onToggle ?? (() => {})} />;
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div className="flex items-center justify-between border-b border-line px-4 py-2">

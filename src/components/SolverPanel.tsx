@@ -1,6 +1,6 @@
 import type { SolveTrace } from "../curv/interp";
 import { psolveInfo } from "../psolve/psolve";
-import { CollapseButton, CollapsedStrip } from "./Panel";
+import { CollapseButton, CollapsedBar } from "./Panel";
 
 function StatusPill({ t }: { t: SolveTrace }) {
   const label = t.degraded ? t.degraded!.verdict : (t.verdict ?? t.status);
@@ -19,7 +19,7 @@ function StatusPill({ t }: { t: SolveTrace }) {
 
 export function SolverPanel({ traces, evalMs, fps, collapsed, onToggle }: { traces: SolveTrace[]; evalMs: number; fps: number; collapsed?: boolean; onToggle?: () => void }) {
   const info = psolveInfo();
-  if (collapsed) return <CollapsedStrip title="solver trace" sub={`${traces.length}`} onOpen={onToggle ?? (() => {})} />;
+  if (collapsed) return <CollapsedBar title="solver trace" sub={`${traces.length}`} onOpen={onToggle ?? (() => {})} />;
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div className="flex items-center justify-between border-b border-line px-4 py-2">

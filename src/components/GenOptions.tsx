@@ -1,5 +1,5 @@
 import { cn } from "../utils/cn";
-import { CollapseButton, CollapsedStrip } from "./Panel";
+import { CollapseButton, CollapsedBar } from "./Panel";
 
 /**
  * Shader-generation options (the `SHADER_FLAGS` of src/gpu/gen.ts), as a panel at the bottom of the
@@ -32,7 +32,7 @@ export interface Census {
 }
 
 export function GenOptions({ flags, onChange, census, collapsed, onToggle }: { flags: GenFlags; onChange: (p: Partial<GenFlags>) => void; census: Census; collapsed?: boolean; onToggle?: () => void }) {
-  if (collapsed) return <CollapsedStrip title="shader generation" sub={flags.branchless ? "branchless" : "branched"} onOpen={onToggle ?? (() => {})} />;
+  if (collapsed) return <CollapsedBar title="shader generation" sub={flags.branchless ? "branchless" : "branched"} onOpen={onToggle ?? (() => {})} />;
   // a row that is implied by the master switch: shown as on, not editable
   const implied = (k: "noShortCircuit" | "cullSelect" | "branchless3D") => flags.branchless && flags[k];
   const row = (label: string, flag: keyof GenFlags, hint: string, force?: boolean) => (
