@@ -23,8 +23,8 @@ in union [ card L.side, for (c in L.cards) card c ]
 Highlights: the bottom **shader generation** panel switches the shader generator between `branched` (bbox-cull and
 raymarch early-outs) and `branchless` (no `if`, no `break`, no short-circuit — both arms of every branch evaluated,
 measured 3× slower in 2D and 10× in the 3D view) and exposes the other codegen options (cull weight, loop unrolling,
-polygon/text/SubCurv variants), each with its measured cost — the panel folds to a vertical strip, as do the
-parametric and solver-trace panels beside it; the **`WGSL` / `JS` view** shows the *whole* shader the backend compiles (uniforms, entry point
+polygon/text/SubCurv variants), each with its measured cost — it stacks with the parametric and solver-trace
+panels, and any of the three folds to a thin labelled bar; the **`WGSL` / `JS` view** shows the *whole* shader the backend compiles (uniforms, entry point
 and the 3D raymarch loop), with the generated body one click away; shaders are reused across frames (only a parameter buffer is refilled by a memoised tree walk), a `solve`
 block whose inputs (free variables, tracked through closures, shapes hashed by content) did not change is not
 re-evaluated at all, unchanged numeric problems are additionally served from a fingerprint cache, pure user functions

@@ -148,10 +148,12 @@ which is a nudge towards measuring `polySelect` on its own.
 `SHADER_FLAGS` option, each with its measured cost in the tooltip, plus a live branch
 census of the last compiled shader (`N lines · i if · b break · s && || · L loops`).  (It started as a
 popover off the toolbar; ten options and their costs do not fit in one and cannot be read while
-dragging a slider, so it is a panel now — the last of the bottom row's three panels.)  All three bottom panels (parametric, solver trace, shader generation) **fold**: each has a chevron in
-its header and collapses to a 30px vertical strip titled down the side (`src/components/Panel.tsx`),
-so folding one gives the others its width instead of hiding it.  Three wide tables side by side were
-three narrow tables; the row shrinks to `auto` height when all of them are folded.  Flipping an option
+dragging a slider, so it is a panel now — the last of the bottom row's three panels.)  All three bottom panels (parametric, solver trace, shader generation) **stack and fold**: they sit one
+above the other at full width — three columns of a wide table were three narrow tables — and each has
+a chevron in its header that folds it to a thin horizontal bar, its title left to right
+(`src/components/Panel.tsx`).  Folding one gives the others its height instead of hiding it, and the
+row itself grows with what is open (28% for one panel, 38% for two, 48% for three) and shrinks to a
+stack of bars when everything is folded.  Flipping an option
 mutates `SHADER_FLAGS` and clears `lastProg`/`staticCache`; three `wgslcheck` checks keep that honest:
 switching to `branchless` must produce different code (not a reused shader), switching back must restore
 the old text, and the **parameter layout must not move** (292 params either way) — the menu cannot be
