@@ -90,9 +90,15 @@ ${c.code}
   let fw = normalize(tgt - ro);
   let rt = normalize(cross(fw, vec3f(0.0, 1.0, 0.0)));
   let up = cross(rt, fw);
-  let nd = vec2f(1.0, -1.0) * (fc.xy / u.atlas.w - u.res * 0.5) * 2.0;
+  // normalised device coords in [-1, 1] — the CPU marcher divides by (res * 0.5); this used to
+  // multiply by 2.0 instead, which made nd ~res wide (e.g. ±800), so every ray left at a right
+  // angle to the view direction and the 3D view came out empty on the GPU while the CPU path
+  // (and therefore every headless gate) looked fine.
+  let nd = vec2f(1.0, -1.0) * (fc.xy / u.atlas.w - u.res * 0.5) / (u.res * 0.5);
   let rd = normalize(fw + rt * (nd.x * u.cam3b.z * u.cam3b.w) + up * (nd.y * u.cam3b.z));
-  const FAR = 400.0;
+  // the far plane follows the camera: a viewport-sized 2D program is ~900 units across and the
+  // auto-fit puts the eye ~1900 units out, where a fixed 400-unit far plane never reaches it
+  let FAR = max(400.0, rad * 6.0);
   var tt = 0.02;
   var hit = false;
   for (var i = 0u; i < 128u; i = i + 1u) {
@@ -139,9 +145,15 @@ ${c.code}
   let fw = normalize(tgt - ro);
   let rt = normalize(cross(fw, vec3f(0.0, 1.0, 0.0)));
   let up = cross(rt, fw);
-  let nd = vec2f(1.0, -1.0) * (fc.xy / u.atlas.w - u.res * 0.5) * 2.0;
+  // normalised device coords in [-1, 1] — the CPU marcher divides by (res * 0.5); this used to
+  // multiply by 2.0 instead, which made nd ~res wide (e.g. ±800), so every ray left at a right
+  // angle to the view direction and the 3D view came out empty on the GPU while the CPU path
+  // (and therefore every headless gate) looked fine.
+  let nd = vec2f(1.0, -1.0) * (fc.xy / u.atlas.w - u.res * 0.5) / (u.res * 0.5);
   let rd = normalize(fw + rt * (nd.x * u.cam3b.z * u.cam3b.w) + up * (nd.y * u.cam3b.z));
-  const FAR = 400.0;
+  // the far plane follows the camera: a viewport-sized 2D program is ~900 units across and the
+  // auto-fit puts the eye ~1900 units out, where a fixed 400-unit far plane never reaches it
+  let FAR = max(400.0, rad * 6.0);
   var tt = 0.02;
   var hit = 0.0;    // 1 once the ray reached a surface
   var live = 1.0;   // 1 while the ray is still marching (0 after a hit, an escape or a NaN)
@@ -311,8 +323,8 @@ const HOME3: Camera3 = { tx: 0, ty: 0, tz: 0, dist: 14, yaw: 0.65, pitch: 0.42, 
 
 // shared 3D raymarcher (CPU path); `step`/`col` evaluate the generated body at a ray position
 let nanCount = 0; // non-finite distances seen by march3 (mirrored into renderer stats.nan)
-function march3(step: (q: number[]) => number, col: (q: number[]) => number[], ro: number[], rd: number[], e: number, bg: number[]): number[] {
-  const FAR = 400;
+function march3(step: (q: number[]) => number, col: (q: number[]) => number[], ro: number[], rd: number[], e: number, bg: number[], far: number): number[] {
+  const FAR = Math.max(400, far);   // mirrors the WGSL wrapper: a viewport-sized program sits ~1900 units out
   let tt = 0.02; let hit = false;
   for (let i = 0; i < 128; i++) {
     const dd = step([ro[0] + rd[0] * tt, ro[1] + rd[1] * tt, ro[2] + rd[2] * tt]);
@@ -345,8 +357,8 @@ function shade3(step: (q: number[]) => number, col: (q: number[]) => number[], r
  * `break` — a `live` factor retires the ray, so all 128 steps run and the shading is computed for
  * every pixel and then discarded with a select.  Same pixels, no divergence, more work.
  */
-function march3b(step: (q: number[]) => number, col: (q: number[]) => number[], ro: number[], rd: number[], e: number, bg: number[]): number[] {
-  const FAR = 400;
+function march3b(step: (q: number[]) => number, col: (q: number[]) => number[], ro: number[], rd: number[], e: number, bg: number[], far: number): number[] {
+  const FAR = Math.max(400, far);
   let tt = 0.02, hit = 0, live = 1;
   for (let i = 0; i < 128; i++) {
     const dd = step([ro[0] + rd[0] * tt, ro[1] + rd[1] * tt, ro[2] + rd[2] * tt]);
@@ -451,7 +463,7 @@ ${c.code}
             const rl2 = Math.hypot(rd0[0], rd0[1], rd0[2]) || 1;
             const rd = [rd0[0] / rl2, rd0[1] / rl2, rd0[2] / rl2];
             const march = SHADER_FLAGS.branchless3D || SHADER_FLAGS.branchless ? march3b : march3;
-            const rgb = march((q) => step(P, time, q), (q) => col(P, time, q), ro, rd, e, bgpx);
+            const rgb = march((q) => step(P, time, q), (q) => col(P, time, q), ro, rd, e, bgpx, c3.dist * 6);
             if (nanCount) { stats.nan += nanCount; nanCount = 0; }
             const q = (j * w + i) * 4;
             img.data[q] = rgb[0]; img.data[q + 1] = rgb[1]; img.data[q + 2] = rgb[2]; img.data[q + 3] = 255;

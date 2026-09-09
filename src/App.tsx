@@ -185,7 +185,10 @@ export default function App() {
   const viewportOf = (W: number, H: number, c: Camera) => ({ x: c.cx - W / (2 * c.zoom), y: c.cy - H / (2 * c.zoom), w: W / c.zoom, h: H / c.zoom });
   const worldMouse = useCallback(() => {
     const cv = canvasRef.current!; const m = mousePx.current; const c = cam.current;
-    if (m.x < -1e5) return { x: -1e6, y: -1e6, down: false };
+    // no pointer yet: report the middle of the view, not a far-away sentinel.  A program that
+    // places geometry at the mouse (the constrained tooltip) would otherwise stretch its bbox to
+    // ±1e6 and the one-shot camera fit would zoom out by six orders of magnitude.
+    if (m.x < -1e5) return { x: c.cx, y: c.cy, down: false };
     return { x: (m.x - cv.clientWidth / 2) / c.zoom + c.cx, y: -(m.y - cv.clientHeight / 2) / c.zoom + c.cy, down: m.down };
   }, []);
   const setCam = useCallback((c: Camera) => {
@@ -534,7 +537,9 @@ export default function App() {
                 <span className="w-9 font-mono">{previewPct}%</span>
               </label>
               <button onClick={() => setBgMode((m) => (m === "light" ? "dark" : "light"))} title="Background" className="rounded-md border border-line px-2 py-0.5 font-mono hover:bg-surface-2">{bgMode === "light" ? "☼ light" : "☾ dark"}</button>
-              <label className="flex items-center gap-1.5"><input type="checkbox" checked={debugBoxes} onChange={(e) => setDebugBoxes(e.target.checked)} className="accent-[#7c5cff]" />boxes</label>
+              <label title="Debug overlay: outline every solved box in pink.  It draws the boxes the solver computed — a drawing aid, not an optimisation (it adds shapes, so it costs a little)."
+                className={cn("flex items-center gap-1.5", debugBoxes && "text-[#ff73b5]")}>
+                <input type="checkbox" checked={debugBoxes} onChange={(e) => setDebugBoxes(e.target.checked)} className={cn(debugBoxes ? "accent-[#ff73b5]" : "accent-[#7c5cff]")} />boxes</label>
               <button onClick={() => setShowCode((s) => !s)} className={cn("rounded-md border border-line px-2 py-0.5 hover:bg-surface-2", showCode && "bg-surface-3 text-fg")}>{renderer.current?.kind === "cpu" ? "JS" : "WGSL"}</button>
               <GenOptions flags={gen} onChange={applyGen} census={census} />
             </div>
