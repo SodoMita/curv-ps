@@ -73,6 +73,14 @@ and `branchless3D` stay off: implemented, documented, benchable with one flag, a
 `polygon` is the one example that got *faster* branchless (0.72×, `polySelect` replaces a `%`),
 which is a nudge towards measuring `polySelect` on its own.
 
+**In the UI:** the preview toolbar has a `gen: branched | branchless` menu (`src/components/GenOptions.tsx`)
+that exposes every `SHADER_FLAGS` option, each with its measured cost in the tooltip, plus a live branch
+census of the last compiled shader (`N lines · i if · b break · s && || · L loops`).  Flipping an option
+mutates `SHADER_FLAGS` and clears `lastProg`/`staticCache`; three `wgslcheck` checks keep that honest:
+switching to `branchless` must produce different code (not a reused shader), switching back must restore
+the old text, and the **parameter layout must not move** (292 params either way) — the menu cannot be
+allowed to invalidate the memoised tree walk.
+
 Caveat, stated plainly: **these are CPU-fallback numbers.**  Headless Node here has no WebGPU
 device (`@kmamal/gpu`/Dawn hangs with no adapter), so the GPU side of the trade is unmeasured —
 the ALU increase is the same, the coherence win is not, and the browser preview is the only oracle.
@@ -511,6 +519,8 @@ src/curv/shapes.ts      SNode F-Rep tree, bboxOf/bbox3Of (memoised), flags3Of, t
 src/curv/prelude.ts     palette, box helpers, layout combinators (incl. flow / hstack_fit), UI components — in Curv
 src/curv/examples.ts    example programs (group "solve" | "curv" | "3d")
 src/gpu/gen.ts          code generators: WGSL, JS, ParamsOnly; dynBlock/finalParams; Gen.usesTime
+src/components/GenOptions.tsx  the preview toolbar's shader-generation menu (branched / branchless + every
+                        SHADER_FLAGS option, with measured costs and a branch census)
 src/gpu/renderer.ts     WebGPU renderer (pipeline cache keyed by code, timestamp queries) + CPU
                         fallback; 3D raymarch (WGSL `stepf`/`colf` + CPU `march3`), orbit camera,
                         per-mode pipeline caches, `stats.nan` counter

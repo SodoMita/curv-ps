@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Editor } from "./components/Editor";
 import { SolverPanel } from "./components/SolverPanel";
 import { Reference } from "./components/Reference";
@@ -9,6 +9,8 @@ import { CurvError } from "./curv/parser";
 import { bboxOf, bbox3Of, finiteBBox, type SNode } from "./curv/shapes";
 import { buildAtlas, type Atlas } from "./gpu/atlas";
 import { createRenderer, type Renderer, type Camera, type Camera3 } from "./gpu/renderer";
+import { SHADER_FLAGS, flagsKey } from "./gpu/gen";
+import { GenOptions, type GenFlags, type Census } from "./components/GenOptions";
 import { loadPsolve } from "./psolve/psolve";
 import { cn } from "./utils/cn";
 
@@ -40,6 +42,16 @@ export default function App() {
   const [debugBoxes, setDebugBoxes] = useState(false);
   const [bgMode, setBgMode] = useState<"light" | "dark">("light");
   const [showCode, setShowCode] = useState(false);
+  // shader-generation options (SHADER_FLAGS); every flag is part of the structural key, so a change
+  // recompiles and refills nothing else — but the static-skip fingerprint has to know about them
+  const [gen, setGen] = useState<GenFlags>({ ...SHADER_FLAGS });
+  const applyGen = useCallback((patch: Partial<GenFlags>) => {
+    Object.assign(SHADER_FLAGS, patch);
+    setGen((g) => ({ ...g, ...patch }));
+    lastProg.current = null;      // force a fresh compile (the structural key already differs)
+    staticCache.current = null;   // …and do not let the static-skip fingerprint answer instead
+    dirty.current = true;
+  }, []);
   const [code, setCode] = useState("");
   const [paused, setPaused] = useState(false);
   const [animated, setAnimated] = useState(false);
@@ -205,7 +217,7 @@ export default function App() {
       }
     };
     // everything below except the camera is a program input; the camera/screen size are render uniforms only
-    const fp = srcRef.current + "\u0001" + JSON.stringify(paramRef.current) + "\u0001" + debugRef.current + "\u0001" + (solid ? "3d" : "2d");
+    const fp = srcRef.current + "\u0001" + JSON.stringify(paramRef.current) + "\u0001" + debugRef.current + "\u0001" + (solid ? "3d" : "2d") + "\u0001" + flagsKey();
     const sk = staticCache.current, prog0 = lastProg.current;
     const needFitNow = solid ? needFit3.current : needFit.current;
     if (sk && sk.fp === fp && prog0 && !needFitNow) {
@@ -431,6 +443,11 @@ export default function App() {
     setMode(ex.group === "3d" ? "3d" : "2d"); // 3D examples open in the solid view
   };
   const example = EXAMPLES.find((e) => e.id === exampleId);
+  // branch census of the last compiled shader body (the 3D wrapper adds its own 4 ifs / 3 breaks)
+  const census: Census = useMemo(() => {
+    const strip = code.replace(/\/\/[^\n]*/g, "");
+    return { lines: code ? code.split("\n").length : 0, ifs: (strip.match(/\bif\s*\(/g) ?? []).length, brks: (strip.match(/\bbreak\b|\bcontinue\b/g) ?? []).length, logic: (strip.match(/&&|\|\|/g) ?? []).length, loops: (strip.match(/\bfor\s*\(/g) ?? []).length };
+  }, [code]);
   const bottomCount = (params.length ? 1 : 0) + (traces.length ? 1 : 0);
   const fmtZoom = (z: number) => (z >= 100 ? z.toFixed(0) : z >= 1 ? z.toFixed(z >= 10 ? 1 : 2) : z.toPrecision(2));
 
@@ -519,6 +536,7 @@ export default function App() {
               <button onClick={() => setBgMode((m) => (m === "light" ? "dark" : "light"))} title="Background" className="rounded-md border border-line px-2 py-0.5 font-mono hover:bg-surface-2">{bgMode === "light" ? "☼ light" : "☾ dark"}</button>
               <label className="flex items-center gap-1.5"><input type="checkbox" checked={debugBoxes} onChange={(e) => setDebugBoxes(e.target.checked)} className="accent-[#7c5cff]" />boxes</label>
               <button onClick={() => setShowCode((s) => !s)} className={cn("rounded-md border border-line px-2 py-0.5 hover:bg-surface-2", showCode && "bg-surface-3 text-fg")}>{renderer.current?.kind === "cpu" ? "JS" : "WGSL"}</button>
+              <GenOptions flags={gen} onChange={applyGen} census={census} />
             </div>
             <div className="relative min-h-0 flex-1 overflow-hidden bg-[#0e1322] p-3 sm:p-4"
               style={{ backgroundImage: "radial-gradient(circle at 1px 1px, #1d2537 1px, transparent 0)", backgroundSize: "20px 20px" }}>

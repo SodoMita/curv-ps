@@ -136,5 +136,30 @@ for (const ex of EXAMPLES) check(ex.id, ex.src);
 console.log("\ncodegen corner cases");
 EXTRA.forEach((src, i) => check(`extra ${i}`, src));
 
+// ---- 4. flipping a shader-gen option (the options menu) must really recompile --------------
+// The menu mutates SHADER_FLAGS while the app is running; if a flag were missing from the structural
+// key, `compileTree(prev)` would hand back the old shader and the option would appear to do nothing.
+console.log("\noption changes invalidate the shader");
+{
+  const ex = EXAMPLES.find((e) => e.id === "packed")!;
+  const r = interp(900, 600, 0).run(ex.src);
+  const a = compileTree(r.shape!, atlas, "wgsl", null, undefined, "slice");
+  const save = { ...SHADER_FLAGS };
+  Object.assign(SHADER_FLAGS, { branchless: true });
+  const b = compileTree(r.shape!, atlas, "wgsl", a, undefined, "slice");
+  const ok1 = !b.reused && b.code !== a.code;
+  console.log(`${ok1 ? "OK " : "ERR"} branchless flips the shader           ${a.code.length}B → ${b.code.length}B, reused=${b.reused}`);
+  if (!ok1) fails++;
+  Object.assign(SHADER_FLAGS, save);
+  const c = compileTree(r.shape!, atlas, "wgsl", b, undefined, "slice");
+  const ok2 = c.code === a.code;
+  console.log(`${ok2 ? "OK " : "ERR"} flipping back restores the old text   ${ok2 ? "identical" : "DIFFERENT"}`);
+  if (!ok2) fails++;
+  // the parameter buffer must not move: the menu cannot be allowed to change the layout
+  const same = a.params.length === b.params.length && a.params.every((v, i) => v === b.params[i]);
+  console.log(`${same ? "OK " : "ERR"} parameter layout is unchanged        ${a.params.length} params`);
+  if (!same) fails++;
+}
+
 console.log(fails ? `\n${fails} shader(s) failed to parse` : "\nall shaders parse as WGSL");
 process.exit(fails ? 1 : 0);
