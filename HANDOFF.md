@@ -76,6 +76,16 @@ gates do not (run the WGSL, fit a camera, wait for a pointer):
   out 0.03 px tall, a speck, until the pointer moved.  A never-seen pointer now reports the middle
   of the view; the same example fits at 45.8 px.
 
+**The code panel was showing a fifth of the file.**  The `WGSL` / `JS` overlay only ever showed the
+generated body — for `rings3d` in the 3D view that is 21 of the 109 lines the GPU compiles, 1.3 kB of
+5.7 kB; the uniform struct, the vertex and fragment entry points and the raymarch loop were
+invisible, which is exactly where the round-21 camera bug lived.  It now opens on `whole` (with
+`body` one click away), and the CPU fallback grew the counterpart to `wrapWGSL`: `wrapJS`, whose
+strings are the ones `compile` / `compile3` hand to `new Function`, so the panel cannot drift from
+what runs.  The two are cached separately in the app — a shape like `circle 3` compiles to the *same*
+body in both view modes and to two very different wrappers (1.1 kB vs 3.2 kB), so the wrapper is
+keyed on mode + body while the branch census stays on the body alone.
+
 The pink boxes are the `solve` debug overlay (the `boxes` checkbox, off by default).  It reads like a
 performance option and is not one — it *draws* the boxes the solver computed — so the label now says
 what it is and turns pink while it is on.

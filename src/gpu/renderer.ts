@@ -319,6 +319,42 @@ async function createWebGPU(canvas: HTMLCanvasElement, atlas: Atlas): Promise<Re
 
 type PixelFn = (P: Float32Array, R: unknown, W: number, H: number, scale: number, cam: Camera, T: number, bg: number[], px: Uint8ClampedArray) => void;
 
+/**
+ * The source the CPU fallback compiles, as text — `wrapWGSL`'s counterpart for the code panel.
+ * `compile3` / `compile` build their functions from exactly these strings, so what the panel shows
+ * cannot drift from what runs (the WGSL wrapper learned that lesson in round 21: a wrapper nobody
+ * looked at is where the 3D view hid its broken camera for a whole round).
+ */
+const jsStepSrc = (c: Compiled) => `const p0 = q; ${c.code}; return ${c.d};`;
+const jsColSrc = (c: Compiled) => `const p0 = q; ${c.code}; return ${c.c};`;
+const jsPixelBody = (c: Compiled) => `
+      const zoom = cam.zoom;
+      for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) {
+        // 3D-native body expects a vec3 point; the 2D view is the z = 0 slice
+        const p0 = [((i + 0.5) / scale - RW * 0.5) / zoom + cam.cx, -((j + 0.5) / scale - RH * 0.5) / zoom + cam.cy, 0];
+${c.code}
+        // NaN guard: a single non-finite distance paints the pixel black and, worse, hides a
+        // real bug in the field.  Count it and treat it as "far away" (background) instead.
+        let d = ${c.d};
+        if (d !== d) { d = 1e30; NAN.nan++; }
+        const col = ${c.c};
+        const aa = Math.min(1, Math.max(0, 0.5 - d * zoom)) * col[3];
+        const q = (j * W + i) * 4;
+        px[q] = (bg[0] + (col[0] - bg[0]) * aa) * 255; px[q + 1] = (bg[1] + (col[1] - bg[1]) * aa) * 255; px[q + 2] = (bg[2] + (col[2] - bg[2]) * aa) * 255; px[q + 3] = 255;
+      }`;
+/** The whole JS module the CPU fallback compiles for one program (solid = the raymarcher's step/colour). */
+export const wrapJS = (c: Compiled) => (c.solid
+  ? `// CPU fallback · 3D solid view · the raymarcher evaluates dist() up to 128 times per ray and
+// shade3() the colour once at the hit.  Generated body, inlined once per accessor.
+function dist(P, R, zoom, T, q) { ${jsStepSrc(c)} }
+function col(P, R, zoom, T, q) { ${jsColSrc(c)} }
+`
+  : `// CPU fallback · 2D slice view · one pass over the framebuffer.
+function pixel(P, R, W, H, scale, cam, T, bg, px, RW, RH, NAN) {${jsPixelBody(c)}
+}
+`);
+
+
 const HOME3: Camera3 = { tx: 0, ty: 0, tz: 0, dist: 14, yaw: 0.65, pitch: 0.42, fov: (38 * Math.PI) / 180 };
 
 // shared 3D raymarcher (CPU path); `step`/`col` evaluate the generated body at a ray position
@@ -389,8 +425,8 @@ function createCPU(canvas: HTMLCanvasElement, atlas: Atlas, fixedScale?: number)
     const t0 = performance.now();
     // the body may reference the frame's `zoom`/`T` free variables (child contexts inherit them);
     // in the solid view zoom is 1 (it only scales 2D AA/culling terms)
-    const dist = new Function("P", "R", "zoom", "T", "q", `const p0 = q; ${c.code}; return ${c.d};`) as (P: Float32Array, R: unknown, zoom: number, T: number, q: number[]) => number;
-    const col = new Function("P", "R", "zoom", "T", "q", `const p0 = q; ${c.code}; return ${c.c};`) as (P: Float32Array, R: unknown, zoom: number, T: number, q: number[]) => number[];
+    const dist = new Function("P", "R", "zoom", "T", "q", jsStepSrc(c)) as (P: Float32Array, R: unknown, zoom: number, T: number, q: number[]) => number;
+    const col = new Function("P", "R", "zoom", "T", "q", jsColSrc(c)) as (P: Float32Array, R: unknown, zoom: number, T: number, q: number[]) => number[];
     f = { step: (P, T, q) => dist(P, R, 1, T, q), col: (P, T, q) => col(P, R, 1, T, q) };
     if (cache3.size > 24) cache3.delete(cache3.keys().next().value!);
     cache3.set(c.code, f); stats.compiles++; stats.lastCompileMs = performance.now() - t0;
@@ -399,21 +435,7 @@ function createCPU(canvas: HTMLCanvasElement, atlas: Atlas, fixedScale?: number)
   const compile = (c: Compiled): PixelFn => {
     let f = cache.get(c.code); if (f) return f;
     const t0 = performance.now();
-    const body = `
-      const zoom = cam.zoom;
-      for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) {
-        // 3D-native body expects a vec3 point; the 2D view is the z = 0 slice
-        const p0 = [((i + 0.5) / scale - RW * 0.5) / zoom + cam.cx, -((j + 0.5) / scale - RH * 0.5) / zoom + cam.cy, 0];
-${c.code}
-        // NaN guard: a single non-finite distance paints the pixel black and, worse, hides a
-        // real bug in the field.  Count it and treat it as "far away" (background) instead.
-        let d = ${c.d};
-        if (d !== d) { d = 1e30; NAN.nan++; }
-        const col = ${c.c};
-        const aa = Math.min(1, Math.max(0, 0.5 - d * zoom)) * col[3];
-        const q = (j * W + i) * 4;
-        px[q] = (bg[0] + (col[0] - bg[0]) * aa) * 255; px[q + 1] = (bg[1] + (col[1] - bg[1]) * aa) * 255; px[q + 2] = (bg[2] + (col[2] - bg[2]) * aa) * 255; px[q + 3] = 255;
-      }`;
+    const body = jsPixelBody(c);
     f = new Function("P", "R", "W", "H", "scale", "cam", "T", "bg", "px", "RW", "RH", "NAN", body) as unknown as PixelFn;
     const raw = f;
     f = (P, R2, W, H, scale, cam, T, bg, px) => (raw as unknown as (...a: unknown[]) => void)(P, R2, W, H, scale, cam, T, bg, px, W / scale, H / scale, stats);
