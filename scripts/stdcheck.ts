@@ -17,6 +17,7 @@ import { loadPsolve } from "../src/psolve/psolve";
 import { Interp, compileTree, show, setSolveBudget } from "../src/curv/interp";
 import { bboxOf, bbox3Of, type BBox3 } from "../src/curv/shapes";
 import { buildAtlas } from "../src/gpu/atlas";
+import { jsStepFn } from "../src/gpu/renderer";
 import { makeJSRuntime } from "../src/gpu/gen";
 import { ATLAS_W, ATLAS_H } from "../src/gpu/atlas";
 
@@ -120,9 +121,11 @@ eq("box3 [2,4,6] >> rotate 90° about Y", fmt(b3("box3 [2,4,6] >> rotate {angle:
 console.log("\nfield sampling (3D: non-finite + inside-vs-bbox)");
 const field3 = (src: string) => {
   const c = compileTree(shape(src), atlas, "js", null, undefined, "solid");
-  const fn = new Function("P", "R", "zoom", "T", "q", `const p0 = q; ${c.code}; return ${c.d};`) as (P: Float32Array, R: unknown, zoom: number, T: number, q: number[]) => number;
+  // the same step function the renderer compiles (jsStepFn owns the signature); rad = 10 makes the
+  // plate of a flattened 2D shape 0.01 thick, which is below every tolerance this file samples with
+  const fn = jsStepFn(c, R);
   const P = Float32Array.from(c.params);
-  return (x: number, y: number, z: number) => fn(P, R, 1, 0, [x, y, z]);
+  return (x: number, y: number, z: number) => fn(P, 0, [x, y, z], 10);
 };
 /** 2D (z = 0) field of a shape, through the interpreter's own CPU compiler. */
 const field2 = (src: string) => { const f = mk().cpuCompile(shape(src)); return (x: number, y: number) => f.dist(x, y, 0); };
@@ -134,12 +137,17 @@ const contains = (src: string, n = 13) => {
   if (!b || !b.every(Number.isFinite)) return "no finite bbox3";
   const cx = (b[0] + b[3]) / 2, cy = (b[1] + b[4]) / 2, cz = (b[2] + b[5]) / 2;
   const rx = (b[3] - b[0]) / 2, ry = (b[4] - b[1]) / 2, rz = (b[5] - b[2]) / 2;
+  // A flat bbox3 is a 2D shape, and in the 3D view a 2D shape is a plate about a pixel thick: it has
+  // no deep interior to sample along z at all.  Coverage of its bbox is a 2D question, so sample the
+  // z = 0 slice (the interpreter's own CPU field) instead of the raymarched one.
+  const flat = rz === 0;
+  const f2 = flat ? field2(src) : null;
   const diag = Math.hypot(rx, ry, rz) || 1;
   const tol = 0.02 * diag;                       // sampling slack
   let inside = 0, outside = 0, bad = 0, nan = 0;
-  for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) for (let k = 0; k < n; k++) {
-    const x = cx + (2 * rx * 1.6) * (i / (n - 1) - 0.5), y = cy + (2 * ry * 1.6) * (j / (n - 1) - 0.5), z = cz + (2 * rz * 1.6) * (k / (n - 1) - 0.5);
-    const d = f(x, y, z);
+  for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) for (let k = 0; k < (flat ? 1 : n); k++) {
+    const x = cx + (2 * rx * 1.6) * (i / (n - 1) - 0.5), y = cy + (2 * ry * 1.6) * (j / (n - 1) - 0.5), z = flat ? 0 : cz + (2 * rz * 1.6) * (k / (n - 1) - 0.5);
+    const d = f2 ? f2(x, y) : f(x, y, z);
     if (!Number.isFinite(d)) { nan++; continue; }
     if (d > -tol) continue;
     inside++;

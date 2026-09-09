@@ -4,9 +4,10 @@
 import { createCanvas } from "@napi-rs/canvas";
 import { loadPsolve } from "../src/psolve/psolve";
 import { Interp, compileTree, show } from "../src/curv/interp";
-import { bbox3Of } from "../src/curv/shapes";
-import { buildAtlas } from "../src/gpu/atlas";
-import { createRenderer, type Camera3 } from "../src/gpu/renderer";
+import { bbox3Of, bboxOf, flat2D } from "../src/curv/shapes";
+import { buildAtlas, ATLAS_W, ATLAS_H } from "../src/gpu/atlas";
+import { makeJSRuntime } from "../src/gpu/gen";
+import { createRenderer, jsStepFn, type Camera3 } from "../src/gpu/renderer";
 import { EXAMPLES } from "../src/curv/examples";
 
 const CW = 96, CH = 64;
@@ -84,6 +85,62 @@ console.log("\nshape record");
   eq("cylinder .bbox → z ±1.5", "let s = cylinder {d: 2, h: 3} in s.bbox", "[[-1, -1, -1.5], [1, 1, 1.5]]");
   eq("show_dist 3D child: is_2d true", "let s = show_dist (sphere 4) in s.is_2d", "true");
   eq("show_dist 3D child: is_3d true", "let s = show_dist (sphere 4) in s.is_3d", "true");
+}
+
+// ---- 3c. a 2D shape in the 3D view is a plate, not an infinite prism ----
+// A 2D shape's distance ignores z, so text in the 3D view turned into a slab receding for ever.
+// Every maximal 2D subtree is now intersected with a slab |z| <= FLAT_K * (camera distance), which
+// is about one pixel on screen.  This is the oracle: a point inside the shape at z = 0 must be
+// well outside it a little way up, and a 3D shape must keep its depth.
+console.log("\n2D shapes are flat in the 3D view");
+{
+  const R = makeJSRuntime((u, v) => {
+    const x = Math.min(ATLAS_W - 1, Math.max(0, Math.round(u * ATLAS_W - 0.5)));
+    const y = Math.min(ATLAS_H - 1, Math.max(0, Math.round(v * ATLAS_H - 0.5)));
+    return atlas.data[y * ATLAS_W + x] / 255;
+  });
+  // the CPU body takes the camera distance as RAD (the WGSL body reads the same from u.cam3a.w)
+  const field = (src: string, w = 960, h = 600) => {
+    const r = interp(w, h, 0).run(src);
+    const c = compileTree(r.shape!, atlas, "js", null, undefined, "solid");
+    const step = jsStepFn(c, R);   // the renderer's own step function, camera distance included
+    return { d: (x: number, y: number, z: number, rad: number) => step(c.params, 0, [x, y, z], rad), flat: flat2D(r.shape!) };
+  };
+  {
+    const rad = 10, h = rad * 0.001;                    // plate: ±0.01 thick
+    const c = field("circle 2");
+    ok("circle: solid in its plane", c.d(0, 0, 0, rad) < 0, `d=${c.d(0, 0, 0, rad).toFixed(3)}`);
+    ok("circle: not a prism (z=10 outside)", c.d(0, 0, 10, rad) > 9, `d=${c.d(0, 0, 10, rad).toFixed(2)}`);
+    ok("circle: the plate is thin (z=0.05 outside)", c.d(0, 0, 0.05, rad) > 0 && h < 0.05, `d=${c.d(0, 0, 0.05, rad).toFixed(4)}`);
+    const s = field("sphere 2");            // `sphere d` has RADIUS d/2: the point z=1 is on the surface
+    ok("sphere keeps its depth (z=0.5 inside)", s.d(0, 0, 0.5, rad) < 0, `d=${s.d(0, 0, 0.5, rad).toFixed(3)}`);
+    ok("sphere: still a ball, not a plate (z=0.9 inside)", s.d(0, 0, 0.9, rad) < 0, `d=${s.d(0, 0, 0.9, rad).toFixed(3)}`);
+    // extrude slices its child at z = 0: flattening that child would cap the height at the plate's
+    const e = field("extrude 2 (circle 1)");   // h = 2 is the FULL height in Curv (half = 1)
+    ok("extrude: inside at z=0.9", e.d(0, 0, 0.9, rad) < 0, `d=${e.d(0, 0, 0.9, rad).toFixed(3)}`);
+    ok("extrude: outside at z=1.5", e.d(0, 0, 1.5, rad) > 0, `d=${e.d(0, 0, 1.5, rad).toFixed(3)}`);
+  }
+  // every 2D example: no point of the shape may extend above its own plane
+  let checked = 0;
+  for (const ex of EXAMPLES.filter((e) => e.group !== "3d")) {
+    try {
+      const f = field(ex.src);
+      if (!f.flat) continue;
+      const bb = bboxOf(run2D(ex.src).shape!, atlas);
+      if (!bb || !bb.every(Number.isFinite)) continue;
+      const rad = Math.max(1, 0.5 * Math.hypot(bb[2] - bb[0], bb[3] - bb[1])) * 3;
+      let inside: [number, number] | null = null;
+      for (let j = 1; j < 24 && !inside; j++) for (let i = 1; i < 24 && !inside; i++) {
+        const x = bb[0] + ((bb[2] - bb[0]) * i) / 24, y = bb[1] + ((bb[3] - bb[1]) * j) / 24;
+        if (f.d(x, y, 0, rad) < -0.05) inside = [x, y];
+      }
+      if (!inside) continue;
+      checked++;
+      const up = f.d(inside[0], inside[1], rad * 0.5, rad);
+      ok(`flat ${ex.id}`, up > 0, `d(z=${(rad * 0.5).toFixed(0)})=${up.toFixed(2)}`);
+    } catch (e: any) { ok(`flat ${ex.id}`, false, e.message); }
+  }
+  ok("≥5 examples checked for flatness", checked >= 5, `${checked} checked`);
 }
 
 // ---- 4. CPU raymarcher: real pixels ----

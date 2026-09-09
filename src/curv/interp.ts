@@ -769,7 +769,7 @@ export class Interp {
     let c = this.cpuFns.get(node);
     if (!c) {
       const g = new JS();
-      const ctx: GenCtx = { atlas: this.atlas, zoom: { t: "f", s: "1" }, time: { t: "f", s: "T" }, cull: false, defaultColour: DEFAULT_COLOUR, mode: "slice", aa: { t: "f", s: "1.5" } };
+      const ctx: GenCtx = { atlas: this.atlas, zoom: { t: "f", s: "1" }, time: { t: "f", s: "T" }, cull: false, defaultColour: DEFAULT_COLOUR, mode: "slice", aa: { t: "f", s: "1.5" }, viewRad: { t: "f", s: "1" }, in3d: false };
       const r = genShape(g, node, { t: "v3", s: "p0" }, ctx);
       const body = `const p0 = [x, y, 0];\n${g.code()}\nreturn [${r.d.s}, ${r.c.s}];`;
       const fn = new Function("P", "R", "x", "y", "T", body) as (P: number[], R: unknown, x: number, y: number, T: number) => [number, number[]];
@@ -1429,6 +1429,9 @@ export function compileTree(node: SNode, atlas: Atlas, target: "wgsl" | "js", pr
     atlas, zoom: { t: "f", s: target === "wgsl" ? "u.cam.z" : "zoom" }, time: { t: "f", s: target === "wgsl" ? "u.time" : "T" },
     cull, defaultColour, mode,
     aa: mode === "slice" ? { t: "f", s: target === "wgsl" ? "(1.5 / u.cam.z)" : "(1.5 / zoom)" } : { t: "f", s: "0.3" },
+    // camera distance: 2D subtrees are flattened to a plate ~FLAT_K of it thick in the solid view
+    viewRad: { t: "f", s: target === "wgsl" ? "max(u.cam3a.w, 0.001)" : "RAD" },
+    in3d: mode === "solid",
   };
   const r = genShape(g, node, { t: "v3", s: "p0" }, ctx);
   const out: CompiledTree = { code: g.code(), d: r.d.s, c: r.c.s, params: new Float32Array(g.finalParams()), key, reused: false, usesTime: g.usesTime };
@@ -1442,7 +1445,7 @@ export function compileTree(node: SNode, atlas: Atlas, target: "wgsl" | "js", pr
 /** Only the parameter buffer of a tree, in codegen order, via the generic ParamsOnly backend (reference implementation). */
 export function collectParams(node: SNode, atlas: Atlas, defaultColour: RGBA = DEFAULT_COLOUR, cull = true): Float32Array {
   const g = new ParamsOnly();
-  genShape(g, node, { t: "v3", s: "" }, { atlas, zoom: { t: "f", s: "" }, time: { t: "f", s: "" }, cull, defaultColour, mode: cull ? "slice" : "solid", aa: { t: "f", s: "" } });
+  genShape(g, node, { t: "v3", s: "" }, { atlas, zoom: { t: "f", s: "" }, time: { t: "f", s: "" }, cull, defaultColour, mode: cull ? "slice" : "solid", aa: { t: "f", s: "" }, viewRad: { t: "f", s: "" }, in3d: false });
   return new Float32Array(g.finalParams());
 }
 /** Same buffer through the dedicated tree walk (`walkParams`); falls back to the generic backend for trees with user shader functions. */
