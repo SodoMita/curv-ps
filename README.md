@@ -5,7 +5,9 @@ with a JS fallback) extended with `solve { … }` blocks: linear / convex-quadra
 [psolve](https://github.com/SodoMita/psolve) compiled to WebAssembly.  2D is the `z = 0` slice of a 3D
 field, so the same program also renders as a raymarched solid (orbit camera) with the C++ `std.curv`
 3D vocabulary: `sphere`, `box3`, `cone`, `capsule`, `torus`, `cylinder`, `gyroid`, `extrude`, `loft`,
-`twist`, `bend`, `repeat_xyz`, `slice_xz`, `reflect_yz`, …
+`twist`, `bend`, `repeat_xyz`, `slice_xz`, `reflect_yz`, …  In that view a 2D shape lies flat: its
+field ignores z, so it is intersected with a slab about a pixel thick (scaled to the camera) instead
+of being extruded for ever — a label is a plate at `z = 0`, and depth is what `extrude` is for.
 
 **Live: <https://sodomita.github.io/curv-ps/>** (the single-file `dist/index.html`, rebuilt on every push to main).
 

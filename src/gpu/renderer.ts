@@ -342,12 +342,25 @@ ${c.code}
         const q = (j * W + i) * 4;
         px[q] = (bg[0] + (col[0] - bg[0]) * aa) * 255; px[q + 1] = (bg[1] + (col[1] - bg[1]) * aa) * 255; px[q + 2] = (bg[2] + (col[2] - bg[2]) * aa) * 255; px[q + 3] = 255;
       }`;
+/**
+ * The CPU `dist`/`colour` functions of a compiled program — the JS twins of the WGSL `stepf`/`colf`.
+ * Exported so the gates evaluate the *same* body the renderer does (the signature lives here and
+ * nowhere else: `RAD` is the camera distance, which a flattened 2D shape needs for its thickness).
+ */
+export const jsStepFn = (c: Compiled, R: unknown) => {
+  const f = new Function("P", "R", "zoom", "T", "q", "RAD", jsStepSrc(c)) as (P: Float32Array, R: unknown, zoom: number, T: number, q: number[], rad: number) => number;
+  return (P: Float32Array, T: number, q: number[], rad: number) => f(P, R, 1, T, q, rad);
+};
+export const jsColFn = (c: Compiled, R: unknown) => {
+  const f = new Function("P", "R", "zoom", "T", "q", "RAD", jsColSrc(c)) as (P: Float32Array, R: unknown, zoom: number, T: number, q: number[], rad: number) => number[];
+  return (P: Float32Array, T: number, q: number[], rad: number) => f(P, R, 1, T, q, rad);
+};
 /** The whole JS module the CPU fallback compiles for one program (solid = the raymarcher's step/colour). */
 export const wrapJS = (c: Compiled) => (c.solid
   ? `// CPU fallback · 3D solid view · the raymarcher evaluates dist() up to 128 times per ray and
 // shade3() the colour once at the hit.  Generated body, inlined once per accessor.
-function dist(P, R, zoom, T, q) { ${jsStepSrc(c)} }
-function col(P, R, zoom, T, q) { ${jsColSrc(c)} }
+function dist(P, R, zoom, T, q, RAD) { ${jsStepSrc(c)} }
+function col(P, R, zoom, T, q, RAD) { ${jsColSrc(c)} }
 `
   : `// CPU fallback · 2D slice view · one pass over the framebuffer.
 function pixel(P, R, W, H, scale, cam, T, bg, px, RW, RH, NAN) {${jsPixelBody(c)}
@@ -418,16 +431,14 @@ function createCPU(canvas: HTMLCanvasElement, atlas: Atlas, fixedScale?: number)
     return atlas.data[y * ATLAS_W + x] / 255;
   });
   const cache = new Map<string, PixelFn>();
-  const cache3 = new Map<string, { step: (P: Float32Array, T: number, q: number[]) => number; col: (P: Float32Array, T: number, q: number[]) => number[] }>();
+  const cache3 = new Map<string, { step: (P: Float32Array, T: number, q: number[], rad: number) => number; col: (P: Float32Array, T: number, q: number[], rad: number) => number[] }>();
   const stats = { compiles: 0, lastCompileMs: 0, cached: 0, gpuMs: 0, timestamps: false, nan: 0 };
   const compile3 = (c: Compiled) => {
     let f = cache3.get(c.code); if (f) return f;
     const t0 = performance.now();
     // the body may reference the frame's `zoom`/`T` free variables (child contexts inherit them);
     // in the solid view zoom is 1 (it only scales 2D AA/culling terms)
-    const dist = new Function("P", "R", "zoom", "T", "q", jsStepSrc(c)) as (P: Float32Array, R: unknown, zoom: number, T: number, q: number[]) => number;
-    const col = new Function("P", "R", "zoom", "T", "q", jsColSrc(c)) as (P: Float32Array, R: unknown, zoom: number, T: number, q: number[]) => number[];
-    f = { step: (P, T, q) => dist(P, R, 1, T, q), col: (P, T, q) => col(P, R, 1, T, q) };
+    f = { step: jsStepFn(c, R), col: jsColFn(c, R) };
     if (cache3.size > 24) cache3.delete(cache3.keys().next().value!);
     cache3.set(c.code, f); stats.compiles++; stats.lastCompileMs = performance.now() - t0;
     return f;
@@ -485,7 +496,7 @@ function createCPU(canvas: HTMLCanvasElement, atlas: Atlas, fixedScale?: number)
             const rl2 = Math.hypot(rd0[0], rd0[1], rd0[2]) || 1;
             const rd = [rd0[0] / rl2, rd0[1] / rl2, rd0[2] / rl2];
             const march = SHADER_FLAGS.branchless3D || SHADER_FLAGS.branchless ? march3b : march3;
-            const rgb = march((q) => step(P, time, q), (q) => col(P, time, q), ro, rd, e, bgpx, c3.dist * 6);
+            const rgb = march((q) => step(P, time, q, c3.dist), (q) => col(P, time, q, c3.dist), ro, rd, e, bgpx, c3.dist * 6);
             if (nanCount) { stats.nan += nanCount; nanCount = 0; }
             const q = (j * w + i) * 4;
             img.data[q] = rgb[0]; img.data[q + 1] = rgb[1]; img.data[q + 2] = rgb[2]; img.data[q + 3] = 255;

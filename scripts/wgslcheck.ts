@@ -190,5 +190,28 @@ console.log("\nthe 3D wrapper's camera agrees with the CPU marcher");
   }
 }
 
+// ---- 6. a 2D shape is a plate in the 3D view, and an ordinary 2D shape in the 2D view --------
+// Same class of bug as §5, same reason: the WGSL body is compiled by the GPU and executed by
+// nobody in this sandbox.  A 2D shape's distance ignores z, so in the 3D view it has to be
+// intersected with a thin slab — and that slab must NOT appear in the slice shader, where it would
+// fatten every shape by the plate's thickness.
+console.log("\n2D shapes are plates in the 3D view (WGSL)");
+{
+  const r = interp(960, 600, 0).run("circle 2");
+  const solid = compileTree(r.shape!, atlas, "wgsl", null, undefined, "solid").code;
+  const slice = compileTree(r.shape!, atlas, "wgsl", null, undefined, "slice").code;
+  const plate = /abs\(p0\.z\)/.test(solid) && /u\.cam3a\.w/.test(solid);
+  console.log(`${plate ? "OK " : "ERR"} solid shader intersects the shape with a slab  ${solid.split("\n").filter((l) => l.includes("abs(p0.z)")).join(" ").trim()}`);
+  if (!plate) fails++;
+  const clean = !/abs\(p0\.z\)/.test(slice) && !/u\.cam3a\.w/.test(slice);
+  console.log(`${clean ? "OK " : "ERR"} slice shader has no slab (2D view untouched)`);
+  if (!clean) fails++;
+  // a 3D shape keeps its depth: no slab is added to a sphere
+  const s3 = compileTree(interp(960, 600, 0).run("sphere 2").shape!, atlas, "wgsl", null, undefined, "solid").code;
+  const noPlate = !/abs\(p0\.z\)/.test(s3);
+  console.log(`${noPlate ? "OK " : "ERR"} a 3D shape is not flattened`);
+  if (!noPlate) fails++;
+}
+
 console.log(fails ? `\n${fails} shader(s) failed to parse` : "\nall shaders parse as WGSL");
 process.exit(fails ? 1 : 0);

@@ -94,6 +94,60 @@ Two golden frames changed (`rings3d@solid`, `loft3d@solid`): the 3D goldens had 
 the 2D shader.  `scripts/pdiff.ts --update` also no longer drops the goldens it did not re-render
 when it is given a list of example ids — it did, once, in this round.
 
+## What changed in round 22 — a 2D shape in the 3D view is a plate, not an infinite prism
+
+**Reported from the browser:** *"in 3d text look like infinitely deep instead of flat"*.
+
+A 2D shape's distance field ignores z — the whole 2D vocabulary (`circle`, `rect`, `text`, …), and
+every Curv program that returns a 2D shape, is a field of x and y only.  Hand that to a raymarcher
+and it is an **infinite prism**: each glyph and each panel became a slab receding for ever along z,
+and a layout like `dashboard` filled the frame with extruded walls.
+
+**The fix** (`src/curv/shapes.ts`): in the solid view, every *maximal* 2D subtree — Curv's own
+`is_2d && !is_3d` — is intersected with a thin slab on its own z = 0 plane:
+
+    d = max(d2(x, y), abs(z) - h)      h = FLAT_K * (camera distance),  FLAT_K = 0.001
+
+`h` is about one pixel on screen at any zoom level — the camera distance is the only scale a 2D
+shape has (`u.cam3a.w` in WGSL, `RAD` in the CPU body, the same number the marcher's `FAR` and
+normal epsilon already use) — and in practice it never falls below the marcher's 0.001 hit epsilon,
+so the plate is a real surface rather than a grazing-ray dropout.  Only the outermost node of a 2D
+subtree is wrapped, so a 2D program is *one* plate and not a stack of them, and a 2D shape under a
+3D transform keeps its own plane (the wrap happens in the child's space, before the transform).
+
+Three details that carry weight:
+
+* **Nodes that slice their child at z = 0 — `extrude`, `loft`, `perimeter_extrude`, `slice2` — pass
+  `in3d: false`.**  That child has no z of its own to be flat in, and intersecting it with a slab
+  first would cap the extrusion at the plate: `extrude 2 (circle 1)` would come out 0.002 tall
+  instead of 2.  `threedcheck` asserts the height survives.
+* **The slice (2D) view is untouched** — the wrap is emitted in solid mode only.  `wgslcheck`
+  asserts the slab is absent from the slice shader, and all 35 golden frames are byte-identical,
+  which covers every 3D example and every 2D slice.
+* **No new parameter.**  The camera distance is read inside the shader, not baked into the parameter
+  buffer, so `walkParams` — the tree walk that refills that buffer every frame — needed no change
+  and cannot drift from codegen.  (It would have been the round-21 bug class again.)
+
+Measured on the CPU fallback, solid view, camera at the auto-fit distance:
+
+| example | before (infinite prisms) | after (flat plate) |
+|---|---|---|
+| buttons | 82.9 % of pixels lit | 12.6 % |
+| dashboard | 99.8 % | 72.0 % |
+| tooltip | 99.9 % | 75.0 % |
+
+**Gates.** `threedcheck` gained an oracle that does not depend on pixels: for a point inside the
+shape at z = 0 the field must be well *outside* it a little way up (`circle 2`: d(0,0,10) = 9.99,
+d(0,0,0.05) > 0 — solid in its plane, and thin), a 3D shape must keep its depth (`sphere 2`:
+d(0,0,0.9) < 0), `extrude` must keep its height, and every 2D example is checked the same way.
+`wgslcheck` checks the WGSL text on both sides of the mode switch.  `stdcheck`'s bbox-coverage
+sampling now samples a flat-bbox3 shape on the z = 0 slice: a plate has no deep interior along z, so
+the old grid found none and reported a failure that was really about the new (correct) geometry.
+
+**Not claimed:** C++ Curv parity.  How a 2D shape is drawn in a 3D view is a viewer decision, not
+something `std.curv` defines, and `stdcheck` does not exercise Curv's viewer.  What is checked is the
+behaviour above; a 2D shape that wants depth has `extrude`.
+
 ## Round 19 recap — branchless shaders: built, measured, and mostly *not* shipped
 
 The round-18 bug (a brace-less `if` in the hand-written WGSL wrapper) invited the obvious cure:

@@ -321,6 +321,11 @@ function bbox3Raw(n: SNode, atlas: Atlas): BBox3 | null {
  * AND over their children (a union of a 2D and a 3D shape is neither, as in Curv); unary operators
  * keep the child's flags; the pure-2D primitives are 2D-only. */
 const f3Memo = new WeakMap<SNode, { is2d: boolean; is3d: boolean }>();
+/** Half-thickness of a flattened 2D shape in the 3D view, as a fraction of the camera distance:
+ *  ~1/1000 of the view is about one pixel on screen, and it never falls below the marcher's epsilon. */
+export const FLAT_K = 0.001;
+/** A shape with no extent in z (Curv's own is_2d and not is_3d): in the 3D view it needs a depth. */
+export const flat2D = (n: SNode): boolean => { const f = flags3Of(n); return f.is2d && !f.is3d; };
 export function flags3Of(n: SNode): { is2d: boolean; is3d: boolean } {
   const hit = f3Memo.get(n); if (hit) return hit;
   const f = (k: SNode) => flags3Of(k);
@@ -990,7 +995,13 @@ export function structKey(n: SNode, atlas: Atlas, cull = true): string | null {
 // real z.  `mode` selects union/AA behaviour: "slice" = 2D view (coverage AA + bbox culling),
 // "solid" = 3D view (exact-min union, no culling — the raymarcher owns early-out).
 export type ViewMode = "slice" | "solid";
-export interface GenCtx { atlas: Atlas; zoom: E; time: E; cull: boolean; defaultColour: RGBA; mode: ViewMode; aa: E }
+export interface GenCtx {
+  atlas: Atlas; zoom: E; time: E; cull: boolean; defaultColour: RGBA; mode: ViewMode; aa: E;
+  /** Camera distance in the 3D view (`u.cam3a.w` / `RAD`): the only scale a 2D shape has for a depth. */
+  viewRad: E;
+  /** True when this subtree's distance is consumed as a 3D field (solid view, outside a slicing node). */
+  in3d?: boolean;
+}
 export interface DC { d: E; c: E }
 
 const V = (g: Gen, ...xs: number[]) => g.vec(xs.map((x) => g.param(x)));
@@ -1064,6 +1075,18 @@ export function genShape(g: Gen, n: SNode, p: E, ctx: GenCtx): DC {
     return { d: dv, c: cv };
   };
   const pz = () => g.idx(p, 2);
+  // A 2D shape's distance ignores z, so in the 3D view it is an infinite prism: text became a slab
+  // receding for ever instead of letters lying on a plane.  Flatten each *maximal* 2D subtree into a
+  // plate at its own z = 0 instead — max(d, abs(z) - h), h = FLAT_K of the view radius (~a pixel).
+  // Only the outermost node of such a subtree is wrapped, so it is one plate and not a stack of them,
+  // and a 2D shape under a 3D transform keeps its own plane (the wrap happens in the child's space).
+  // Nodes that slice their child at z = 0 (extrude, loft, perex, slice2) pass in3d: false — that
+  // child has no z of its own to be flat in, and extruding an already-flat plate would cap the height.
+  if (ctx.mode === "solid" && ctx.in3d && flat2D(n)) {
+    const inner = genShape(g, n, p, { ...ctx, in3d: false });
+    const hE = g.let(g.bin("*", ctx.viewRad, g.num(FLAT_K)));
+    return { d: g.let(g.fn("max", [inner.d, g.bin("-", g.fn("abs", [g.idx(p, 2)]), hE)])), c: inner.c };
+  }
   switch (n.k) {
     case "circle": return prim(g.bin("-", g.fn("length", [p]), g.param(n.r)));
     case "rect": return prim(sdBox(g, p, g.param(n.w / 2), g.param(n.h / 2), g.param(Math.min(n.r, n.w / 2, n.h / 2))));
@@ -1362,7 +1385,7 @@ export function genShape(g: Gen, n: SNode, p: E, ctx: GenCtx): DC {
     case "extrude": {
       // h is the HALF height (total = 2h), centred on z = 0 — the 2D shape is sliced at z = 0
       const h = g.param(n.h);
-      const a = kid(n.s, g.vec([px(), py(), g.num(0)]), { cull: false });
+      const a = kid(n.s, g.vec([px(), py(), g.num(0)]), { cull: false, in3d: false });
       if (n.m === "mitred") return { d: g.let(g.fn("max", [g.bin("-", g.fn("abs", [pz()]), h), a.d])), c: a.c };
       const dz = g.let(g.bin("-", g.fn("abs", [pz()]), h));
       const out = g.let(g.fn("max", [g.vec([dz, a.d]), g.num(0)]));
@@ -1370,15 +1393,15 @@ export function genShape(g: Gen, n: SNode, p: E, ctx: GenCtx): DC {
     }
     case "loft": {
       const h = g.param(n.h);
-      const a = kid(n.a, g.vec([px(), py(), g.num(0)]), { cull: false });
-      const b = kid(n.b, g.vec([px(), py(), g.num(0)]), { cull: false });
+      const a = kid(n.a, g.vec([px(), py(), g.num(0)]), { cull: false, in3d: false });
+      const b = kid(n.b, g.vec([px(), py(), g.num(0)]), { cull: false, in3d: false });
       const t = g.let(g.bin("/", g.bin("+", g.fn("clamp", [pz(), g.neg(h), h]), h), g.bin("*", h, g.num(2))));
       return { d: g.let(g.fn("max", [g.bin("-", g.fn("abs", [pz()]), h), g.fn("mix", [a.d, b.d, t])])), c: g.let(g.fn("mix", [a.c, b.c, t])) };
     }
     case "perex": {
       // perimeter_extrude: sweep the 2D section along the 2D perimeter (torus, revolve…)
-      const per = kid(n.a, g.vec([px(), py(), g.num(0)]), { cull: false }).d;
-      const b = kid(n.b, g.vec([per, pz(), g.num(0)]), { cull: false });
+      const per = kid(n.a, g.vec([px(), py(), g.num(0)]), { cull: false, in3d: false }).d;
+      const b = kid(n.b, g.vec([per, pz(), g.num(0)]), { cull: false, in3d: false });
       return { d: g.let(b.d), c: b.c };
     }
     case "twist": {
@@ -1433,7 +1456,7 @@ export function genShape(g: Gen, n: SNode, p: E, ctx: GenCtx): DC {
     case "slice2": {
       // planar cross section of any shape (z = 0 result, like C++ slice_xy / xz / yz)
       const q = n.plane === 0 ? g.vec([px(), py(), g.num(0)]) : n.plane === 1 ? g.vec([px(), g.num(0), py()]) : g.vec([g.num(0), px(), py()]);
-      return kid(n.s, g.let(q));
+      return kid(n.s, g.let(q), { in3d: false });
     }
     case "xform3": {
       // pure 3D rotation + translation (orthonormal m, row-major): distance preserved, no scale
