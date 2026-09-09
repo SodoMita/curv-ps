@@ -213,5 +213,62 @@ console.log("\n2D shapes are plates in the 3D view (WGSL)");
   if (!noPlate) fails++;
 }
 
+// ---- 7. the sdf-steps count is a comptime literal of the 3D wrapper, and the slab is 3D-only --
+// `sdfSteps` is a codegen-time constant, not a uniform: the raymarch loop bound must appear in the
+// generated WGSL as a literal that follows the flag, the wrapper text (and with it the pipeline
+// cache key, which wraps this text) must change when the count changes, and neither may leak into
+// the 2D slice view.  The empty-space slab test must be identical in the branched and branchless
+// wrappers — flagcheck holds the two builds to identical pixels, so they must share the formulas.
+console.log("\nsdf steps are a comptime constant of the 3D wrapper");
+{
+  const ex = EXAMPLES.find((e) => e.id === "rings3d")!;
+  const r = interp(900, 600, 0).run(ex.src);
+  const shape = r.shape!;
+  const save = { ...SHADER_FLAGS };
+  const loopLine = (code: string) => (code.split("\n").find((l) => /for \(var i = 0u;/.test(l)) ?? "").trim();
+  try {
+    const seen = new Map<number, string>();
+    for (const n of [32, 128, 256]) {
+      SHADER_FLAGS.sdfSteps = n;
+      const c = compileTree(shape, atlas, "wgsl", null, undefined, "solid");
+      const code = wrapWGSL({ ...c, solid: true });
+      const line = loopLine(code);
+      const ok = line === `for (var i = 0u; i < ${n}u; i = i + 1u) {`;
+      console.log(`${ok ? "OK " : "ERR"} steps=${String(n).padStart(3)} baked as a loop-bound literal    ${ok ? "" : "→ " + line}`);
+      if (!ok) fails++;
+      seen.set(n, code);
+      // the slice view has no raymarch loop at all: the same body compiled in slice mode must not
+      // mention the count (the u32 loop is the wrapper's; body loops count in f32)
+      const sl = wrapWGSL({ ...c, solid: false });
+      if (/i < \d+u/.test(sl)) { console.log(`ERR steps=${n} leaked into the slice wrapper`); fails++; }
+    }
+    const okDiff = seen.get(32) !== seen.get(128) && seen.get(128) !== seen.get(256);
+    console.log(`${okDiff ? "OK " : "ERR"} the wrapper text changes with the count      (so does the pipeline key, which hashes it)`);
+    if (!okDiff) fails++;
+    // the body — and with it the parameter buffer — must NOT change: the flag is deliberately
+    // absent from flagsKey, the body caches stay valid across a steps change
+    SHADER_FLAGS.sdfSteps = 32;
+    const body32 = compileTree(shape, atlas, "wgsl", null, undefined, "solid");
+    SHADER_FLAGS.sdfSteps = 256;
+    const body256 = compileTree(shape, atlas, "wgsl", body32, undefined, "solid");
+    const okBody = body256.reused && body256.code === body32.code;
+    console.log(`${okBody ? "OK " : "ERR"} body and parameters are step-invariant     ${okBody ? "compileTree reuse holds" : "the body changed with the count"}`);
+    if (!okBody) fails++;
+    // the empty-space slab: identical formulas in both wrapper flavours, absent from the slice view
+    const slabOf = (code: string) => code.split("\n").filter((l) => /let (pad|dinv|ta|tb|lo|hi|t0|t1) =/.test(l)).map((l) => l.trim()).join("\n");
+    SHADER_FLAGS.sdfSteps = 128;
+    Object.assign(SHADER_FLAGS, { branchless: false, branchless3D: false });
+    const slabBr = slabOf(wrapWGSL({ ...compileTree(shape, atlas, "wgsl", null, undefined, "solid"), solid: true }));
+    Object.assign(SHADER_FLAGS, { branchless: true, branchless3D: true });
+    const slabBl = slabOf(wrapWGSL({ ...compileTree(shape, atlas, "wgsl", null, undefined, "solid"), solid: true }));
+    const okSlab = slabBr !== "" && slabBr === slabBl;
+    console.log(`${okSlab ? "OK " : "ERR"} branched and branchless share the slab test${okSlab ? "" : "  → the two wrappers compute the box bounds differently"}`);
+    if (!okSlab) fails++;
+    const sliceCode = wrapWGSL({ ...compileTree(shape, atlas, "wgsl", null, undefined, "slice"), solid: false });
+    if (/let t0 = max\(0\.02/.test(sliceCode)) { console.log("ERR the slab test leaked into the slice wrapper"); fails++; }
+    else console.log("OK  the slice wrapper has no slab test");
+  } finally { Object.assign(SHADER_FLAGS, save); }
+}
+
 console.log(fails ? `\n${fails} shader(s) failed to parse` : "\nall shaders parse as WGSL");
 process.exit(fails ? 1 : 0);

@@ -4,7 +4,7 @@
 import { createCanvas } from "@napi-rs/canvas";
 import { loadPsolve } from "../src/psolve/psolve";
 import { Interp, compileTree, show } from "../src/curv/interp";
-import { bbox3Of, bboxOf, flat2D } from "../src/curv/shapes";
+import { bbox3Of, marchBoxOf, bboxOf, flat2D, BB_PAD_K } from "../src/curv/shapes";
 import { buildAtlas, ATLAS_W, ATLAS_H } from "../src/gpu/atlas";
 import { makeJSRuntime } from "../src/gpu/gen";
 import { createRenderer, jsStepFn, type Camera3 } from "../src/gpu/renderer";
@@ -208,6 +208,93 @@ try {
   for (let i = 0; i < a.length; i += 4) if (Math.abs(a[i] - b[i]) > 2 || Math.abs(a[i + 1] - b[i + 1]) > 2 || Math.abs(a[i + 2] - b[i + 2]) > 2) diff++;
   ok("pulse: t=0.5 vs t=4 differ", diff > 50, `${diff} px differ`);
 } catch (e: any) { ok("pulse anim", false, e.message); }
+
+// ---- 5. the marcher's empty-space skip is sound and pixel-preserving -----------------------
+// The solid view intersects each ray with the scene's bounding box (padded by BB_PAD_K·rad, see
+// renderer.ts) before marching: a ray that misses the box paints background without one field
+// evaluation, a ray that meets it starts at the entry.  Two oracles:
+//   (a) soundness — the field cannot register a hit outside the padded box (d ≥ the 0.001 hit
+//       epsilon there), so the skipped segments contain no surface.  The pad exists because a
+//       flattened 2D shape is a slab ±FLAT_K·rad thick while its own box has zero z extent.
+//   (b) parity — the same program rendered with the box and without it (the renderer then marches
+//       from the eye, the pre-round-23 path) agrees pixel-for-pixel up to floating-point path
+//       differences: grazing rays may flip at a silhouette, but materially the frames are the same.
+console.log("\nempty-space skip");
+{
+  const R = makeJSRuntime((u, v) => {
+    const x = Math.min(ATLAS_W - 1, Math.max(0, Math.round(u * ATLAS_W - 0.5)));
+    const y = Math.min(ATLAS_H - 1, Math.max(0, Math.round(v * ATLAS_H - 0.5)));
+    return atlas.data[y * ATLAS_W + x] / 255;
+  });
+  const field = (src: string) => {
+    const r = interp(960, 600, 0).run(src);
+    const c = compileTree(r.shape!, atlas, "js", null, undefined, "solid");
+    const step = jsStepFn(c, R);
+    return (x: number, y: number, z: number, rad: number) => step(c.params, 0, [x, y, z], rad);
+  };
+  let sound = 0;
+  for (const ex of EXAMPLES) {
+    try {
+      const r = ex.group === "3d" ? run(ex.src) : run2D(ex.src);
+      if (!r.shape) continue;
+      const bb = marchBoxOf(r.shape, atlas);
+      if (!bb) { if (ex.group === "3d" && ex.id !== "grad3d") ok(`box: ${ex.id}`, false, "3d example without a finite box"); continue; }
+      const rad = ex.group === "3d" ? (camFor[ex.id]?.dist ?? 8) : 100;
+      const pad = Math.max(0.01, BB_PAD_K * rad);
+      const cx = (bb[0] + bb[3]) / 2, cy = (bb[1] + bb[4]) / 2, cz = (bb[2] + bb[5]) / 2;
+      const ex3 = (bb[3] - bb[0]) / 2 || 1, ey3 = (bb[4] - bb[1]) / 2 || 1, ez3 = (bb[5] - bb[2]) / 2 || 1;
+      const d = field(ex.src);
+      // shell of sample points strictly outside the padded box: face centres, edge midpoints,
+      // corners — and, right above/below the centre, the plate-thickness case the pad exists for
+      const pts: [number, number, number][] = [];
+      for (const k of [1.2, 2.5]) {
+        pts.push([cx + (ex3 + k * pad), cy, cz], [cx - (ex3 + k * pad), cy, cz], [cx, cy + (ey3 + k * pad), cz], [cx, cy - (ey3 + k * pad), cz], [cx, cy, cz + (ez3 + k * pad)], [cx, cy, cz - (ez3 + k * pad)]);
+        pts.push([cx + (ex3 + k * pad), cy + (ey3 + k * pad), cz + (ez3 + k * pad)], [cx - (ex3 + k * pad), cy - (ey3 + k * pad), cz - (ez3 + k * pad)]);
+        pts.push([cx, cy, cz + (ez3 + k * pad) + 0.5 * pad], [cx, cy, cz - (ez3 + k * pad) - 0.5 * pad]); // just past the pad, inside the footprint
+      }
+      let worst = Infinity, at = "";
+      for (const [x, y, z] of pts) { const v = d(x, y, z, rad); if (v < worst) { worst = v; at = `(${x.toFixed(1)},${y.toFixed(1)},${z.toFixed(1)})`; } }
+      ok(`box bounds the field: ${ex.id}`, worst >= 0.001, `min d=${worst.toFixed(4)} at ${at}`);
+      if (worst >= 0.001) sound++;
+    } catch (e: any) { ok(`box bounds the field: ${ex.id}`, false, e.message); }
+  }
+  ok("≥10 examples with a derived box", sound >= 10, `${sound} checked`);
+  // a custom shape's *declared* bbox must never drive the skip, however honest it looks: the field
+  // may be inside everywhere (mandelbrot is `everything.dist`, liquid_paint says `dist = -inf`)
+  for (const id of ["mandelbrot", "liquid_paint", "log_spiral"]) {
+    const ex = EXAMPLES.find((e) => e.id === id)!;
+    const r = run2D(ex.src);
+    ok(`custom shape never skips: ${id}`, r.shape !== null && marchBoxOf(r.shape!, atlas) === null, r.shape ? "declared bbox → march from the eye" : "(no shape)");
+  }
+
+  // (b) parity, resolution pinned: the same program with its box and without it
+  const pinned = await createRenderer(mkCanvas() as any, atlas, "cpu", { fixedScale: 1 });
+  const renderBox = async (src: string, box: boolean, c3: Camera3) => {
+    const r = run(src);
+    const compiled = compileTree(r.shape!, atlas, "js", null, undefined, "solid");
+    await pinned.render({ ...compiled, solid: true, bbox3: box ? compiled.bbox3 : null }, { cx: 0, cy: 0, zoom: 1 }, BG, 0, 1, c3);
+    return pixels();
+  };
+  let parity = 0;
+  for (const ex of EXAMPLES.filter((e) => e.group === "3d")) {
+    try {
+      const c3: Camera3 = { ...cam3, ...(camFor[ex.id] ?? {}) };
+      const a = await renderBox(ex.src, true, c3);
+      const b = await renderBox(ex.src, false, c3);
+      let diff = 0, maxd = 0;
+      for (let i = 0; i < a.length; i += 4) {
+        const dd = Math.max(Math.abs(a[i] - b[i]), Math.abs(a[i + 1] - b[i + 1]), Math.abs(a[i + 2] - b[i + 2]));
+        if (dd > 2) diff++;
+        maxd = Math.max(maxd, dd);
+      }
+      const frac = diff / (CW * CH);
+      ok(`skip parity: ${ex.id}`, frac <= 0.01, `${(frac * 100).toFixed(2)}% of pixels differ (max Δ${maxd.toFixed(0)}/255)`);
+      if (frac <= 0.01) parity++;
+    } catch (e: any) { ok(`skip parity: ${ex.id}`, false, e.message); }
+  }
+  ok("every 3d example passes parity", parity === 8, `${parity}/8`);
+  pinned.destroy();
+}
 
 renderer.destroy();
 console.log(fails ? `\n${fails} FAILURES` : "\nall 3d checks passed");

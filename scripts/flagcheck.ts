@@ -54,18 +54,18 @@ type Flags = Partial<typeof SHADER_FLAGS>;
 // every setting the menu can produce: the shipped default, everything off, the master switch, each
 // branch option on its own, and the two groups of "other codegen" rows
 const COMBOS: { name: string; flags: Flags }[] = [
-  { name: "shipped", flags: { polySelect: false, textBranchless: false, cullWeight: 4, flattenIf: false, unrollMax: 0, textWindow: false, branchless: false, noShortCircuit: true, cullSelect: false, branchless3D: false } },
-  { name: "all-off", flags: { polySelect: false, textBranchless: false, cullWeight: 4, flattenIf: false, unrollMax: 0, textWindow: false, branchless: false, noShortCircuit: false, cullSelect: false, branchless3D: false } },
-  { name: "branchless", flags: { polySelect: false, textBranchless: false, cullWeight: 4, flattenIf: false, unrollMax: 0, textWindow: false, branchless: true, noShortCircuit: true, cullSelect: false, branchless3D: false } },
-  { name: "cullSelect", flags: { polySelect: false, textBranchless: false, cullWeight: 4, flattenIf: false, unrollMax: 0, textWindow: false, branchless: false, noShortCircuit: true, cullSelect: true, branchless3D: false } },
-  { name: "branchless3D", flags: { polySelect: false, textBranchless: false, cullWeight: 4, flattenIf: false, unrollMax: 0, textWindow: false, branchless: false, noShortCircuit: true, cullSelect: false, branchless3D: true } },
-  { name: "selects", flags: { polySelect: true, textBranchless: true, cullWeight: 4, flattenIf: true, unrollMax: 0, textWindow: true, branchless: false, noShortCircuit: true, cullSelect: false, branchless3D: false } },
-  { name: "unroll8+cull1", flags: { polySelect: false, textBranchless: false, cullWeight: 1, flattenIf: false, unrollMax: 8, textWindow: false, branchless: false, noShortCircuit: true, cullSelect: false, branchless3D: false } },
+  { name: "shipped", flags: { polySelect: false, textBranchless: false, cullWeight: 4, flattenIf: false, unrollMax: 0, textWindow: false, branchless: false, noShortCircuit: true, cullSelect: false, branchless3D: false, sdfSteps: 128 } },
+  { name: "all-off", flags: { polySelect: false, textBranchless: false, cullWeight: 4, flattenIf: false, unrollMax: 0, textWindow: false, branchless: false, noShortCircuit: false, cullSelect: false, branchless3D: false, sdfSteps: 128 } },
+  { name: "branchless", flags: { polySelect: false, textBranchless: false, cullWeight: 4, flattenIf: false, unrollMax: 0, textWindow: false, branchless: true, noShortCircuit: true, cullSelect: false, branchless3D: false, sdfSteps: 128 } },
+  { name: "cullSelect", flags: { polySelect: false, textBranchless: false, cullWeight: 4, flattenIf: false, unrollMax: 0, textWindow: false, branchless: false, noShortCircuit: true, cullSelect: true, branchless3D: false, sdfSteps: 128 } },
+  { name: "branchless3D", flags: { polySelect: false, textBranchless: false, cullWeight: 4, flattenIf: false, unrollMax: 0, textWindow: false, branchless: false, noShortCircuit: true, cullSelect: false, branchless3D: true, sdfSteps: 128 } },
+  { name: "selects", flags: { polySelect: true, textBranchless: true, cullWeight: 4, flattenIf: true, unrollMax: 0, textWindow: true, branchless: false, noShortCircuit: true, cullSelect: false, branchless3D: false, sdfSteps: 128 } },
+  { name: "unroll8+cull1", flags: { polySelect: false, textBranchless: false, cullWeight: 1, flattenIf: false, unrollMax: 8, textWindow: false, branchless: false, noShortCircuit: true, cullSelect: false, branchless3D: false, sdfSteps: 128 } },
 ];
 const setFlags = (f: Flags) => { Object.assign(SHADER_FLAGS, f); };
 const BASE = COMBOS[0].flags;
 
-interface Shot { hash: string; nan: number }
+interface Shot { hash: string; nan: number; lit: number }
 function renderSlice(src: string): { shot: Shot; params: number[]; walk: number[]; code: string; key: string | null; reused: boolean } {
   const it = new Interp(atlas, { viewport: { x: -VW / 2, y: -VH / 2, w: VW, h: VH }, time: TIME, mouse: { x: 120, y: 60, down: false }, params: {} });
   const r = it.run(src);
@@ -117,7 +117,12 @@ async function renderSolid(src: string): Promise<Shot> {
   const img = canvas.getContext("2d").getImageData(0, 0, W3, H3).data;
   const nan = renderer.stats.nan;
   renderer.destroy();
-  return { hash: fnv(img), nan };
+  let lit = 0;
+  for (let i = 0; i < W3 * H3; i++) {
+    const q = i * 4;
+    if (Math.abs(img[q] - BG[0] * 255) > 1.5 || Math.abs(img[q + 1] - BG[1] * 255) > 1.5 || Math.abs(img[q + 2] - BG[2] * 255) > 1.5) lit++;
+  }
+  return { hash: fnv(img), nan, lit };
 }
 
 const want = process.argv.slice(2).filter((a) => !a.startsWith("--"));
@@ -193,5 +198,51 @@ for (const ex of EXAMPLES) {
   for (const i of info) console.log(`    ${i}`);
 }
 setFlags(BASE);
+
+// ---- the sdf-steps setting: a quality knob, not an invariance knob ------------------------
+// Unlike every other option in the menu, the step count MAY change the solid view's pixels —
+// trading grazing-surface fidelity for march time is its point.  What must still hold:
+//   • the 2D slice view has no marcher, so its pixels cannot move with the count
+//   • the parameter buffer and the generated body do not move (the flag is deliberately absent
+//     from flagsKey — body/param caches stay valid across a change)
+//   • hits are monotone in the count: the first N steps of an M-step march are the same march,
+//     so lit(32) ≤ lit(64) ≤ lit(128) ≤ lit(256), and the NaN count likewise
+console.log("\nsdf steps (3d group)");
+for (const ex of EXAMPLES.filter((e) => e.group === "3d")) {
+  if (want.length && !want.includes(ex.id)) continue;
+  const save = { ...SHADER_FLAGS };
+  const notes: string[] = [];
+  try {
+    setFlags(BASE);
+    SHADER_FLAGS.sdfSteps = 128;
+    const base = renderSlice(ex.src);
+    let baseParams: number[] | null = null, baseCode = "";
+    const lit: number[] = [], nan: number[] = [];
+    for (const n of [32, 64, 128, 256]) {
+      SHADER_FLAGS.sdfSteps = n;
+      const sl = renderSlice(ex.src);
+      if (sl.shot.hash !== base.shot.hash) notes.push(`steps=${n}: slice pixels differ — the 2D view has no marcher`);
+      if (sl.shot.nan) notes.push(`steps=${n}: non-finite distance ×${sl.shot.nan} in the slice view`);
+      const r2 = new Interp(atlas, { viewport: { x: -VW / 2, y: -VH / 2, w: VW, h: VH }, time: TIME, mouse: { x: 120, y: 60, down: false }, params: {} }).run(ex.src);
+      const js = compileTree(r2.shape!, atlas, "js", null, undefined, "slice");
+      if (baseParams === null) { baseParams = [...js.params]; baseCode = js.code; }
+      else {
+        if (js.params.length !== baseParams.length || js.params.some((v, i) => v !== baseParams[i])) notes.push(`steps=${n}: parameter buffer moved`);
+        if (js.code !== baseCode) notes.push(`steps=${n}: body code moved`);
+      }
+      const so = await renderSolid(ex.src);
+      lit.push(so.lit); nan.push(so.nan);
+    }
+    for (let i = 1; i < lit.length; i++) {
+      if (lit[i] < lit[i - 1]) notes.push(`lit pixels went down as steps went up (${lit.join(", ")}) — the first N steps of an M-step march are the same march`);
+      if (nan[i] < nan[i - 1]) notes.push(`NaN count went down as steps went up (${nan.join(", ")})`);
+    }
+    if (notes.length) { fails++; console.log(`ERR ${ex.id.padEnd(14)}\n    ${notes.join("\n    ")}`); }
+    else console.log(`OK  ${ex.id.padEnd(14)} 2d untouched · params/body fixed · lit ${lit.join(" ≤ ")}`);
+  } catch (e: any) { fails++; console.log(`ERR ${ex.id.padEnd(14)} ${e.message}`); }
+  finally { Object.assign(SHADER_FLAGS, save); }
+}
+setFlags(BASE);
+
 console.log(fails ? `\n${fails} FLAG FAILURES` : `\nevery flag setting renders identically (${COMBOS.length} settings × ${EXAMPLES.length} examples)`);
 if (fails) process.exitCode = 1;

@@ -3,7 +3,7 @@
 // shader code by subcurv.ts; `solve { ... }` blocks compile to a psolve problem.
 import { parse, CurvError, type Expr, type Def, type Pat, type ListItem, type Stmt } from "./parser";
 import { Lin, Quad, Cons, Problem, STRENGTH, type Rel, type ConstraintResult } from "../psolve/constraints";
-import { Shape, type SNode, type RGBA, type BBox, type ShaderFn, type GenCtx, type ViewMode, genShape, bboxOf, bbox3Of, finiteBBox, structKey, walkParams, nodeHash, inode, flags3Of } from "./shapes";
+import { Shape, type SNode, type RGBA, type BBox, type BBox3, type ShaderFn, type GenCtx, type ViewMode, genShape, bboxOf, bbox3Of, marchBoxOf, finiteBBox, finiteBBox3, structKey, walkParams, nodeHash, inode, flags3Of } from "./shapes";
 import { measureText, type Atlas } from "../gpu/atlas";
 import { PRELUDE } from "./prelude";
 import { JS, WGSL, ParamsOnly, makeJSRuntime, type Gen, type E } from "../gpu/gen";
@@ -1398,7 +1398,11 @@ function showSolved(v: Value): string {
 
 export interface CompiledTree { code: string; d: string; c: string; params: Float32Array; key: string | null; reused: boolean;
   /** compiled user shader code reads the time (`[x,y,z,t]` argument or `time`): the picture animates even if the evaluator saw no `time` */
-  usesTime: boolean }
+  usesTime: boolean;
+  /** the scene's finite 3D bounding box, recomputed on every compilation (the numbers may move even
+   *  when the structure — and therefore the cached body — does not): the solid view's marcher skips
+   *  the empty space outside it.  null in the slice view and for unbounded scenes. */
+  bbox3: BBox3 | null }
 
 /**
  * Compile a whole program (shape tree) for a backend.  If `prev` is the result of a previous
@@ -1414,14 +1418,20 @@ const CODE_LRU_MAX = 32;
 export function compileTree(node: SNode, atlas: Atlas, target: "wgsl" | "js", prev: CompiledTree | null = null, defaultColour: RGBA = DEFAULT_COLOUR, mode: ViewMode = "slice"): CompiledTree {
   const cull = mode === "slice"; // bbox culling + coverage AA only make sense in the 2D (slice) view
   const key = structKey(node, atlas, cull);
+  // the marcher's empty-space skip needs the box on every path — including the params-only reuse
+  // below, which is exactly where a moving number (a solved layout, an animated radius) shifts it.
+  // marchBoxOf only returns boxes derived from geometry: a custom shape's declared bbox drives the
+  // camera fit but may be smaller than the field (mandelbrot is `everything.dist`), so it must not
+  // clip the march
+  const bbox3 = mode === "solid" ? finiteBBox3(marchBoxOf(node, atlas)) : null;
   // (buffer length may legitimately differ: text / polygon blocks use parameterised offsets)
-  if (prev && key !== null && prev.key === key) return { ...prev, params: collectParamsFast(node, atlas, defaultColour, cull), reused: true };
+  if (prev && key !== null && prev.key === key) return { ...prev, params: collectParamsFast(node, atlas, defaultColour, cull), bbox3, reused: true };
   if (key !== null) {
     const lk = target + "|" + key;
     const hit = codeLru.get(lk);
     if (hit) {
       codeLru.delete(lk); codeLru.set(lk, hit); // refresh
-      return { code: hit.code, d: hit.d, c: hit.c, params: collectParamsFast(node, atlas, defaultColour, cull), key, reused: true, usesTime: hit.usesTime };
+      return { code: hit.code, d: hit.d, c: hit.c, params: collectParamsFast(node, atlas, defaultColour, cull), key, bbox3, reused: true, usesTime: hit.usesTime };
     }
   }
   const g: Gen = target === "wgsl" ? new WGSL() : new JS();
@@ -1434,7 +1444,7 @@ export function compileTree(node: SNode, atlas: Atlas, target: "wgsl" | "js", pr
     in3d: mode === "solid",
   };
   const r = genShape(g, node, { t: "v3", s: "p0" }, ctx);
-  const out: CompiledTree = { code: g.code(), d: r.d.s, c: r.c.s, params: new Float32Array(g.finalParams()), key, reused: false, usesTime: g.usesTime };
+  const out: CompiledTree = { code: g.code(), d: r.d.s, c: r.c.s, params: new Float32Array(g.finalParams()), key, bbox3, reused: false, usesTime: g.usesTime };
   if (key !== null) {
     const lk = target + "|" + key;
     codeLru.set(lk, { d: out.d, c: out.c, code: out.code, usesTime: g.usesTime });

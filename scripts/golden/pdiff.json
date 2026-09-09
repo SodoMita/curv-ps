@@ -124,7 +124,7 @@
       "nan": 0
     },
     "ball3d@solid": {
-      "hash": "ebcd0edf",
+      "hash": "2f1de780",
       "lit": 2572,
       "nan": 0
     },
@@ -134,7 +134,7 @@
       "nan": 0
     },
     "rings3d@solid": {
-      "hash": "cc2ad32e",
+      "hash": "309f476f",
       "lit": 1579,
       "nan": 0
     },
@@ -144,7 +144,7 @@
       "nan": 0
     },
     "molecule3d@solid": {
-      "hash": "a59d3faa",
+      "hash": "89fc7f68",
       "lit": 1303,
       "nan": 0
     },
@@ -154,7 +154,7 @@
       "nan": 0
     },
     "twist3d@solid": {
-      "hash": "bd080115",
+      "hash": "4702a2fe",
       "lit": 1173,
       "nan": 0
     },
@@ -174,7 +174,7 @@
       "nan": 0
     },
     "loft3d@solid": {
-      "hash": "f22311be",
+      "hash": "737200f2",
       "lit": 2306,
       "nan": 0
     },
@@ -194,7 +194,7 @@
       "nan": 0
     },
     "pulse3d@solid": {
-      "hash": "022ddd70",
+      "hash": "8b52a8ad",
       "lit": 2104,
       "nan": 0
     }

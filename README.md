@@ -25,7 +25,8 @@ in union [ card L.side, for (c in L.cards) card c ]
 Highlights: the bottom **shader generation** panel switches the shader generator between `branched` (bbox-cull and
 raymarch early-outs) and `branchless` (no `if`, no `break`, no short-circuit — both arms of every branch evaluated,
 measured 3× slower in 2D and 10× in the 3D view) and exposes the other codegen options (cull weight, loop unrolling,
-polygon/text/SubCurv variants), each with its measured cost — it stacks with the parametric and solver-trace
+polygon/text/SubCurv variants, and the 3D raymarch's **sdf steps** — a compile-time constant baked into the shader as a
+loop-bound literal, not a uniform), each with its measured cost — it stacks with the parametric and solver-trace
 panels — every seam between two regions is draggable (canvas/panels, editor/preview, panel/panel, the reference drawer, the code overlay; double-click hands it back to the layout) — and any of the three folds to a thin labelled bar; the **`WGSL` / `JS` view** shows the *whole* shader the backend compiles (uniforms, entry point
 and the 3D raymarch loop), with the generated body one click away; shaders are reused across frames (only a parameter buffer is refilled by a memoised tree walk), a `solve`
 block whose inputs (free variables, tracked through closures, shapes hashed by content) did not change is not
@@ -34,6 +35,8 @@ that are expensive enough are memoised across frames the same way (profile-guide
 read `parametric` or print are never memoised), programs that only use `time` inside compiled shader code animate by
 re-rendering the same tree, layout combinators (`hstack`, `grid`, `flow`, `hstack_fit`, …) are plain Curv functions
 that return constraint values, and text is an SDF atlas (ASCII + Latin-1 + symbols, kerned).
+
+* `npx tsx scripts/marchbench.ts [example …]` — round-23 marcher benchmark: ms/frame and SDF evaluations per frame for the 3D raymarcher's **bbox empty-space skip** (in-process A/B: the same program with its bounding box vs with it stripped) and the `sdfSteps` sweep (32/64/128/256 — the comptime loop bound), plus the WGSL loop line per step count
 
 The solver is psolve's own wasm bridge (ABI 3, reproducibly built — see `psolve-src/PIN`): the previous frame's
 solution is fed back as a **warm start** (pixel-identical layouts at a fraction of the time on drag frames), a solve

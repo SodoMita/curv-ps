@@ -54,9 +54,22 @@ export interface ShaderFlags {
    *  `branchless`, which masks *every* conditional the same way. */
   cullSelect: boolean;
   /** the hand-written 3D raymarch wrapper (src/gpu/renderer.ts): no `if`, no `break` — every ray
-   *  runs all 128 steps and is shaded even when it hits nothing.  Measured separately because it
-   *  is by far the most expensive of the four. */
+   *  runs all `sdfSteps` steps and is shaded even when it hits nothing.  Measured separately
+   *  because it is by far the most expensive of the four. */
   branchless3D: boolean;
+  /**
+   * 3D raymarch: maximum sphere-tracing steps per ray.  A **compile-time constant of codegen,
+   * not a uniform**: the loop bound is baked into the generated WGSL (and into the CPU fallback's
+   * generated marcher) as a literal, so the shader compiler knows the trip count and can unroll
+   * and constant-fold around it — and a change recompiles the pipeline (the bound is part of the
+   * pipeline key, `keyOf` in renderer.ts) rather than paying an indirection every iteration.
+   * Fewer steps march faster but can miss grazing surfaces (hits are monotone in the count: the
+   * first N steps of an M-step march are the same march); more steps are slower and exhaustive.
+   * Body code and the parameter buffer do not depend on it, so — unlike the emission flags — it
+   * is deliberately NOT part of `flagsKey`: the body/param caches stay valid across a change.
+   * Default 128, the count the marcher was hardcoded to before the option existed.
+   */
+  sdfSteps: number;
 }
 /**
  * Defaults, as measured by `scripts/branchbench.ts` (CPU fallback, best-of-N, pinned resolution):
@@ -66,8 +79,15 @@ export interface ShaderFlags {
  *     the 3D view (the raymarch loses its early-out), so it is off.  Flip it here or from the
  *     console (`SHADER_FLAGS.branchless = true`) to build the branchless variant.
  */
-export const SHADER_FLAGS: ShaderFlags = { polySelect: false, textBranchless: false, cullWeight: 4, flattenIf: false, unrollMax: 0, textWindow: false, branchless: false, noShortCircuit: true, cullSelect: false, branchless3D: false };
+export const SHADER_FLAGS: ShaderFlags = { polySelect: false, textBranchless: false, cullWeight: 4, flattenIf: false, unrollMax: 0, textWindow: false, branchless: false, noShortCircuit: true, cullSelect: false, branchless3D: false, sdfSteps: 128 };
+/** The sanitised step count every consumer bakes in (the menu only offers these values; this
+ *  guards the console — `SHADER_FLAGS.sdfSteps = 0` would otherwise emit `i < 0u`). */
+export const sdfSteps = () => { const n = Math.round(SHADER_FLAGS.sdfSteps); return Number.isFinite(n) && n >= 1 ? Math.min(n, 4096) : 128; };
 export const flagsKey = () => (SHADER_FLAGS.polySelect ? "p" : "") + (SHADER_FLAGS.textBranchless ? "T" : "") + "w" + SHADER_FLAGS.cullWeight + (SHADER_FLAGS.flattenIf ? "f" : "") + "u" + SHADER_FLAGS.unrollMax + (SHADER_FLAGS.textWindow ? "G" : "") + (SHADER_FLAGS.branchless ? "B" : "") + (SHADER_FLAGS.noShortCircuit ? "L" : "") + (SHADER_FLAGS.cullSelect ? "C" : "") + (SHADER_FLAGS.branchless3D ? "3" : "");
+// (`sdfSteps` is intentionally absent: it changes only the 3D wrapper, never the body or the
+//  parameter buffer, so the body/param caches this key guards stay valid across a steps change.
+//  The wrapper-only inputs are keyed where they matter: the pipeline key in renderer.ts and the
+//  code panel's refresh key in App.tsx — both include the step count.)
 /** A branch is worth removing only when the flag says so; the individual flags remain for A/B. */
 export const branchless = () => SHADER_FLAGS.branchless;
 /** `&&`/`||` → `&`/`|`: on its own (no masked `if`s) or as part of the branchless build. */
