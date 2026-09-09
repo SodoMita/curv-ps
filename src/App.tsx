@@ -451,7 +451,13 @@ export default function App() {
     const strip = code.replace(/\/\/[^\n]*/g, "");
     return { lines: code ? code.split("\n").length : 0, ifs: (strip.match(/\bif\s*\(/g) ?? []).length, brks: (strip.match(/\bbreak\b|\bcontinue\b/g) ?? []).length, logic: (strip.match(/&&|\|\|/g) ?? []).length, loops: (strip.match(/\bfor\s*\(/g) ?? []).length };
   }, [code]);
-  const bottomCount = (params.length ? 1 : 0) + (traces.length ? 1 : 0);
+  // the bottom row always holds the shader-generation panel; the params and solver panels join it
+  // when the program has parameters or solve blocks
+  const bottomCount = 1 + (params.length ? 1 : 0) + (traces.length ? 1 : 0);
+  const cols = params.length && traces.length ? "minmax(200px,24%) minmax(0,1fr) minmax(230px,26%)"
+    : params.length ? "minmax(220px,34%) minmax(230px,30%)"
+    : traces.length ? "minmax(0,1fr) minmax(230px,30%)"
+    : "1fr";
   const fmtZoom = (z: number) => (z >= 100 ? z.toFixed(0) : z >= 1 ? z.toFixed(z >= 10 ? 1 : 2) : z.toPrecision(2));
 
   return (
@@ -514,7 +520,7 @@ export default function App() {
         </section>
 
         {/* right: preview + panels (first on mobile so the canvas is what you see and touch) */}
-        <section className={cn("order-first grid min-h-[80vh] lg:order-none lg:min-h-0", bottomCount ? "grid-rows-[minmax(0,1fr)_minmax(160px,34%)]" : "grid-rows-[minmax(0,1fr)_auto]")}>
+        <section className={cn("order-first grid min-h-[80vh] lg:order-none lg:min-h-0", bottomCount > 1 ? "grid-rows-[minmax(0,1fr)_minmax(170px,34%)]" : "grid-rows-[minmax(0,1fr)_minmax(150px,26%)]")}>
           <div className="flex min-h-0 flex-col">
             <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 border-b border-line px-3 py-2 text-[11px] text-muted sm:px-4">
               <span className="font-semibold uppercase tracking-[0.14em]">Preview</span>
@@ -544,7 +550,6 @@ export default function App() {
                   debugBoxes ? "border-[#ff73b5]/50 bg-[#ff73b5]/10 text-[#ff73b5]" : "border-line/60 hover:bg-surface-2")}>
                 <input type="checkbox" checked={debugBoxes} onChange={(e) => setDebugBoxes(e.target.checked)} className={cn(debugBoxes ? "accent-[#ff73b5]" : "accent-[#7c5cff]")} />debug boxes</label>
               <button onClick={() => setShowCode((s) => !s)} className={cn("rounded-md border border-line px-2 py-0.5 hover:bg-surface-2", showCode && "bg-surface-3 text-fg")}>{renderer.current?.kind === "cpu" ? "JS" : "WGSL"}</button>
-              <GenOptions flags={gen} onChange={applyGen} census={census} />
             </div>
             <div className="relative min-h-0 flex-1 overflow-hidden bg-[#0e1322] p-3 sm:p-4"
               style={{ backgroundImage: "radial-gradient(circle at 1px 1px, #1d2537 1px, transparent 0)", backgroundSize: "20px 20px" }}>
@@ -565,12 +570,11 @@ export default function App() {
               )}
             </div>
           </div>
-          {bottomCount > 0 && (
-            <div className="grid min-h-0 border-t border-line bg-ink" style={{ gridTemplateColumns: params.length && traces.length ? "minmax(220px,34%) 1fr" : "1fr" }}>
-              {params.length > 0 && <div className="min-h-0 overflow-auto border-r border-line"><ParamsPanel params={params} values={paramValues} onChange={(n, v) => setParamValues((p) => ({ ...p, [n]: v }))} onReset={() => setParamValues({})} /></div>}
-              {traces.length > 0 && <div className="min-h-0"><SolverPanel traces={traces} evalMs={stats.evalMs} fps={stats.fps} /></div>}
-            </div>
-          )}
+          <div className="grid min-h-0 border-t border-line bg-ink" style={{ gridTemplateColumns: cols }}>
+            {params.length > 0 && <div className="min-h-0 overflow-auto border-r border-line"><ParamsPanel params={params} values={paramValues} onChange={(n, v) => setParamValues((p) => ({ ...p, [n]: v }))} onReset={() => setParamValues({})} /></div>}
+            {traces.length > 0 && <div className="min-h-0 border-r border-line"><SolverPanel traces={traces} evalMs={stats.evalMs} fps={stats.fps} /></div>}
+            <div className="min-h-0 bg-surface/40"><GenOptions flags={gen} onChange={applyGen} census={census} /></div>
+          </div>
         </section>
       </div>
 
