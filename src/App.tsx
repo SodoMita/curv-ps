@@ -537,9 +537,12 @@ export default function App() {
                 <span className="w-9 font-mono">{previewPct}%</span>
               </label>
               <button onClick={() => setBgMode((m) => (m === "light" ? "dark" : "light"))} title="Background" className="rounded-md border border-line px-2 py-0.5 font-mono hover:bg-surface-2">{bgMode === "light" ? "☼ light" : "☾ dark"}</button>
-              <label title="Debug overlay: outline every solved box in pink.  It draws the boxes the solver computed — a drawing aid, not an optimisation (it adds shapes, so it costs a little)."
-                className={cn("flex items-center gap-1.5", debugBoxes && "text-[#ff73b5]")}>
-                <input type="checkbox" checked={debugBoxes} onChange={(e) => setDebugBoxes(e.target.checked)} className={cn(debugBoxes ? "accent-[#ff73b5]" : "accent-[#7c5cff]")} />boxes</label>
+              {/* the pink rectangles: a debug overlay that draws the boxes `solve` computed.  It is
+                  not an optimisation (it adds shapes, so it costs a little) — hence the name. */}
+              <label title="Debug overlay — draws the boxes the solver computed as pink outlines on top of the picture. This is a drawing aid for `solve { }` blocks, NOT an optimisation: it adds shapes, so it costs a little performance."
+                className={cn("flex items-center gap-1.5 rounded-md border px-1.5 py-0.5 transition-colors",
+                  debugBoxes ? "border-[#ff73b5]/50 bg-[#ff73b5]/10 text-[#ff73b5]" : "border-line/60 hover:bg-surface-2")}>
+                <input type="checkbox" checked={debugBoxes} onChange={(e) => setDebugBoxes(e.target.checked)} className={cn(debugBoxes ? "accent-[#ff73b5]" : "accent-[#7c5cff]")} />debug boxes</label>
               <button onClick={() => setShowCode((s) => !s)} className={cn("rounded-md border border-line px-2 py-0.5 hover:bg-surface-2", showCode && "bg-surface-3 text-fg")}>{renderer.current?.kind === "cpu" ? "JS" : "WGSL"}</button>
               <GenOptions flags={gen} onChange={applyGen} census={census} />
             </div>
