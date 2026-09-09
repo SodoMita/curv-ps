@@ -24,7 +24,7 @@ Highlights: the bottom **shader generation** panel switches the shader generator
 raymarch early-outs) and `branchless` (no `if`, no `break`, no short-circuit — both arms of every branch evaluated,
 measured 3× slower in 2D and 10× in the 3D view) and exposes the other codegen options (cull weight, loop unrolling,
 polygon/text/SubCurv variants), each with its measured cost — it stacks with the parametric and solver-trace
-panels, and any of the three folds to a thin labelled bar; the **`WGSL` / `JS` view** shows the *whole* shader the backend compiles (uniforms, entry point
+panels — every seam between two regions is draggable (canvas/panels, editor/preview, panel/panel, the reference drawer, the code overlay; double-click hands it back to the layout) — and any of the three folds to a thin labelled bar; the **`WGSL` / `JS` view** shows the *whole* shader the backend compiles (uniforms, entry point
 and the 3D raymarch loop), with the generated body one click away; shaders are reused across frames (only a parameter buffer is refilled by a memoised tree walk), a `solve`
 block whose inputs (free variables, tracked through closures, shapes hashed by content) did not change is not
 re-evaluated at all, unchanged numeric problems are additionally served from a fingerprint cache, pure user functions

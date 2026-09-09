@@ -1,5 +1,5 @@
 import type { ParamDesc } from "../curv/interp";
-import { CollapseButton, CollapsedBar } from "./Panel";
+import { CollapsedBar, PanelHeader } from "./Panel";
 
 type V = number | boolean | number[];
 interface Props { params: ParamDesc[]; values: Record<string, V>; onChange: (name: string, v: V) => void; onReset: () => void; collapsed?: boolean; onToggle?: () => void }
@@ -8,14 +8,10 @@ export function ParamsPanel({ params, values, onChange, onReset, collapsed, onTo
   if (collapsed) return <CollapsedBar title="parametric" sub={`${params.length}`} onOpen={onToggle ?? (() => {})} />;
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="flex items-center justify-between border-b border-line px-4 py-2">
-        <div className="flex items-center gap-1 text-[11px] font-semibold uppercase tracking-[0.14em] text-muted">
-          {onToggle && <CollapseButton onToggle={onToggle} title="Fold this panel" />}
-          parametric
-        </div>
-        <button onClick={onReset} className="rounded border border-line px-1.5 py-0.5 font-mono text-[10px] text-muted hover:bg-surface-2">defaults</button>
-      </div>
-      <div className="min-h-0 flex-1 space-y-2.5 overflow-auto p-3">
+      <PanelHeader title="parametric" onToggle={onToggle ?? (() => {})}>
+        <button onClick={onReset} className="shrink-0 rounded border border-line px-1.5 py-0 font-mono text-[9.5px] text-muted hover:bg-surface-2">defaults</button>
+      </PanelHeader>
+      <div className="min-h-0 flex-1 space-y-2 overflow-auto p-2">
         {params.map((p) => {
           const cur = values[p.name] ?? p.value;
           if (p.kind === "checkbox") return (

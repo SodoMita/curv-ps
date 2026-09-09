@@ -1,5 +1,5 @@
 import { cn } from "../utils/cn";
-import { CollapseButton, CollapsedBar } from "./Panel";
+import { CollapsedBar, PanelHeader } from "./Panel";
 
 /**
  * Shader-generation options (the `SHADER_FLAGS` of src/gpu/gen.ts), as a panel at the bottom of the
@@ -56,19 +56,17 @@ export function GenOptions({ flags, onChange, census, collapsed, onToggle }: { f
 
   return (
     <div className="flex h-full min-h-0 flex-col text-[11px] text-muted">
-      <div className="flex items-center gap-2 border-b border-line px-2 py-1">
-        {onToggle && <CollapseButton onToggle={onToggle} title="Fold this panel" />}
-        <span className="font-semibold uppercase tracking-[0.12em] text-fg/70">shader generation</span>
-        <div className="ml-auto flex overflow-hidden rounded-md border border-line">
+      <PanelHeader title="shader generation" onToggle={onToggle ?? (() => {})}>
+        <div className="flex shrink-0 overflow-hidden rounded border border-line">
           {(["branched", "branchless"] as const).map((m, i) => (
             <button key={m} onClick={() => onChange({ branchless: i === 1 })}
               title={i === 1 ? "no if / break / short-circuit: both arms of every branch are computed" : "cull and early-out branches are kept — the fast build"}
-              className={cn("px-2 py-0.5 font-mono transition-colors", (flags.branchless ? i === 1 : i === 0) ? "bg-accent/80 text-white" : "hover:bg-surface-2")}>
+              className={cn("px-1.5 py-0 font-mono text-[9.5px] transition-colors", (flags.branchless ? i === 1 : i === 0) ? "bg-accent/80 text-white" : "hover:bg-surface-2")}>
               {m}
             </button>
           ))}
         </div>
-      </div>
+      </PanelHeader>
 
       <div className="min-h-0 flex-1 overflow-auto px-2 py-1.5">
         <div className="px-1 pb-1 text-[10px] leading-snug">
@@ -97,7 +95,7 @@ export function GenOptions({ flags, onChange, census, collapsed, onToggle }: { f
         </div>
       </div>
 
-      <div className="border-t border-line px-2 py-1 font-mono text-[10px] text-fg/60">
+      <div className="border-t border-line px-2 py-[3px] font-mono text-[9.5px] text-fg/60">
         last shader: {census.lines} lines · {census.ifs} if · {census.brks} break · {census.logic} &amp;&amp; ||· {census.loops} loops
       </div>
     </div>

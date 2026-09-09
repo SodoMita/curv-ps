@@ -149,11 +149,23 @@ which is a nudge towards measuring `polySelect` on its own.
 census of the last compiled shader (`N lines · i if · b break · s && || · L loops`).  (It started as a
 popover off the toolbar; ten options and their costs do not fit in one and cannot be read while
 dragging a slider, so it is a panel now — the last of the bottom row's three panels.)  All three bottom panels (parametric, solver trace, shader generation) **stack and fold**: they sit one
-above the other at full width — three columns of a wide table were three narrow tables — and each has
-a chevron in its header that folds it to a thin horizontal bar, its title left to right
-(`src/components/Panel.tsx`).  Folding one gives the others its height instead of hiding it, and the
-row itself grows with what is open (28% for one panel, 38% for two, 48% for three) and shrinks to a
-stack of bars when everything is folded.  Flipping an option
+above the other at full width — three columns of a wide table were three narrow tables — and fold to a
+thin bar titled left to right (`src/components/Panel.tsx`).  The **whole header** is the fold target,
+chevron and title together, not the 12px arrow; the panel's own actions (reset, the branched switch,
+the timings) stay to the right of it.  Both bars are ~18px: every pixel of chrome is a pixel the
+content does not get.  Folding one gives the others its height, the row grows with what is open
+(32% / 44% / 54%, floored by `min(150px,50%)` / `min(230px,55%)` / `min(320px,60%)` so a landscape
+window cannot squeeze a panel down to its title).  **Every seam between two regions is draggable**
+(`src/components/Splitter.tsx`): the one between the canvas and the row takes an explicit height,
+the vertical one between the editor column and the preview column takes an explicit width, the seam
+between two open panels trades height between just those two (the pair's total is untouched, so the
+third panel never moves), the reference drawer has one on its top edge, and the code view (the WGSL/JS
+overlay) has one on its bottom edge, so it can be made short enough to keep the picture in sight.  Double-click — or Enter —
+hands any of them back to the layout, the arrow keys nudge a focused seam by 16px, and each drag is
+floored (a panel keeps 44px, the editor column 280px, the preview 360px) and clamped to the window, so
+no region can be dragged out of existence; a dragged size is re-clamped when the window changes under
+it.  The inter-panel seams are **overlays**, not tracks: they float on the border between two panels
+and cost no layout height, which is the same reason the bars are thin.  Flipping an option
 mutates `SHADER_FLAGS` and clears `lastProg`/`staticCache`; three `wgslcheck` checks keep that honest:
 switching to `branchless` must produce different code (not a reused shader), switching back must restore
 the old text, and the **parameter layout must not move** (292 params either way) — the menu cannot be
@@ -597,8 +609,10 @@ src/curv/shapes.ts      SNode F-Rep tree, bboxOf/bbox3Of (memoised), flags3Of, t
 src/curv/prelude.ts     palette, box helpers, layout combinators (incl. flow / hstack_fit), UI components — in Curv
 src/curv/examples.ts    example programs (group "solve" | "curv" | "3d")
 src/gpu/gen.ts          code generators: WGSL, JS, ParamsOnly; dynBlock/finalParams; Gen.usesTime
-src/components/Panel.tsx       folding for the bottom row: collapsed strip + the header chevron, shared by
+src/components/Panel.tsx       folding for the bottom row: collapsed bar + the header chevron, shared by
                         all three panels
+src/components/Splitter.tsx    a draggable edge between two regions (bar = its own track, overlay =
+                        floats on a seam); reports a pixel delta, knows no geometry
 src/components/GenOptions.tsx  the bottom-row shader-generation panel (branched / branchless + every
                         SHADER_FLAGS option, with measured costs and a branch census)
 src/gpu/renderer.ts     WebGPU renderer (pipeline cache keyed by code, timestamp queries) + CPU
