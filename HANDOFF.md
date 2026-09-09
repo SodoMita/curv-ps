@@ -52,6 +52,34 @@ setting ran before it), compares every setting's pixels and parameter buffer aga
 default in both view modes, checks the walked buffer against the codegen buffer, and asserts the two
 view modes never share a compiled program.
 
+### Reported from the browser: the 3D view was empty, and the tooltip lost its camera
+
+Three defects the headless gates could not see — all three are things the browser does that the
+gates do not (run the WGSL, fit a camera, wait for a pointer):
+
+* **The 3D view rendered nothing on the GPU.**  The hand-written WGSL wrapper built its ray
+  direction from `(pixel - res * 0.5) * 2.0`, where the CPU marcher has
+  `((i + 0.5) - w * 0.5) / (w * 0.5)`.  So `nd` came out ~res wide instead of ±1 and every ray left
+  the eye at a right angle to the view axis — measured 89.9° at the frame corner against the CPU's
+  31.3° — with a 38° fov, nothing was ever inside the frustum.  Both backends share the generated
+  body but each has its own camera code, so the CPU fallback (and therefore all 35 golden frames)
+  looked perfect.  `scripts/wgslcheck.ts` now compares the two formulas' shape: parsing cannot catch
+  this, and it is the second WGSL-only defect to reach `main` (round 18 was the brace-less `if`).
+* **The far plane was 400 units, absolute.**  A viewport-sized program is ~900 units across, so the
+  3D auto-fit puts the eye ~1900 units out and every ray stopped before it reached the shape:
+  `split`, `dashboard`, `stacks`, `buttons`, `toolbar`, `wrapfit`, `chart` were a transparent screen
+  (0.0% of pixels lit).  `FAR` now follows the camera — `max(400, dist * 6)` — in both backends, and
+  those examples went from 0% to 44–55% lit.
+* **The mouse sentinel broke the one-shot camera fit.**  With no pointer over the canvas the app
+  reported the mouse at (-1e6, -1e6); the constrained tooltip places its solved box at the mouse, so
+  its bbox reached -1e6 and the fit zoomed out six orders of magnitude — the 54-unit tooltip came
+  out 0.03 px tall, a speck, until the pointer moved.  A never-seen pointer now reports the middle
+  of the view; the same example fits at 45.8 px.
+
+The pink boxes are the `solve` debug overlay (the `boxes` checkbox, off by default).  It reads like a
+performance option and is not one — it *draws* the boxes the solver computed — so the label now says
+what it is and turns pink while it is on.
+
 Two golden frames changed (`rings3d@solid`, `loft3d@solid`): the 3D goldens had been recorded with
 the 2D shader.  `scripts/pdiff.ts --update` also no longer drops the goldens it did not re-render
 when it is given a list of example ids — it did, once, in this round.

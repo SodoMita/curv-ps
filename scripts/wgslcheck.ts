@@ -161,5 +161,34 @@ console.log("\noption changes invalidate the shader");
   if (!same) fails++;
 }
 
+// ---- 5. the hand-written 3D wrapper must agree with the CPU marcher's camera ----------------
+// The wrapper is WGSL and every other gate runs the CPU path, so a divergence between the two is
+// invisible to all 35 golden frames.  Round 21 shipped exactly that: `nd` was
+// `(px - res * 0.5) * 2.0` where the CPU marcher has `((i + 0.5) - w * 0.5) / (w * 0.5)`, so every
+// ray left the eye at ~90 degrees from the view axis and the 3D view was empty on the GPU while the
+// CPU fallback looked perfect.  Parsing cannot catch it; this compares the two formulas' shape.
+console.log("\nthe 3D wrapper's camera agrees with the CPU marcher");
+{
+  const ex = EXAMPLES.find((e) => e.id === "rings3d")!;
+  for (const bl of [false, true]) {
+    const save = { ...SHADER_FLAGS };
+    Object.assign(SHADER_FLAGS, { branchless: bl, branchless3D: bl });
+    const r = interp(900, 600, 0).run(ex.src);
+    const c = compileTree(r.shape!, atlas, "wgsl", null, undefined, "solid");
+    const code = wrapWGSL({ ...c, solid: true });
+    const nd = code.split("\n").find((l) => l.includes("let nd =")) ?? "";
+    // normalised device coords: divide by half the resolution, like the CPU marcher does
+    const okNd = /\/ *\(u\.res \* 0\.5\)/.test(nd) && !/\* *2\.0/.test(nd);
+    console.log(`${okNd ? "OK " : "ERR"} ${bl ? "branchless " : ""}ray dir uses normalised device coords${okNd ? "" : `  → ${nd.trim()}`}`);
+    if (!okNd) fails++;
+    // the far plane has to follow the camera: a viewport-sized program fits at ~1900 units out
+    const far = code.split("\n").find((l) => l.includes("FAR =")) ?? "";
+    const okFar = /max\(400\.0, *rad/.test(far);
+    console.log(`${okFar ? "OK " : "ERR"} ${bl ? "branchless " : ""}far plane follows the camera distance${okFar ? "" : `  → ${far.trim()}`}`);
+    if (!okFar) fails++;
+    Object.assign(SHADER_FLAGS, save);
+  }
+}
+
 console.log(fails ? `\n${fails} shader(s) failed to parse` : "\nall shaders parse as WGSL");
 process.exit(fails ? 1 : 0);
