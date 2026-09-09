@@ -1,4 +1,5 @@
 import { cn } from "../utils/cn";
+import { CollapseButton, CollapsedStrip } from "./Panel";
 
 /**
  * Shader-generation options (the `SHADER_FLAGS` of src/gpu/gen.ts), as a panel at the bottom of the
@@ -30,7 +31,8 @@ export interface Census {
   loops: number;
 }
 
-export function GenOptions({ flags, onChange, census }: { flags: GenFlags; onChange: (p: Partial<GenFlags>) => void; census: Census }) {
+export function GenOptions({ flags, onChange, census, collapsed, onToggle }: { flags: GenFlags; onChange: (p: Partial<GenFlags>) => void; census: Census; collapsed?: boolean; onToggle?: () => void }) {
+  if (collapsed) return <CollapsedStrip title="shader generation" sub={flags.branchless ? "branchless" : "branched"} onOpen={onToggle ?? (() => {})} />;
   // a row that is implied by the master switch: shown as on, not editable
   const implied = (k: "noShortCircuit" | "cullSelect" | "branchless3D") => flags.branchless && flags[k];
   const row = (label: string, flag: keyof GenFlags, hint: string, force?: boolean) => (
@@ -55,6 +57,7 @@ export function GenOptions({ flags, onChange, census }: { flags: GenFlags; onCha
   return (
     <div className="flex h-full min-h-0 flex-col text-[11px] text-muted">
       <div className="flex items-center gap-2 border-b border-line px-2 py-1">
+        {onToggle && <CollapseButton onToggle={onToggle} title="Fold this panel" />}
         <span className="font-semibold uppercase tracking-[0.12em] text-fg/70">shader generation</span>
         <div className="ml-auto flex overflow-hidden rounded-md border border-line">
           {(["branched", "branchless"] as const).map((m, i) => (

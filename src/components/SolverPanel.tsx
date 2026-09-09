@@ -1,5 +1,6 @@
 import type { SolveTrace } from "../curv/interp";
 import { psolveInfo } from "../psolve/psolve";
+import { CollapseButton, CollapsedStrip } from "./Panel";
 
 function StatusPill({ t }: { t: SolveTrace }) {
   const label = t.degraded ? t.degraded!.verdict : (t.verdict ?? t.status);
@@ -16,12 +17,16 @@ function StatusPill({ t }: { t: SolveTrace }) {
   return <span className={"rounded px-1.5 py-0.5 font-mono text-[10px] " + cls} title={title}>{label}</span>;
 }
 
-export function SolverPanel({ traces, evalMs, fps }: { traces: SolveTrace[]; evalMs: number; fps: number }) {
+export function SolverPanel({ traces, evalMs, fps, collapsed, onToggle }: { traces: SolveTrace[]; evalMs: number; fps: number; collapsed?: boolean; onToggle?: () => void }) {
   const info = psolveInfo();
+  if (collapsed) return <CollapsedStrip title="solver trace" sub={`${traces.length}`} onOpen={onToggle ?? (() => {})} />;
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div className="flex items-center justify-between border-b border-line px-4 py-2">
-        <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted">Solver trace</div>
+        <div className="flex items-center gap-1 text-[11px] font-semibold uppercase tracking-[0.14em] text-muted">
+          {onToggle && <CollapseButton onToggle={onToggle} title="Fold this panel" />}
+          Solver trace
+        </div>
         <div className="flex gap-3 font-mono text-[11px] text-muted">
           <span>eval {evalMs.toFixed(2)} ms</span>
           <span>{fps > 0 ? `${fps.toFixed(0)} fps` : "static"}</span>
