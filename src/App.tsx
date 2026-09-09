@@ -8,7 +8,7 @@ import { Interp, compileTree, type CompiledTree, type SolveTrace, type ParamDesc
 import { CurvError } from "./curv/parser";
 import { bboxOf, bbox3Of, finiteBBox, type SNode } from "./curv/shapes";
 import { buildAtlas, type Atlas } from "./gpu/atlas";
-import { createRenderer, type Renderer, type Camera, type Camera3 } from "./gpu/renderer";
+import { wrapWGSL, wrapJS, createRenderer, type Renderer, type Camera, type Camera3 } from "./gpu/renderer";
 import { SHADER_FLAGS, flagsKey } from "./gpu/gen";
 import { GenOptions, type GenFlags, type Census } from "./components/GenOptions";
 import { loadPsolve } from "./psolve/psolve";
@@ -52,7 +52,9 @@ export default function App() {
     staticCache.current = null;   // …and do not let the static-skip fingerprint answer instead
     dirty.current = true;
   }, []);
-  const [code, setCode] = useState("");
+  const [code, setCode] = useState("");          // the generated body (feeds the branch census)
+  const [whole, setWhole] = useState("");        // everything the backend compiles: body + wrapper
+  const [codeView, setCodeView] = useState<"whole" | "body">("whole");
   const [paused, setPaused] = useState(false);
   const [animated, setAnimated] = useState(false);
   const [responsive, setResponsive] = useState(false);
@@ -91,7 +93,8 @@ export default function App() {
   const pinch3 = useRef<{ dist: number; yaw: number; pitch: number } | null>(null);
   const pts = useRef(new Map<number, { x: number; y: number }>());
   const rendering = useRef(false);
-  const codeRef = useRef("");
+  const codeRef = useRef("");    // last body shown (also what the census counts)
+  const wholeRef = useRef("");   // mode + body: the wrapper depends on the view mode, not just the body
   const quality = useRef(1); // adaptive render scale while animating
   const cpuMs = useRef(0);   // eval + params/codegen time of the last frame (feeds the GPU budget)
   const settle = useRef<number | null>(null);
@@ -210,7 +213,19 @@ export default function App() {
         r.render({ ...prog, solid }, cam.current, BG[bgRef.current], time, q, solid ? cam3.current : undefined)
           .then(() => {
             rendering.current = false;
-            if (updateCode && prog.code !== codeRef.current) { codeRef.current = prog.code; setCode(prog.code); }
+            if (updateCode && prog.code !== codeRef.current) {
+              codeRef.current = prog.code;
+              setCode(prog.code);
+            }
+            // the body alone is the middle of the file: the panel should show the shader/module the
+            // backend actually compiles (uniforms, entry point, raymarch loop and all).  A shape whose
+            // two bodies are identical (a plain `circle`) still has two different wrappers, hence the
+            // mode in the key.
+            const wk = (solid ? "3|" : "2|") + prog.code;
+            if (updateCode && wk !== wholeRef.current) {
+              wholeRef.current = wk;
+              setWhole(r.kind === "webgpu" ? wrapWGSL({ ...prog, solid }) : wrapJS({ ...prog, solid }));
+            }
           })
           .catch((e: Error) => { rendering.current = false; setError({ message: e.message }); });
       } else dirty.current = true; // shader still compiling: try again next frame
@@ -572,7 +587,20 @@ export default function App() {
                 </div>
               )}
               {showCode && (
-                <pre className="absolute inset-3 overflow-auto rounded-xl border border-line bg-ink/95 p-3 font-mono text-[10.5px] leading-snug text-fg/80 sm:inset-4">{code || "// nothing compiled yet"}</pre>
+                <div className="absolute inset-3 flex flex-col overflow-hidden rounded-xl border border-line bg-ink/95 sm:inset-4">
+                  <div className="flex items-center gap-2 border-b border-line px-3 py-1 font-mono text-[10.5px] text-muted">
+                    <span className="text-fg">{renderer.current?.kind === "cpu" ? "JS · CPU fallback" : "WGSL"}</span>
+                    <div className="flex overflow-hidden rounded border border-line">
+                      {(["whole", "body"] as const).map((v) => (
+                        <button key={v} onClick={() => setCodeView(v)}
+                          title={v === "whole" ? "Everything the backend compiles — uniforms, entry point and the 3D raymarch loop included" : "Just the generated body: the straight-line distance/colour code for this program"}
+                          className={cn("px-1.5 py-0.5 transition-colors", codeView === v ? "bg-accent/80 text-white" : "hover:bg-surface-2")}>{v}</button>
+                      ))}
+                    </div>
+                    <span className="ml-auto">{((codeView === "whole" ? whole : code) || "").split("\n").length} lines</span>
+                  </div>
+                  <pre className="min-h-0 flex-1 overflow-auto p-3 font-mono text-[10.5px] leading-snug text-fg/80">{(codeView === "whole" ? whole : code) || "// nothing compiled yet"}</pre>
+                </div>
               )}
             </div>
           </div>
