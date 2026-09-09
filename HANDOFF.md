@@ -16,7 +16,7 @@ Headless checks (all use the JS backend, no browser needed):
 | `npx tsx scripts/branchbench.ts [id …]` | **round-19 branch-vs-branchless benchmark**: times five builds (`branching`, `noShortCircuit`, `+cullSelect`, `branchless` bodies, `branchless` raymarch) on the CPU fallback at a pinned resolution, interleaved, and counts the `if`/`break`/`&&` that remain in the WGSL |
 | `npx tsx scripts/wgslcheck.ts` | **round-18 WGSL gate**: parses the **whole** shader the GPU sees (`wrapWGSL`, wrapper included) for every example *and* a list of codegen corner cases, in **both** view modes (50 shaders).  Needed because the JS/CPU target accepts things WGSL does not: `if (dd > FAR) break;` in the 3D raymarch loop shipped green through every gate and failed only in the browser |
 | `npx tsx scripts/pdiff.ts [--update] [id …]` | **golden pixel gate**: renders every example headlessly (slice mode at 240×160 + solid mode at 96×64 for the 3D group), hashes the framebuffer and compares with `scripts/golden/pdiff.json`; counts non-finite distances per frame. `--update` (re)writes the goldens after an intended change |
-| `npx tsx scripts/flagcheck.ts [id …]` | **round-21 invariance gate for the `gen:` menu**: every example × every flag setting the menu can produce — pixels and parameter buffer identical to the shipped default in **both** view modes, the walked buffer equal to the codegen buffer, each setting's code independent of which setting was compiled before it, and the two view modes never sharing a compiled program |
+| `npx tsx scripts/flagcheck.ts [id …]` | **round-21 invariance gate for the shader-generation options**: every example × every flag setting the menu can produce — pixels and parameter buffer identical to the shipped default in **both** view modes, the walked buffer equal to the codegen buffer, each setting's code independent of which setting was compiled before it, and the two view modes never sharing a compiled program |
 | `npx tsx scripts/warmcheck.ts` | **round-14 bridge oracle**: warm→cold drag equivalence (plan P0.2 acceptance: pixel-identity), failure degradation/recovery with **no memo pollution**, first-frame certified-infeasible error message, wall-clock **budget → STOPPED + approximate incumbent (never garbage)**, budget ladder certifies |
 | `npx tsx scripts/warmbench.ts [example …]` | cold-vs-chained solve timing, interleaved best-of-4 per width (round-12 noise lesson), warm-accept / cold-retry counters |
 | `npx tsx scripts/internbench.ts [example …]` | round-15 hash-consing A/B (inode ON/OFF, alternated in-process, best-of-6): full-eval cost vs fresh-tree key+param-walk cost, hit counters |
@@ -133,9 +133,12 @@ and `branchless3D` stay off: implemented, documented, benchable with one flag, a
 `polygon` is the one example that got *faster* branchless (0.72×, `polySelect` replaces a `%`),
 which is a nudge towards measuring `polySelect` on its own.
 
-**In the UI:** the preview toolbar has a `gen: branched | branchless` menu (`src/components/GenOptions.tsx`)
-that exposes every `SHADER_FLAGS` option, each with its measured cost in the tooltip, plus a live branch
-census of the last compiled shader (`N lines · i if · b break · s && || · L loops`).  Flipping an option
+**In the UI:** the bottom of the preview column has a **shader generation** panel
+(`src/components/GenOptions.tsx`) with a `branched | branchless` switch that exposes every
+`SHADER_FLAGS` option, each with its measured cost in the tooltip, plus a live branch
+census of the last compiled shader (`N lines · i if · b break · s && || · L loops`).  (It started as a
+popover off the toolbar; ten options and their costs do not fit in one and cannot be read while
+dragging a slider, so it is a panel now.)  Flipping an option
 mutates `SHADER_FLAGS` and clears `lastProg`/`staticCache`; three `wgslcheck` checks keep that honest:
 switching to `branchless` must produce different code (not a reused shader), switching back must restore
 the old text, and the **parameter layout must not move** (292 params either way) — the menu cannot be
@@ -579,7 +582,7 @@ src/curv/shapes.ts      SNode F-Rep tree, bboxOf/bbox3Of (memoised), flags3Of, t
 src/curv/prelude.ts     palette, box helpers, layout combinators (incl. flow / hstack_fit), UI components — in Curv
 src/curv/examples.ts    example programs (group "solve" | "curv" | "3d")
 src/gpu/gen.ts          code generators: WGSL, JS, ParamsOnly; dynBlock/finalParams; Gen.usesTime
-src/components/GenOptions.tsx  the preview toolbar's shader-generation menu (branched / branchless + every
+src/components/GenOptions.tsx  the bottom-row shader-generation panel (branched / branchless + every
                         SHADER_FLAGS option, with measured costs and a branch census)
 src/gpu/renderer.ts     WebGPU renderer (pipeline cache keyed by code, timestamp queries) + CPU
                         fallback; 3D raymarch (WGSL `stepf`/`colf` + CPU `march3`), orbit camera,
