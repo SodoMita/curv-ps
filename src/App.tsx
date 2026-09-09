@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Editor } from "./components/Editor";
 import { SolverPanel } from "./components/SolverPanel";
 import { Reference } from "./components/Reference";
@@ -9,6 +9,8 @@ import { CurvError } from "./curv/parser";
 import { bboxOf, bbox3Of, finiteBBox, type SNode } from "./curv/shapes";
 import { buildAtlas, type Atlas } from "./gpu/atlas";
 import { createRenderer, type Renderer, type Camera, type Camera3 } from "./gpu/renderer";
+import { SHADER_FLAGS, flagsKey } from "./gpu/gen";
+import { GenOptions, type GenFlags, type Census } from "./components/GenOptions";
 import { loadPsolve } from "./psolve/psolve";
 import { cn } from "./utils/cn";
 
@@ -40,6 +42,16 @@ export default function App() {
   const [debugBoxes, setDebugBoxes] = useState(false);
   const [bgMode, setBgMode] = useState<"light" | "dark">("light");
   const [showCode, setShowCode] = useState(false);
+  // shader-generation options (SHADER_FLAGS); every flag is part of the structural key, so a change
+  // recompiles and refills nothing else — but the static-skip fingerprint has to know about them
+  const [gen, setGen] = useState<GenFlags>({ ...SHADER_FLAGS });
+  const applyGen = useCallback((patch: Partial<GenFlags>) => {
+    Object.assign(SHADER_FLAGS, patch);
+    setGen((g) => ({ ...g, ...patch }));
+    lastProg.current = null;      // force a fresh compile (the structural key already differs)
+    staticCache.current = null;   // …and do not let the static-skip fingerprint answer instead
+    dirty.current = true;
+  }, []);
   const [code, setCode] = useState("");
   const [paused, setPaused] = useState(false);
   const [animated, setAnimated] = useState(false);
@@ -104,6 +116,30 @@ export default function App() {
     cam3.current = c; dirty.current = true;
     setCam3View((v) => (v.tx === c.tx && v.ty === c.ty && v.tz === c.tz && v.dist === c.dist && v.yaw === c.yaw && v.pitch === c.pitch ? v : c));
   }, []);
+
+  // ---- error reporting: a bug report is only useful with the context that produced it, so the
+  // copy button takes the error, the example, the view mode, the backend and the program
+  const [copied, setCopied] = useState(false);
+  const copyError = useCallback(async () => {
+    if (!error) return;
+    const text = [
+      `curv-ps: error${error.line ? ` (line ${error.line})` : ""}: ${error.message}`,
+      `example: ${exampleId} \u00b7 view: ${viewMode === "3d" ? "3d (solid raymarch)" : "2d (slice)"} \u00b7 renderer: ${rendererInfo?.kind ?? "unknown"}${rendererInfo?.info ? ` (${rendererInfo.info})` : ""}`,
+      "",
+      src,
+    ].join("\n");
+    let done = false;
+    try { if (navigator.clipboard?.writeText) { await navigator.clipboard.writeText(text); done = true; } } catch { /* denied or unavailable */ }
+    if (!done) { // http (not https) or a denied permission: the textarea route still works
+      const ta = document.createElement("textarea");
+      ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+      document.body.appendChild(ta); ta.select();
+      try { done = document.execCommand("copy"); } catch { /* nothing else to try */ }
+      document.body.removeChild(ta);
+    }
+    setCopied(done);
+    window.setTimeout(() => setCopied(false), 1400);
+  }, [error, exampleId, viewMode, rendererInfo, src]);
 
   // ---- boot: psolve wasm + glyph atlas + renderer
   useEffect(() => {
@@ -181,7 +217,7 @@ export default function App() {
       }
     };
     // everything below except the camera is a program input; the camera/screen size are render uniforms only
-    const fp = srcRef.current + "\u0001" + JSON.stringify(paramRef.current) + "\u0001" + debugRef.current + "\u0001" + (solid ? "3d" : "2d");
+    const fp = srcRef.current + "\u0001" + JSON.stringify(paramRef.current) + "\u0001" + debugRef.current + "\u0001" + (solid ? "3d" : "2d") + "\u0001" + flagsKey();
     const sk = staticCache.current, prog0 = lastProg.current;
     const needFitNow = solid ? needFit3.current : needFit.current;
     if (sk && sk.fp === fp && prog0 && !needFitNow) {
@@ -407,6 +443,11 @@ export default function App() {
     setMode(ex.group === "3d" ? "3d" : "2d"); // 3D examples open in the solid view
   };
   const example = EXAMPLES.find((e) => e.id === exampleId);
+  // branch census of the last compiled shader body (the 3D wrapper adds its own 4 ifs / 3 breaks)
+  const census: Census = useMemo(() => {
+    const strip = code.replace(/\/\/[^\n]*/g, "");
+    return { lines: code ? code.split("\n").length : 0, ifs: (strip.match(/\bif\s*\(/g) ?? []).length, brks: (strip.match(/\bbreak\b|\bcontinue\b/g) ?? []).length, logic: (strip.match(/&&|\|\|/g) ?? []).length, loops: (strip.match(/\bfor\s*\(/g) ?? []).length };
+  }, [code]);
   const bottomCount = (params.length ? 1 : 0) + (traces.length ? 1 : 0);
   const fmtZoom = (z: number) => (z >= 100 ? z.toFixed(0) : z >= 1 ? z.toFixed(z >= 10 ? 1 : 2) : z.toPrecision(2));
 
@@ -457,7 +498,15 @@ export default function App() {
             <Editor value={src} onChange={setSrc} errorLine={error?.line} />
           </div>
           <div className={cn("shrink-0 border-t border-line px-4 py-2 font-mono text-[11.5px]", error ? "bg-rose-500/10 text-rose-300" : "text-muted")}>
-            {error ? <><span className="font-semibold">error</span>{error.line ? ` (line ${error.line})` : ""}: {error.message}</> : <>✓ {src.split("\n").length} lines · eval {stats.evalMs.toFixed(1)} ms{stats.staticSkip ? <span className="text-emerald-300/90" title="The program read no time/mouse/viewport on its last evaluation and its src and parametric inputs are unchanged: the tree cannot differ, so evaluation and codegen were skipped entirely (the camera is a render uniform)"> · static</span> : ""}{stats.memoCalls > 0 ? <span title="Calls of pure user functions answered from the call memo (same function, same arguments and free variables as an earlier evaluation) / calls that were expensive enough to be memoised">{` (${stats.memoHits}/${stats.memoCalls} memo)`}</span> : ""} · {stats.reused ? <span title="Shape tree structure unchanged: shader reused, only the parameter buffer was refilled">params {stats.genMs.toFixed(1)} ms</span> : <>codegen {stats.genMs.toFixed(1)} ms</>} · shader {stats.lines} lines{stats.compiles ? ` · ${stats.compiles} compile${stats.compiles > 1 ? "s" : ""} (last ${stats.compileMs.toFixed(0)} ms)` : ""}{stats.fps > 0 ? ` · ${stats.fps.toFixed(0)} fps` : ""}{stats.timestamps && stats.gpuMs > 0 ? <span title="GPU render-pass time (WebGPU timestamp query)">{` · gpu ${stats.gpuMs.toFixed(1)} ms`}</span> : ""}{stats.quality < 1 ? ` · ${Math.round(stats.quality * 100)}% res` : ""}</>}
+            {error
+              ? <div className="flex items-start gap-2">
+                  <span className="min-w-0 flex-1"><span className="font-semibold">error</span>{error.line ? ` (line ${error.line})` : ""}: {error.message}</span>
+                  <button onClick={copyError} title="Copy the error, the view/backend it happened on, and the program — everything a bug report needs"
+                    className={cn("shrink-0 rounded border px-1.5 py-0.5 font-mono text-[10.5px] transition-colors", copied ? "border-emerald-400/50 bg-emerald-400/10 text-emerald-200" : "border-rose-400/40 text-rose-200 hover:bg-rose-400/15")}>
+                    {copied ? "copied" : "copy"}
+                  </button>
+                </div>
+              : <>✓ {src.split("\n").length} lines · eval {stats.evalMs.toFixed(1)} ms{stats.staticSkip ? <span className="text-emerald-300/90" title="The program read no time/mouse/viewport on its last evaluation and its src and parametric inputs are unchanged: the tree cannot differ, so evaluation and codegen were skipped entirely (the camera is a render uniform)"> · static</span> : ""}{stats.memoCalls > 0 ? <span title="Calls of pure user functions answered from the call memo (same function, same arguments and free variables as an earlier evaluation) / calls that were expensive enough to be memoised">{` (${stats.memoHits}/${stats.memoCalls} memo)`}</span> : ""} · {stats.reused ? <span title="Shape tree structure unchanged: shader reused, only the parameter buffer was refilled">params {stats.genMs.toFixed(1)} ms</span> : <>codegen {stats.genMs.toFixed(1)} ms</>} · shader {stats.lines} lines{stats.compiles ? ` · ${stats.compiles} compile${stats.compiles > 1 ? "s" : ""} (last ${stats.compileMs.toFixed(0)} ms)` : ""}{stats.fps > 0 ? ` · ${stats.fps.toFixed(0)} fps` : ""}{stats.timestamps && stats.gpuMs > 0 ? <span title="GPU render-pass time (WebGPU timestamp query)">{` · gpu ${stats.gpuMs.toFixed(1)} ms`}</span> : ""}{stats.quality < 1 ? ` · ${Math.round(stats.quality * 100)}% res` : ""}</>}
           </div>
         </section>
 
@@ -487,6 +536,7 @@ export default function App() {
               <button onClick={() => setBgMode((m) => (m === "light" ? "dark" : "light"))} title="Background" className="rounded-md border border-line px-2 py-0.5 font-mono hover:bg-surface-2">{bgMode === "light" ? "☼ light" : "☾ dark"}</button>
               <label className="flex items-center gap-1.5"><input type="checkbox" checked={debugBoxes} onChange={(e) => setDebugBoxes(e.target.checked)} className="accent-[#7c5cff]" />boxes</label>
               <button onClick={() => setShowCode((s) => !s)} className={cn("rounded-md border border-line px-2 py-0.5 hover:bg-surface-2", showCode && "bg-surface-3 text-fg")}>{renderer.current?.kind === "cpu" ? "JS" : "WGSL"}</button>
+              <GenOptions flags={gen} onChange={applyGen} census={census} />
             </div>
             <div className="relative min-h-0 flex-1 overflow-hidden bg-[#0e1322] p-3 sm:p-4"
               style={{ backgroundImage: "radial-gradient(circle at 1px 1px, #1d2537 1px, transparent 0)", backgroundSize: "20px 20px" }}>

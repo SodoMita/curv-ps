@@ -134,8 +134,8 @@
       "nan": 0
     },
     "rings3d@solid": {
-      "hash": "bf2345cb",
-      "lit": 1575,
+      "hash": "cc2ad32e",
+      "lit": 1579,
       "nan": 0
     },
     "molecule3d": {
@@ -174,7 +174,7 @@
       "nan": 0
     },
     "loft3d@solid": {
-      "hash": "b469a1e7",
+      "hash": "f22311be",
       "lit": 2306,
       "nan": 0
     },

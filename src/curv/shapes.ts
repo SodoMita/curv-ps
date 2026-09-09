@@ -3,7 +3,7 @@
 // the Gen backends.  All numbers that may vary between evaluations are emitted
 // as parameters so re-solving / animating never triggers a shader recompile.
 import { type Atlas, CELL, FONT_PX, GLYPH_PAD, BASELINE, ATLAS_COLS, ATLAS_ROWS, penAdvance } from "../gpu/atlas";
-import { type Gen, type E, GenError, SHADER_FLAGS, flagsKey } from "../gpu/gen";
+import { type Gen, type E, GenError, SHADER_FLAGS, flagsKey, branchless } from "../gpu/gen";
 
 export type RGBA = [number, number, number, number];
 export type BBox = [number, number, number, number]; // x0 y0 x1 y1 (local coords)
@@ -394,7 +394,24 @@ export function textGlyphs(n: { text: string; size: number; align: "center" | "l
  */
 /** Parameter segment of one subtree: its numbers in order, and the positions (relative to the segment) of deferred-block slots. */
 interface ParamSeg { nums: number[]; blocks: { at: number; values: number[] }[] }
-const wpMemo: [WeakMap<SNode, ParamSeg | null>, WeakMap<SNode, ParamSeg | null>] = [new WeakMap(), new WeakMap()];
+// Memo slot per (cull, flags) — the same fingerprint `skSlot` uses.  `cullable()` reads
+// SHADER_FLAGS.cullWeight, so a tree walked under one threshold must never be answered from a
+// segment built under another: the segments carry the cull bboxes as parameters, and the menu can
+// change cullWeight live.  Before this the slots were keyed on `cull` alone, so flipping cullWeight
+// left the walk serving the old buffer to a shader compiled for the new one (635 vs 615 params on
+// `buttons`) — scripts/flagcheck.ts is the gate for it.
+const wpSlots = new Map<string, [WeakMap<SNode, ParamSeg | null>, WeakMap<SNode, ParamSeg | null>]>();
+const WP_SLOTS_MAX = 16;
+function wpSlot(cull: boolean): WeakMap<SNode, ParamSeg | null> {
+  const fk = flagsKey() + (cull ? "/1" : "/0");
+  let m = wpSlots.get(fk);
+  if (!m) {
+    if (wpSlots.size >= WP_SLOTS_MAX) wpSlots.delete(wpSlots.keys().next().value!); // entries are pure caches
+    m = [new WeakMap(), new WeakMap()];
+    wpSlots.set(fk, m);
+  }
+  return m[cull ? 1 : 0];
+}
 export function walkParams(root: SNode, atlas: Atlas, cull = true): number[] | null {
   const seg = walkSeg(root, atlas, cull);
   if (!seg) return null;
@@ -409,7 +426,7 @@ export function walkParams(root: SNode, atlas: Atlas, cull = true): number[] | n
  * — copying them out of a parent's segment is cheaper than a WeakMap lookup per node.
  */
 function walkSeg(root: SNode, atlas: Atlas, cull: boolean): ParamSeg | null {
-  const memo = wpMemo[cull ? 1 : 0];
+  const memo = wpSlot(cull);
   const hit = memo.get(root);
   if (hit !== undefined) return hit;
   const out: number[] = []; const blocks: { at: number; values: number[] }[] = [];
@@ -418,7 +435,7 @@ function walkSeg(root: SNode, atlas: Atlas, cull: boolean): ParamSeg | null {
   let ok = true;
   const walk = (n: SNode, cull: boolean): void => {
     if (n !== root) { // nested subtree: reuse / create its own segment when it is big enough to be worth it
-      const m = wpMemo[cull ? 1 : 0];
+      const m = wpSlot(cull);
       let s = m.get(n);
       if (s === undefined && weight(n) >= 8) { s = walkSeg(n, atlas, cull); }
       if (s !== undefined) {
@@ -958,7 +975,12 @@ function skFail(): number { skOut2 = 0; return 0; }
 export function structKey(n: SNode, atlas: Atlas, cull = true): string | null {
   const h1 = skNum(n, atlas, cull);
   if (h1 === 0 && skOut2 === 0) return null;
-  return flagsKey() + "|" + (h1 >>> 0).toString(36) + "." + (skOut2 >>> 0).toString(36);
+  // The view mode travels in the key: `cull` is `mode === "slice"`, and the two modes do not compile
+  // to the same code (slice unions blend with coverage AA and carry cull brackets; solid unions take
+  // the exact min and the raymarcher owns early-out).  The trees that expose this are the ones with
+  // no cullable child — there `cullable()` is false either way, so the lanes came out equal and the
+  // code LRU (and the `prev` fast path) happily served a 2D shader to the 3D view and back.
+  return flagsKey() + (cull ? "|1|" : "|0|") + (h1 >>> 0).toString(36) + "." + (skOut2 >>> 0).toString(36);
 }
 
 // ---------------------------------------------------------------- codegen
@@ -1030,6 +1052,13 @@ export function genShape(g: Gen, n: SNode, p: E, ctx: GenCtx): DC {
     const cx = g.param((bb[0] + bb[2]) / 2), cy = g.param((bb[1] + bb[3]) / 2), hx = g.param((bb[2] - bb[0]) / 2), hy = g.param((bb[3] - bb[1]) / 2);
     const bd = g.let(sdBox(g, g.bin("-", q, g.vec([cx, cy, g.num(0)])), hx, hy, g.num(0)));
     const pad = ctx.aa;
+    if (SHADER_FLAGS.cullSelect || branchless()) {
+      // branchless: the child is evaluated for every pixel and discarded by a select — the
+      // opposite of what culling is for, which is exactly why it is not the default
+      const r = kid(s, q);
+      const inside = g.cmp("<", bd, pad);
+      return { d: g.let(g.sel(inside, r.d, g.bin("+", bd, pad))), c: g.let(g.sel(inside, r.c, g.vec([g.num(0), g.num(0), g.num(0), g.num(0)]))) };
+    }
     const dv = g.var(g.bin("+", bd, pad)); const cv = g.var(g.vec([g.num(0), g.num(0), g.num(0), g.num(0)]));
     g.if(g.cmp("<", bd, pad), () => { const r = kid(s, q); g.assign(dv, r.d); g.assign(cv, r.c); });
     return { d: dv, c: cv };
@@ -1076,7 +1105,7 @@ export function genShape(g: Gen, n: SNode, p: E, ctx: GenCtx): DC {
         g.assign(dv, g.fn("min", [dv, g.fn("dot", [b, b])]));
         const c1 = g.cmp(">=", py(), g.idx(vi, 1)), c2 = g.cmp("<", py(), g.idx(vj, 1)), c3 = g.cmp(">", g.bin("-", g.bin("*", g.idx(e, 0), g.idx(w, 1)), g.bin("*", g.idx(e, 1), g.idx(w, 0))), g.num(0));
         const all = g.logic("&&", g.logic("&&", c1, c2), c3), none = g.logic("&&", g.logic("&&", g.not(c1), g.not(c2)), g.not(c3));
-        if (SHADER_FLAGS.polySelect) g.assign(sv, g.bin("*", sv, g.sel(g.logic("||", all, none), g.num(-1), g.num(1))));
+        if (SHADER_FLAGS.polySelect || branchless()) g.assign(sv, g.bin("*", sv, g.sel(g.logic("||", all, none), g.num(-1), g.num(1))));
         else g.if(g.logic("||", all, none), () => g.assign(sv, g.neg(sv)));
       });
       return prim(g.bin("*", sv, g.fn("sqrt", [dv])));
@@ -1092,7 +1121,10 @@ export function genShape(g: Gen, n: SNode, p: E, ctx: GenCtx): DC {
       const pad = ctx.aa;
       const half = g.let(g.bin("*", qsE, g.num(0.5)));
       const dv = g.var(g.num(1e30));
-      if (SHADER_FLAGS.textWindow && glyphs.length > 6) {
+      // the window is a *shortcut*: it skips glyphs by picking a different loop, which is a branch.
+      // Branchless mode walks every glyph (the window's own argument — cells outside it are farther
+      // than the ones inside, so the min() is the same) and pays for it in texture traffic.
+      if (SHADER_FLAGS.textWindow && !branchless() && glyphs.length > 6) {
         // Long label: binary-search the first cell whose x0 is right of px.v (cells are sorted along
         // the row), then apply the same per-glyph body to a 6-glyph window around the hit.  Cell box
         // distances rise monotonically away from the hit and within-pad cells are always in the
@@ -1130,7 +1162,7 @@ export function genShape(g: Gen, n: SNode, p: E, ctx: GenCtx): DC {
         const at = (off: number) => g.paramAt(g.bin("+", g.bin("+", baseE, g.bin("*", i, g.num(5))), g.num(off)));
         const lp = g.let(g.bin("-", p, g.vec([at(0), qyE, g.num(0)])));
         const bd = g.let(sdBox(g, g.bin("-", lp, half), half, half, g.num(0)));
-        if (SHADER_FLAGS.textBranchless) {
+        if (SHADER_FLAGS.textBranchless || branchless()) {
           // branchless: always sample, select the result — no divergence, more texture traffic
           // clamp the 2-slice: lp is a vec3 (the point is 3D now), and mix(v2, v2, v3) would
             // broadcast the third lane into every component (NaN glyphs on the JS backend)

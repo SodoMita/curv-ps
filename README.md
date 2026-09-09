@@ -20,7 +20,10 @@ let
 in union [ card L.side, for (c in L.cards) card c ]
 ```
 
-Highlights: shaders are reused across frames (only a parameter buffer is refilled by a memoised tree walk), a `solve`
+Highlights: the preview toolbar's **`gen:` menu** switches the shader generator between `branched` (bbox-cull and
+raymarch early-outs) and `branchless` (no `if`, no `break`, no short-circuit — both arms of every branch evaluated,
+measured 3× slower in 2D and 10× in the 3D view) and exposes the other codegen options (cull weight, loop unrolling,
+polygon/text/SubCurv variants), each with its measured cost; shaders are reused across frames (only a parameter buffer is refilled by a memoised tree walk), a `solve`
 block whose inputs (free variables, tracked through closures, shapes hashed by content) did not change is not
 re-evaluated at all, unchanged numeric problems are additionally served from a fingerprint cache, pure user functions
 that are expensive enough are memoised across frames the same way (profile-guided; impure bodies and functions that
@@ -46,6 +49,9 @@ runs inside a per-frame **wall-clock budget** that hands back an incumbent rathe
 * `npx tsx scripts/memotest.ts` — dependency-tracking tests for solve-block and call memoisation
 * `npx tsx scripts/threedcheck.ts` — 3D gate: solid-mode codegen on both backends, `bbox3`, `is_2d`/`is_3d`, and the CPU raymarcher's real pixels (slice/solid parity, animation)
 * `npx tsx scripts/stdcheck.ts` — C++ `std.curv` parity: prelude values, 2D/3D boxes, and the generated field sampled on a grid (no non-finite distance, nothing inside the shape outside its box)
+* `npx tsx scripts/branchbench.ts [id …]` — times the branching and the branchless shader builds against each other on the CPU fallback (`SHADER_FLAGS.branchless`, `noShortCircuit`, `cullSelect`, `branchless3D`) and counts the `if`/`break`/`&&` left in the WGSL
+* `npx tsx scripts/wgslcheck.ts` — parses the **whole** WGSL shader (wrapper included) of every example and a list of codegen corner cases, in both view modes: the CPU fallback compiles JS, so a WGSL-only syntax error is invisible to every other gate
 * `npx tsx scripts/pdiff.ts [--update]` — golden-frame gate: hashes every example's render (slice + solid) against `scripts/golden/pdiff.json` and counts non-finite distances; `--update` rewrites the goldens after an intended change
+* `npx tsx scripts/flagcheck.ts [id …]` — invariance gate for the `gen:` menu: renders every example under every flag setting the menu can produce and checks the settings agree with each other (same pixels, same parameter buffer, code independent of the order the settings were compiled in)
 
 See [HANDOFF.md](HANDOFF.md) for the architecture, invariants and the current state of development.
