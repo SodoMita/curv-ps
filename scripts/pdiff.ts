@@ -120,7 +120,9 @@ if (JSON.stringify(gold.config) !== JSON.stringify(CONFIG)) {
   console.log(`--  render config changed (${GOLDEN})`);
   if (!update) console.log("   (every hash will differ; re-check and run --update)");
 }
-const shots: Record<string, Shot> = update ? {} : { ...gold.shots };
+// an --update run may be filtered to a few examples; it must patch those shots into the existing
+// file, not replace it (starting from {} silently dropped every other golden — round 21)
+const shots: Record<string, Shot> = { ...gold.shots };
 let fails = 0, missing = 0;
 const one = async (id: string, src: string, solid: boolean) => {
   const key = solid ? id + "@solid" : id;

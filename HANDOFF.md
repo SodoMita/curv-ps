@@ -1,4 +1,4 @@
-# Curv+solve — handoff (dev round 19)
+# Curv+solve — handoff (dev round 21)
 
 Browser playground for **Curv** (2D F-Rep, compiled to WGSL / JS) extended with
 `solve { }` constraint blocks solved by **psolve** (LP + convex QP, WebAssembly).
@@ -16,15 +16,47 @@ Headless checks (all use the JS backend, no browser needed):
 | `npx tsx scripts/branchbench.ts [id …]` | **round-19 branch-vs-branchless benchmark**: times five builds (`branching`, `noShortCircuit`, `+cullSelect`, `branchless` bodies, `branchless` raymarch) on the CPU fallback at a pinned resolution, interleaved, and counts the `if`/`break`/`&&` that remain in the WGSL |
 | `npx tsx scripts/wgslcheck.ts` | **round-18 WGSL gate**: parses the **whole** shader the GPU sees (`wrapWGSL`, wrapper included) for every example *and* a list of codegen corner cases, in **both** view modes (50 shaders).  Needed because the JS/CPU target accepts things WGSL does not: `if (dd > FAR) break;` in the 3D raymarch loop shipped green through every gate and failed only in the browser |
 | `npx tsx scripts/pdiff.ts [--update] [id …]` | **golden pixel gate**: renders every example headlessly (slice mode at 240×160 + solid mode at 96×64 for the 3D group), hashes the framebuffer and compares with `scripts/golden/pdiff.json`; counts non-finite distances per frame. `--update` (re)writes the goldens after an intended change |
+| `npx tsx scripts/flagcheck.ts [id …]` | **round-21 invariance gate for the `gen:` menu**: every example × every flag setting the menu can produce — pixels and parameter buffer identical to the shipped default in **both** view modes, the walked buffer equal to the codegen buffer, each setting's code independent of which setting was compiled before it, and the two view modes never sharing a compiled program |
 | `npx tsx scripts/warmcheck.ts` | **round-14 bridge oracle**: warm→cold drag equivalence (plan P0.2 acceptance: pixel-identity), failure degradation/recovery with **no memo pollution**, first-frame certified-infeasible error message, wall-clock **budget → STOPPED + approximate incumbent (never garbage)**, budget ladder certifies |
 | `npx tsx scripts/warmbench.ts [example …]` | cold-vs-chained solve timing, interleaved best-of-4 per width (round-12 noise lesson), warm-accept / cold-retry counters |
 | `npx tsx scripts/internbench.ts [example …]` | round-15 hash-consing A/B (inode ON/OFF, alternated in-process, best-of-6): full-eval cost vs fresh-tree key+param-walk cost, hit counters |
 | `npx tsx scripts/exprbench.ts [example …]` | round-16 expression-memo A/B (alternated in-process, best-of-6): full-eval cost with the list-site memo ON vs OFF |
 | `npx tsx scripts/prof.ts [-v]` | warm eval / codegen / params-only timings, per-`solve` cache kind, call-memo hit/miss counters; `-v` prints the per-site memo decisions (function bodies and «list» expression sites) |
 
-All eleven check scripts were green at the end of this round (`paramcheck` / `memotest` / `warmcheck` / `threedcheck` / `wgslcheck` / `stdcheck` / `pdiff` exit 1 on any failure — check the exit code).  `pdiff` and `stdcheck` run with `setSolveBudget(0)`: the UI's 16 ms per-solve budget can hand back an incumbent that depends on machine load, which would make a golden frame flaky.
+All twelve check scripts were green at the end of this round (`paramcheck` / `memotest` / `warmcheck` / `threedcheck` / `wgslcheck` / `stdcheck` / `pdiff` exit 1 on any failure — check the exit code).  `pdiff` and `stdcheck` run with `setSolveBudget(0)`: the UI's 16 ms per-solve budget can hand back an incumbent that depends on machine load, which would make a golden frame flaky.
 
-## What changed in this round (19) — branchless shaders: built, measured, and mostly *not* shipped
+## What changed in this round (21) — two cache keys that forgot an input of codegen
+
+Round 20 put every `SHADER_FLAGS` option behind a menu, which makes one question load-bearing for
+every cache that is keyed on the shape tree: *is this entry valid under the flags and the view mode
+of the request?*  `scripts/flagcheck.ts` asks it for all 27 examples × 7 settings.  Two answers were
+no:
+
+* **`structKey` was mode-blind.**  It mixes `cullable()`'s answer per child — and `cullable` is false
+  for every child when `cull` is false, so any tree *without* a cullable child hashed identically in
+  the two view modes.  Slice unions blend with coverage AA and carry cull brackets; solid unions take
+  the exact min and the raymarcher owns early-out, so the two are not the same shader — yet the code
+  LRU (and the `prev` fast path in `compileTree`) served the 2D one to the 3D view, and the other way
+  round.  Every 3D example was exposed: once a program had been compiled in 2D, its 3D view ran the
+  2D shader — 12.9% of the pixels differ on `rings3d`, 3.9% on `loft3d`.  The key now carries the
+  mode (`|1|` / `|0|`).
+* **`walkParams`' memo was flag-blind.**  Its slots were keyed on `cull` alone, but `cullable()` reads
+  `SHADER_FLAGS.cullWeight`, and a cull bracket pushes its bbox as four parameters.  After moving the
+  cull-weight slider the tree walk kept handing out the buffer built under the old threshold — 615
+  numbers to a shader compiled for 635 — and the walk is exactly what feeds the GPU every frame.
+  Slots are now keyed on `flagsKey()`, like the struct-key slots already were.
+
+Both are the same class: a cache keyed on "the shape" that forgot one input of codegen.  The gate
+compiles each setting twice in two different orders (a setting's text must not depend on which
+setting ran before it), compares every setting's pixels and parameter buffer against the shipped
+default in both view modes, checks the walked buffer against the codegen buffer, and asserts the two
+view modes never share a compiled program.
+
+Two golden frames changed (`rings3d@solid`, `loft3d@solid`): the 3D goldens had been recorded with
+the 2D shader.  `scripts/pdiff.ts --update` also no longer drops the goldens it did not re-render
+when it is given a list of example ids — it did, once, in this round.
+
+## Round 19 recap — branchless shaders: built, measured, and mostly *not* shipped
 
 The round-18 bug (a brace-less `if` in the hand-written WGSL wrapper) invited the obvious cure:
 generate **no branching at all**.  `Gen` can now lower control flow instead of emitting it:

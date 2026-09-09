@@ -394,7 +394,24 @@ export function textGlyphs(n: { text: string; size: number; align: "center" | "l
  */
 /** Parameter segment of one subtree: its numbers in order, and the positions (relative to the segment) of deferred-block slots. */
 interface ParamSeg { nums: number[]; blocks: { at: number; values: number[] }[] }
-const wpMemo: [WeakMap<SNode, ParamSeg | null>, WeakMap<SNode, ParamSeg | null>] = [new WeakMap(), new WeakMap()];
+// Memo slot per (cull, flags) — the same fingerprint `skSlot` uses.  `cullable()` reads
+// SHADER_FLAGS.cullWeight, so a tree walked under one threshold must never be answered from a
+// segment built under another: the segments carry the cull bboxes as parameters, and the menu can
+// change cullWeight live.  Before this the slots were keyed on `cull` alone, so flipping cullWeight
+// left the walk serving the old buffer to a shader compiled for the new one (635 vs 615 params on
+// `buttons`) — scripts/flagcheck.ts is the gate for it.
+const wpSlots = new Map<string, [WeakMap<SNode, ParamSeg | null>, WeakMap<SNode, ParamSeg | null>]>();
+const WP_SLOTS_MAX = 16;
+function wpSlot(cull: boolean): WeakMap<SNode, ParamSeg | null> {
+  const fk = flagsKey() + (cull ? "/1" : "/0");
+  let m = wpSlots.get(fk);
+  if (!m) {
+    if (wpSlots.size >= WP_SLOTS_MAX) wpSlots.delete(wpSlots.keys().next().value!); // entries are pure caches
+    m = [new WeakMap(), new WeakMap()];
+    wpSlots.set(fk, m);
+  }
+  return m[cull ? 1 : 0];
+}
 export function walkParams(root: SNode, atlas: Atlas, cull = true): number[] | null {
   const seg = walkSeg(root, atlas, cull);
   if (!seg) return null;
@@ -409,7 +426,7 @@ export function walkParams(root: SNode, atlas: Atlas, cull = true): number[] | n
  * — copying them out of a parent's segment is cheaper than a WeakMap lookup per node.
  */
 function walkSeg(root: SNode, atlas: Atlas, cull: boolean): ParamSeg | null {
-  const memo = wpMemo[cull ? 1 : 0];
+  const memo = wpSlot(cull);
   const hit = memo.get(root);
   if (hit !== undefined) return hit;
   const out: number[] = []; const blocks: { at: number; values: number[] }[] = [];
@@ -418,7 +435,7 @@ function walkSeg(root: SNode, atlas: Atlas, cull: boolean): ParamSeg | null {
   let ok = true;
   const walk = (n: SNode, cull: boolean): void => {
     if (n !== root) { // nested subtree: reuse / create its own segment when it is big enough to be worth it
-      const m = wpMemo[cull ? 1 : 0];
+      const m = wpSlot(cull);
       let s = m.get(n);
       if (s === undefined && weight(n) >= 8) { s = walkSeg(n, atlas, cull); }
       if (s !== undefined) {
@@ -958,7 +975,12 @@ function skFail(): number { skOut2 = 0; return 0; }
 export function structKey(n: SNode, atlas: Atlas, cull = true): string | null {
   const h1 = skNum(n, atlas, cull);
   if (h1 === 0 && skOut2 === 0) return null;
-  return flagsKey() + "|" + (h1 >>> 0).toString(36) + "." + (skOut2 >>> 0).toString(36);
+  // The view mode travels in the key: `cull` is `mode === "slice"`, and the two modes do not compile
+  // to the same code (slice unions blend with coverage AA and carry cull brackets; solid unions take
+  // the exact min and the raymarcher owns early-out).  The trees that expose this are the ones with
+  // no cullable child — there `cullable()` is false either way, so the lanes came out equal and the
+  // code LRU (and the `prev` fast path) happily served a 2D shader to the 3D view and back.
+  return flagsKey() + (cull ? "|1|" : "|0|") + (h1 >>> 0).toString(36) + "." + (skOut2 >>> 0).toString(36);
 }
 
 // ---------------------------------------------------------------- codegen

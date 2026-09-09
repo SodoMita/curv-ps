@@ -52,5 +52,6 @@ runs inside a per-frame **wall-clock budget** that hands back an incumbent rathe
 * `npx tsx scripts/branchbench.ts [id …]` — times the branching and the branchless shader builds against each other on the CPU fallback (`SHADER_FLAGS.branchless`, `noShortCircuit`, `cullSelect`, `branchless3D`) and counts the `if`/`break`/`&&` left in the WGSL
 * `npx tsx scripts/wgslcheck.ts` — parses the **whole** WGSL shader (wrapper included) of every example and a list of codegen corner cases, in both view modes: the CPU fallback compiles JS, so a WGSL-only syntax error is invisible to every other gate
 * `npx tsx scripts/pdiff.ts [--update]` — golden-frame gate: hashes every example's render (slice + solid) against `scripts/golden/pdiff.json` and counts non-finite distances; `--update` rewrites the goldens after an intended change
+* `npx tsx scripts/flagcheck.ts [id …]` — invariance gate for the `gen:` menu: renders every example under every flag setting the menu can produce and checks the settings agree with each other (same pixels, same parameter buffer, code independent of the order the settings were compiled in)
 
 See [HANDOFF.md](HANDOFF.md) for the architecture, invariants and the current state of development.
