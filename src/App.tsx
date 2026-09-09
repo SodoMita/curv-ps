@@ -11,6 +11,7 @@ import { buildAtlas, type Atlas } from "./gpu/atlas";
 import { wrapWGSL, wrapJS, createRenderer, type Renderer, type Camera, type Camera3 } from "./gpu/renderer";
 import { SHADER_FLAGS, flagsKey } from "./gpu/gen";
 import { GenOptions, type GenFlags, type Census } from "./components/GenOptions";
+import { Splitter } from "./components/Splitter";
 import { loadPsolve } from "./psolve/psolve";
 import { cn } from "./utils/cn";
 
@@ -19,6 +20,8 @@ import { cn } from "./utils/cn";
 const BG: Record<"light" | "dark", [number, number, number]> = { light: [0.965, 0.965, 0.975], dark: [0x0e / 255, 0x13 / 255, 0x22 / 255] };
 type ParamValues = Record<string, number | boolean | number[]>;
 type ViewMode = "2d" | "3d";
+type PanelKey = "params" | "solver" | "gen";
+const PANEL_TITLE: Record<PanelKey, string> = { params: "the parameters", solver: "the solver trace", gen: "the shader options" };
 const HOME: Camera = { cx: 0, cy: 0, zoom: 1 };
 const HOME3: Camera3 = { tx: 0, ty: 0, tz: 0, dist: 14, yaw: 0.65, pitch: 0.42, fov: (38 * Math.PI) / 180 };
 const DEBOUNCE_MS = 100;
@@ -362,7 +365,11 @@ export default function App() {
   useEffect(() => { const h = setTimeout(() => { dirty.current = true; }, DEBOUNCE_MS); return () => clearTimeout(h); }, [src]);
   useEffect(() => {
     const cv = canvasRef.current; if (!cv) return;
-    const ro = new ResizeObserver(() => { renderer.current?.resize(); dirty.current = true; });
+    const ro = new ResizeObserver(() => {
+      renderer.current?.resize(); dirty.current = true;
+      setBottomPx((px) => (px === null ? null : Math.min(px, Math.max(120, window.innerHeight - 160))));
+      setLeftPx((px) => (px === null ? null : clampLeft(px)));
+    });
     ro.observe(cv); return () => ro.disconnect();
   }, []);
 
@@ -467,19 +474,66 @@ export default function App() {
     return { lines: code ? code.split("\n").length : 0, ifs: (strip.match(/\bif\s*\(/g) ?? []).length, brks: (strip.match(/\bbreak\b|\bcontinue\b/g) ?? []).length, logic: (strip.match(/&&|\|\|/g) ?? []).length, loops: (strip.match(/\bfor\s*\(/g) ?? []).length };
   }, [code]);
   // The bottom row always holds the shader-generation panel; the params and solver panels join it when
-  // the program has parameters or solve blocks.  Any of the three folds to a 30px vertical strip: they
-  // are wide tables, and three of them side by side are three narrow tables.
+  // the program has parameters or solve blocks.  They stack, each at the full width of the row: three
+  // of them side by side were three narrow tables.  Any of the three folds to a labelled bar.
   const [folded, setFolded] = useState({ params: false, solver: false, gen: false });
-  const fold = (k: "params" | "solver" | "gen") => setFolded((f) => ({ ...f, [k]: !f[k] }));
-  // stacked, not side by side: a folded panel is a bar (auto), an open one takes a share of the row
-  const rows = [
-    params.length ? (folded.params ? "auto" : "minmax(0,1fr)") : null,
-    traces.length ? (folded.solver ? "auto" : "minmax(0,1fr)") : null,
-    folded.gen ? "auto" : "minmax(0,1fr)",
-  ].filter(Boolean).join(" ");
-  const openCount = (params.length && !folded.params ? 1 : 0) + (traces.length && !folded.solver ? 1 : 0) + (!folded.gen ? 1 : 0);
-  // the row grows with what is open, and shrinks to a stack of bars when nothing is
-  const rowH = openCount === 0 ? "auto" : openCount === 1 ? "minmax(160px,28%)" : openCount === 2 ? "minmax(210px,38%)" : "minmax(260px,48%)";
+  const fold = (k: PanelKey) => setFolded((f) => ({ ...f, [k]: !f[k] }));
+  const vis: PanelKey[] = [params.length ? "params" : null, traces.length ? "solver" : null, "gen"].filter(Boolean) as PanelKey[];
+  // a folded panel is a bar (auto); an open one takes a share of the row — and that share is exactly
+  // what the seam between two open panels trades
+  const [frs, setFrs] = useState<Record<PanelKey, number>>({ params: 1, solver: 1, gen: 1 });
+  const frsRef = useRef(frs); frsRef.current = frs;
+  const rows = vis.map((k) => (folded[k] ? "auto" : `minmax(0,${frs[k]}fr)`)).join(" ");
+  const openCount = vis.filter((k) => !folded[k]).length;
+  // The row grows with what is open (a percentage of the preview column, with a floor so a landscape
+  // window cannot squeeze the panels down to a title bar), and it can be dragged: the splitter hands
+  // the height over to the pointer, double-click gives it back to the layout.
+  const [bottomPx, setBottomPx] = useState<number | null>(null);
+  const bottomRef = useRef<HTMLDivElement>(null);
+  const splitSt = useRef(0);
+  const rowH = openCount === 0 ? "auto"
+    : bottomPx !== null ? `${bottomPx}px`
+    : openCount === 1 ? "minmax(min(150px,50%),32%)"
+    : openCount === 2 ? "minmax(min(230px,55%),44%)"
+    : "minmax(min(320px,60%),54%)";
+
+  // ---- draggable edges.  Every seam between two regions is a Splitter: it reports a pixel delta from
+  // where the drag started, and these handlers decide what that means.  Each keeps a floor so no region
+  // can be dragged out of existence, and each hands its size back to the layout when it is reset.
+  const PANEL_MIN = 44;   // a folded bar is ~18px: never let a drag take a panel below two of those
+  const panelEl = useRef<Partial<Record<PanelKey, HTMLDivElement | null>>>({});
+  const pairSt = useRef<{ a: PanelKey; b: PanelKey; ha: number; hb: number; fa: number; fb: number } | null>(null);
+  const beginPair = (a: PanelKey, b: PanelKey) => {
+    const ea = panelEl.current[a], eb = panelEl.current[b]; if (!ea || !eb) return;
+    pairSt.current = { a, b, ha: ea.getBoundingClientRect().height, hb: eb.getBoundingClientRect().height, fa: frsRef.current[a], fb: frsRef.current[b] };
+  };
+  const movePair = (dy: number) => {
+    const st = pairSt.current; if (!st || st.ha <= 0 || st.hb <= 0) return;
+    // the two neighbours trade height; the pair's total is unchanged, so the other panels never move
+    const total = st.ha + st.hb;
+    if (total < PANEL_MIN * 2) return;                    // nothing sensible to trade
+    const na = Math.max(PANEL_MIN, Math.min(total - PANEL_MIN, st.ha + dy));
+    const nb = total - na;
+    // fr units are proportional to heights, so scaling each by its own growth leaves the sum put
+    const fa = Math.max(0.02, st.fa * (na / st.ha)), fb = Math.max(0.02, st.fb * (nb / st.hb));
+    setFrs((f) => ({ ...f, [st.a]: fa, [st.b]: fb }));
+  };
+  const resetPair = (a: PanelKey, b: PanelKey) => setFrs((f) => ({ ...f, [a]: 1, [b]: 1 }));
+
+  // editor column | preview column
+  const [leftPx, setLeftPx] = useState<number | null>(null);
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const leftColRef = useRef<HTMLElement>(null);
+  const leftSt = useRef(0);
+  const clampLeft = (px: number) => {
+    const w = bodyRef.current?.clientWidth ?? window.innerWidth;
+    return Math.max(280, Math.min(px, Math.max(280, w - 360)));
+  };
+
+  // reference drawer (the bottom of the page)
+  const [refPx, setRefPx] = useState<number | null>(null);
+  const refRef = useRef<HTMLDivElement>(null);
+  const refSt = useRef(0);
   const fmtZoom = (z: number) => (z >= 100 ? z.toFixed(0) : z >= 1 ? z.toFixed(z >= 10 ? 1 : 2) : z.toPrecision(2));
 
   return (
@@ -505,9 +559,10 @@ export default function App() {
       </header>
 
       {/* body */}
-      <div className="grid min-h-0 flex-1 grid-cols-1 overflow-auto lg:grid-cols-[minmax(360px,42%)_1fr] lg:overflow-hidden">
+      <div ref={bodyRef} className="grid min-h-0 flex-1 grid-cols-1 overflow-auto lg:grid-cols-[var(--left)_5px_minmax(0,1fr)] lg:overflow-hidden"
+        style={{ "--left": leftPx === null ? "minmax(360px,42%)" : `${leftPx}px` } as React.CSSProperties}>
         {/* left: examples + editor */}
-        <section className="flex min-h-[70vh] flex-col border-b border-line lg:min-h-0 lg:border-r lg:border-b-0">
+        <section ref={leftColRef} className="flex min-h-[70vh] flex-col border-b border-line lg:min-h-0 lg:border-r lg:border-b-0">
           <div className="flex flex-wrap items-center gap-2 border-b border-line px-3 py-2">
             <label className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted">Example</label>
             <select value={exampleId} onChange={(e) => loadExample(e.target.value)}
@@ -541,8 +596,16 @@ export default function App() {
           </div>
         </section>
 
+        {/* the seam between the editor column and the preview column (stacked below lg, where there is
+            nothing to drag: the splitter is display:none there, so it never takes a grid cell) */}
+        <Splitter dir="col" className="hidden w-[5px] lg:block"
+          title="Drag to give the editor or the preview more width · double-click to hand it back to the layout"
+          onBegin={() => { leftSt.current = leftColRef.current?.getBoundingClientRect().width ?? 0; }}
+          onMove={(d) => setLeftPx(clampLeft(leftSt.current + d))}
+          onReset={() => setLeftPx(null)} />
+
         {/* right: preview + panels (first on mobile so the canvas is what you see and touch) */}
-        <section className={cn("order-first grid min-h-[80vh] lg:order-none lg:min-h-0", `grid-rows-[minmax(0,1fr)_${rowH}]`)}>
+        <section className={cn("order-first grid min-h-[80vh] lg:order-none lg:min-h-0", `grid-rows-[minmax(0,1fr)_5px_${rowH}]`)}>
           <div className="flex min-h-0 flex-col">
             <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 border-b border-line px-3 py-2 text-[11px] text-muted sm:px-4">
               <span className="font-semibold uppercase tracking-[0.14em]">Preview</span>
@@ -605,16 +668,40 @@ export default function App() {
               )}
             </div>
           </div>
-          <div className="grid min-h-0 border-t border-line bg-ink" style={{ gridTemplateRows: rows }}>
-            {params.length > 0 && <div className="min-h-0 overflow-hidden border-b border-line"><ParamsPanel params={params} values={paramValues} onChange={(n, v) => setParamValues((p) => ({ ...p, [n]: v }))} onReset={() => setParamValues({})} collapsed={folded.params} onToggle={() => fold("params")} /></div>}
-            {traces.length > 0 && <div className="min-h-0 overflow-hidden border-b border-line"><SolverPanel traces={traces} evalMs={stats.evalMs} fps={stats.fps} collapsed={folded.solver} onToggle={() => fold("solver")} /></div>}
-            <div className="min-h-0 overflow-hidden bg-surface/40"><GenOptions flags={gen} onChange={applyGen} census={census} collapsed={folded.gen} onToggle={() => fold("gen")} /></div>
+          <Splitter dir="row" className="h-[5px]"
+            title="Drag to give the panels more or less height · double-click to hand it back to the layout"
+            onBegin={() => { splitSt.current = bottomRef.current?.getBoundingClientRect().height ?? 0; }}
+            onMove={(d) => setBottomPx(Math.max(60, Math.min(Math.max(120, window.innerHeight - 160), splitSt.current - d)))}
+            onReset={() => setBottomPx(null)} />
+          <div ref={bottomRef} className="grid min-h-0 bg-ink" style={{ gridTemplateRows: rows }}>
+            {vis.map((k, i) => (
+              // the cell is not clipped: the seam floats on the border above it, which is the only way
+              // a drag target can straddle two panels without paying for a track of its own
+              <div key={k} ref={(el) => { panelEl.current[k] = el; }} className="relative min-h-0">
+                {i > 0 && !folded[k] && !folded[vis[i - 1]] && (
+                  <Splitter dir="row" variant="overlay" className="-top-[4px] left-0 right-0 h-[8px]"
+                    title={`Drag to trade height between ${PANEL_TITLE[vis[i - 1]]} and ${PANEL_TITLE[k]} · double-click to even them out`}
+                    onBegin={() => beginPair(vis[i - 1], k)} onMove={movePair} onReset={() => resetPair(vis[i - 1], k)} />
+                )}
+                <div className={cn("h-full min-h-0 overflow-hidden", i < vis.length - 1 && "border-b border-line", k === "gen" && "bg-surface/40")}>
+                  {k === "params" && <ParamsPanel params={params} values={paramValues} onChange={(n, v) => setParamValues((p) => ({ ...p, [n]: v }))} onReset={() => setParamValues({})} collapsed={folded.params} onToggle={() => fold("params")} />}
+                  {k === "solver" && <SolverPanel traces={traces} evalMs={stats.evalMs} fps={stats.fps} collapsed={folded.solver} onToggle={() => fold("solver")} />}
+                  {k === "gen" && <GenOptions flags={gen} onChange={applyGen} census={census} collapsed={folded.gen} onToggle={() => fold("gen")} />}
+                </div>
+              </div>
+            ))}
           </div>
         </section>
       </div>
 
-      {showRef && (
-        <div className="max-h-[46vh] shrink-0 overflow-auto border-t border-line bg-surface/60 px-4 py-4 sm:px-6 sm:py-5">
+      {showRef && (<>
+        <Splitter dir="row" className="h-[5px] shrink-0"
+          title="Drag to give the reference more or less height · double-click to hand it back to the layout"
+          onBegin={() => { refSt.current = refRef.current?.getBoundingClientRect().height ?? 0; }}
+          onMove={(d) => setRefPx(Math.max(80, Math.min(Math.max(120, window.innerHeight - 200), refSt.current - d)))}
+          onReset={() => setRefPx(null)} />
+        <div ref={refRef} style={{ height: refPx ?? undefined }}
+          className={cn("shrink-0 overflow-auto border-t border-line bg-surface/60 px-4 py-4 sm:px-6 sm:py-5", refPx === null && "max-h-[46vh]")}>
           <div className="mb-4 max-w-4xl text-[12px] leading-relaxed text-muted">
             <span className="text-fg">How it works.</span> Curv programs are evaluated by a tree-walking interpreter; shape values form an F-Rep tree which is compiled to a
             straight-line <span className="font-mono">WGSL</span> fragment shader (numbers go into a parameter buffer, so animation and re-solving never recompile;
@@ -627,7 +714,7 @@ export default function App() {
           </div>
           <Reference />
         </div>
-      )}
+      </>)}
     </div>
   );
 }
