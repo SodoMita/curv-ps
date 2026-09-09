@@ -138,7 +138,10 @@ which is a nudge towards measuring `polySelect` on its own.
 `SHADER_FLAGS` option, each with its measured cost in the tooltip, plus a live branch
 census of the last compiled shader (`N lines · i if · b break · s && || · L loops`).  (It started as a
 popover off the toolbar; ten options and their costs do not fit in one and cannot be read while
-dragging a slider, so it is a panel now.)  Flipping an option
+dragging a slider, so it is a panel now — the last of the bottom row's three panels.)  All three bottom panels (parametric, solver trace, shader generation) **fold**: each has a chevron in
+its header and collapses to a 30px vertical strip titled down the side (`src/components/Panel.tsx`),
+so folding one gives the others its width instead of hiding it.  Three wide tables side by side were
+three narrow tables; the row shrinks to `auto` height when all of them are folded.  Flipping an option
 mutates `SHADER_FLAGS` and clears `lastProg`/`staticCache`; three `wgslcheck` checks keep that honest:
 switching to `branchless` must produce different code (not a reused shader), switching back must restore
 the old text, and the **parameter layout must not move** (292 params either way) — the menu cannot be
@@ -582,6 +585,8 @@ src/curv/shapes.ts      SNode F-Rep tree, bboxOf/bbox3Of (memoised), flags3Of, t
 src/curv/prelude.ts     palette, box helpers, layout combinators (incl. flow / hstack_fit), UI components — in Curv
 src/curv/examples.ts    example programs (group "solve" | "curv" | "3d")
 src/gpu/gen.ts          code generators: WGSL, JS, ParamsOnly; dynBlock/finalParams; Gen.usesTime
+src/components/Panel.tsx       folding for the bottom row: collapsed strip + the header chevron, shared by
+                        all three panels
 src/components/GenOptions.tsx  the bottom-row shader-generation panel (branched / branchless + every
                         SHADER_FLAGS option, with measured costs and a branch census)
 src/gpu/renderer.ts     WebGPU renderer (pipeline cache keyed by code, timestamp queries) + CPU
