@@ -33,9 +33,65 @@ export interface ShaderFlags {
   /** text loop: binary-search the glyph window under the pixel (cells are sorted along the row) and
    *  evaluate only ~6 glyphs instead of all N — same parameters, different code */
   textWindow: boolean;
+  /**
+   * Master switch: emit **no control flow at all** — no `if`, no `else`, no `break`, no
+   * short-circuit `&&`/`||`.  Every conditional becomes a masked assignment
+   * (`x = select(x, v, cond)`) and every `break` becomes a `live` flag that stops further updates,
+   * so both arms of a branch are always computed and every loop runs all of its iterations.
+   * Uniform (parameter-counted) `for` loops stay: they are loops, not divergent branches.
+   * Costs work, buys divergence-free warps; `scripts/branchbench.ts` measures which wins.
+   */
+  branchless: boolean;
+  /**
+   * `&&`/`||` short-circuit, and a short-circuit is a branch.  This flag alone (no masking of
+   * `if`s) swaps them for the non-short-circuiting `&`/`|` that WGSL also defines for `bool`.
+   * It is the cheap half of `branchless`: both operands are already-computed values in
+   * straight-line code, so nothing extra is evaluated.  Implied by `branchless`.
+   */
+  noShortCircuit: boolean;
+  /** bbox-cull bracket of a union/intersection child as a `select` instead of an `if` (the child is
+   *  then always evaluated — that is the whole cost of removing the branch).  Implied by
+   *  `branchless`, which masks *every* conditional the same way. */
+  cullSelect: boolean;
+  /** the hand-written 3D raymarch wrapper (src/gpu/renderer.ts): no `if`, no `break` — every ray
+   *  runs all `sdfSteps` steps and is shaded even when it hits nothing.  Measured separately
+   *  because it is by far the most expensive of the four. */
+  branchless3D: boolean;
+  /**
+   * 3D raymarch: maximum sphere-tracing steps per ray.  A **compile-time constant of codegen,
+   * not a uniform**: the loop bound is baked into the generated WGSL (and into the CPU fallback's
+   * generated marcher) as a literal, so the shader compiler knows the trip count and can unroll
+   * and constant-fold around it — and a change recompiles the pipeline (the bound is part of the
+   * pipeline key, `keyOf` in renderer.ts) rather than paying an indirection every iteration.
+   * Fewer steps march faster but can miss grazing surfaces (hits are monotone in the count: the
+   * first N steps of an M-step march are the same march); more steps are slower and exhaustive.
+   * Body code and the parameter buffer do not depend on it, so — unlike the emission flags — it
+   * is deliberately NOT part of `flagsKey`: the body/param caches stay valid across a change.
+   * Default 128, the count the marcher was hardcoded to before the option existed.
+   */
+  sdfSteps: number;
 }
-export const SHADER_FLAGS: ShaderFlags = { polySelect: false, textBranchless: false, cullWeight: 4, flattenIf: false, unrollMax: 0, textWindow: false };
-export const flagsKey = () => (SHADER_FLAGS.polySelect ? "p" : "") + (SHADER_FLAGS.textBranchless ? "T" : "") + "w" + SHADER_FLAGS.cullWeight + (SHADER_FLAGS.flattenIf ? "f" : "") + "u" + SHADER_FLAGS.unrollMax + (SHADER_FLAGS.textWindow ? "G" : "");
+/**
+ * Defaults, as measured by `scripts/branchbench.ts` (CPU fallback, best-of-N, pinned resolution):
+ *   • `noShortCircuit` is free (1.00× slice / 1.02× solid) and removes every short-circuiting
+ *     `&&`/`||` from the generated code, so it is on;
+ *   • `branchless` costs 3.0× in the 2D view (it is mostly the loss of bbox culling) and 9.7× in
+ *     the 3D view (the raymarch loses its early-out), so it is off.  Flip it here or from the
+ *     console (`SHADER_FLAGS.branchless = true`) to build the branchless variant.
+ */
+export const SHADER_FLAGS: ShaderFlags = { polySelect: false, textBranchless: false, cullWeight: 4, flattenIf: false, unrollMax: 0, textWindow: false, branchless: false, noShortCircuit: true, cullSelect: false, branchless3D: false, sdfSteps: 128 };
+/** The sanitised step count every consumer bakes in (the menu only offers these values; this
+ *  guards the console — `SHADER_FLAGS.sdfSteps = 0` would otherwise emit `i < 0u`). */
+export const sdfSteps = () => { const n = Math.round(SHADER_FLAGS.sdfSteps); return Number.isFinite(n) && n >= 1 ? Math.min(n, 4096) : 128; };
+export const flagsKey = () => (SHADER_FLAGS.polySelect ? "p" : "") + (SHADER_FLAGS.textBranchless ? "T" : "") + "w" + SHADER_FLAGS.cullWeight + (SHADER_FLAGS.flattenIf ? "f" : "") + "u" + SHADER_FLAGS.unrollMax + (SHADER_FLAGS.textWindow ? "G" : "") + (SHADER_FLAGS.branchless ? "B" : "") + (SHADER_FLAGS.noShortCircuit ? "L" : "") + (SHADER_FLAGS.cullSelect ? "C" : "") + (SHADER_FLAGS.branchless3D ? "3" : "");
+// (`sdfSteps` is intentionally absent: it changes only the 3D wrapper, never the body or the
+//  parameter buffer, so the body/param caches this key guards stay valid across a steps change.
+//  The wrapper-only inputs are keyed where they matter: the pipeline key in renderer.ts and the
+//  code panel's refresh key in App.tsx — both include the step count.)
+/** A branch is worth removing only when the flag says so; the individual flags remain for A/B. */
+export const branchless = () => SHADER_FLAGS.branchless;
+/** `&&`/`||` → `&`/`|`: on its own (no masked `if`s) or as part of the branchless build. */
+export const bitLogic = () => SHADER_FLAGS.branchless || SHADER_FLAGS.noShortCircuit;
 
 export abstract class Gen {
   /** set by SubCurv when compiled user code reads the time (the `t` of `[x,y,z,t]`, or `time`): the program animates through the time uniform */
@@ -84,9 +140,30 @@ export abstract class Gen {
   abstract if(c: E, then: () => void, els?: () => void): void;
   abstract loop(count: E, body: (i: E) => void): void;
   abstract brk(): void;
+
+  // ---- branchless lowering (SHADER_FLAGS.branchless) -------------------------------------------
+  /** Conditions that currently guard every assignment (`if` arms and the `live` flag of a loop). */
+  protected conds: E[] = [];
+  /** Per-enclosing-loop `live` / break-requested flag pair; `brk()` sets the innermost one and
+   *  clears `live` at the same moment — a break skips the rest of *this* iteration, not just the
+   *  following ones. */
+  protected brks: { live: E; brk: E }[] = [];
+  /** AND of the active conditions, or null when nothing is guarded (so `assign` stays plain). */
+  protected condNow(): E | null {
+    if (!this.conds.length) return null;
+    return this.conds.reduce((a, b) => ({ t: "b" as Ty, s: `(${a.s} & ${b.s})` }));
+  }
+  protected pushCond(c: E) { this.conds.push(c); }
+  protected popCond() { this.conds.pop(); }
   swz(a: E, ids: number[]): E { const t = this.let(a); return this.vec(ids.map((i) => this.idx(t, i))); }
   // broadcast a scalar to a vector type
   abstract bcast(e: E, t: Ty): E;
+  /** Scalar → vector only.  A vector → vector call is always a bug in the caller: WGSL silently
+   *  truncated (vec2f(vec3f…)) while the JS `R.bc` is scalar-only and built a nested array,
+   *  i.e. NaN.  Throw loudly instead — see the `text` glyph clamp (round 17). */
+  protected bcastGuard(e: E, t: Ty): void {
+    if (e.t !== "f" && e.t !== t) throw new GenError(`Cannot broadcast a ${DIM[e.t]}-component vector to ${DIM[t]} components`);
+  }
   unify(a: E, b: E): [E, E] {
     if (a.t === b.t) return [a, b];
     if (a.t === "f") return [this.bcast(a, b.t), b];
@@ -108,7 +185,7 @@ export class WGSL extends Gen {
   num(v: number): E { return { t: "f", s: fmtW(v) }; }
   paramAt(i: E): E { return { t: "f", s: `P[u32(${i.s})]` }; }
   bool(v: boolean): E { return { t: "b", s: v ? "true" : "false" }; }
-  bcast(e: E, t: Ty): E { return e.t === t ? e : { t, s: `${WTY[t]}(${e.s})` }; }
+  bcast(e: E, t: Ty): E { if (e.t === t) return e; this.bcastGuard(e, t); return { t, s: `${WTY[t]}(${e.s})` }; }
   bin(op: string, a: E, b: E): E {
     if (a.t === "b" || b.t === "b") throw new GenError(`Cannot apply '${op}' to a boolean`);
     const t = a.t === "f" ? b.t : a.t;
@@ -132,7 +209,9 @@ export class WGSL extends Gen {
     if (op === "!=") return { t: "b", s: `any(${a.s} != ${b.s})` };
     throw new GenError("Ordered comparison of vectors is not supported in shader code");
   }
-  logic(op: "&&" | "||", a: E, b: E): E { return { t: "b", s: `(${a.s} ${op} ${b.s})` }; }
+  /** `&&`/`||` short-circuit, i.e. they branch; branchless mode uses the non-short-circuiting
+   *  `&`/`|`, which WGSL defines for `bool` too (both operands always evaluated). */
+  logic(op: "&&" | "||", a: E, b: E): E { return { t: "b", s: bitLogic() ? `(${a.s} ${op === "&&" ? "&" : "|"} ${b.s})` : `(${a.s} ${op} ${b.s})` }; }
   not(a: E): E { return { t: "b", s: `(!${a.s})` }; }
   fn(name: string, args: E[]): E {
     if (this.isUnary(name)) {
@@ -163,16 +242,43 @@ export class WGSL extends Gen {
   tex(uv: E): E { return { t: "f", s: `textureSampleLevel(atlasTex, atlasSamp, ${uv.s}, 0.0).r` }; }
   let(e: E): E { if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(e.s) || /^P\[\d+\]$/.test(e.s)) return e; const n = this.tmp(); this.emit(`let ${n}: ${WTY[e.t]} = ${e.s};`); return { t: e.t, s: n }; }
   var(e: E): E { const n = this.tmp("v"); this.emit(`var ${n}: ${WTY[e.t]} = ${e.s};`); return { t: e.t, s: n }; }
-  assign(ref: E, e: E) { this.emit(`${ref.s} = ${this.bcast(e, ref.t).s};`); }
+  /** Under a condition the store becomes `ref = select(ref, v, cond)` — the value is computed
+   *  either way, but the update only lands where the branch would have taken it. */
+  assign(ref: E, e: E) {
+    const v = this.bcast(e, ref.t).s, c = branchless() ? this.condNow() : null;
+    this.emit(c ? `${ref.s} = select(${ref.s}, ${v}, ${c.s});` : `${ref.s} = ${v};`);
+  }
   if(c: E, then: () => void, els?: () => void) {
+    if (branchless()) { // both arms emitted, guarded by the condition: no control flow at all
+      this.pushCond(c); then(); this.popCond();
+      if (els) { this.pushCond(this.not(c)); els(); this.popCond(); }
+      return;
+    }
     this.emit(`if (${c.s}) {`); this.indent += "  "; then(); this.indent = this.indent.slice(2);
     if (els) { this.emit("} else {"); this.indent += "  "; els(); this.indent = this.indent.slice(2); }
     this.emit("}");
   }
   loop(count: E, body: (i: E) => void) {
-    const i = this.tmp("i"); this.emit(`for (var ${i}: f32 = 0.0; ${i} < ${count.s}; ${i} += 1.0) {`); this.indent += "  "; body({ t: "f", s: i }); this.indent = this.indent.slice(2); this.emit("}");
+    const i = this.tmp("i");
+    this.emit(`for (var ${i}: f32 = 0.0; ${i} < ${count.s}; ${i} += 1.0) {`); this.indent += "  ";
+    if (branchless()) {
+      // a `break` no longer leaves the loop: it clears `live`, so every later iteration is a no-op
+      const live = this.tmp("l"), b = this.tmp("k");
+      this.emit(`var ${live}: bool = true;`);
+      this.emit(`var ${b}: bool = false;`);
+      this.pushCond({ t: "b", s: live }); this.brks.push({ live: { t: "b", s: live }, brk: { t: "b", s: b } });
+      body({ t: "f", s: i });
+      this.brks.pop(); this.popCond();
+      this.emit(`${live} = ${live} & !${b};`);
+    } else body({ t: "f", s: i });
+    this.indent = this.indent.slice(2); this.emit("}");
   }
-  brk() { this.emit("break;"); }
+  brk() {
+    const f = branchless() ? this.brks[this.brks.length - 1] : undefined;
+    if (!f) { this.emit("break;"); return; }
+    this.assign(f.brk, this.bool(true));                 // masked by the active conditions
+    this.emit(`${f.live.s} = ${f.live.s} & !${f.brk.s};`); // and retire *now*, not at the next iteration
+  }
 }
 
 const fmtJ = (v: number) => (Number.isFinite(v) ? (Object.is(v, -0) ? "0" : String(v)) : v > 0 ? "Infinity" : v < 0 ? "-Infinity" : "0");
@@ -182,7 +288,7 @@ export class JS extends Gen {
   num(v: number): E { return { t: "f", s: fmtJ(v) }; }
   paramAt(i: E): E { return { t: "f", s: `P[${i.s}]` }; }
   bool(v: boolean): E { return { t: "b", s: v ? "true" : "false" }; }
-  bcast(e: E, t: Ty): E { return e.t === t ? e : { t, s: `R.bc(${e.s}, ${DIM[t]})` }; }
+  bcast(e: E, t: Ty): E { if (e.t === t) return e; this.bcastGuard(e, t); return { t, s: `R.bc(${e.s}, ${DIM[t]})` }; }
   bin(op: string, a: E, b: E): E {
     if (a.t === "b" || b.t === "b") throw new GenError(`Cannot apply '${op}' to a boolean`);
     const t = a.t === "f" ? b.t : a.t;
@@ -206,7 +312,7 @@ export class JS extends Gen {
     if (op === "!=") return { t: "b", s: `(!R.eq(${a.s}, ${b.s}))` };
     throw new GenError("Ordered comparison of vectors is not supported in shader code");
   }
-  logic(op: "&&" | "||", a: E, b: E): E { return { t: "b", s: `(${a.s} ${op} ${b.s})` }; }
+  logic(op: "&&" | "||", a: E, b: E): E { return { t: "b", s: bitLogic() ? `(${a.s} ${op === "&&" ? "&" : "|"} ${b.s})` : `(${a.s} ${op} ${b.s})` }; }
   not(a: E): E { return { t: "b", s: `(!${a.s})` }; }
   fn(name: string, args: E[]): E {
     if (this.isUnary(name)) {
@@ -237,16 +343,42 @@ export class JS extends Gen {
   tex(uv: E): E { return { t: "f", s: `R.tex(${uv.s})` }; }
   let(e: E): E { if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(e.s) || /^P\[\d+\]$/.test(e.s)) return e; const n = this.tmp(); this.emit(`const ${n} = ${e.s};`); return { t: e.t, s: n }; }
   var(e: E): E { const n = this.tmp("v"); this.emit(`let ${n} = ${e.s};`); return { t: e.t, s: n }; }
-  assign(ref: E, e: E) { this.emit(`${ref.s} = ${this.bcast(e, ref.t).s};`); }
+  /** see the WGSL backend: `select` becomes a ternary, `&`/`|` on booleans yield 0/1 numbers,
+   *  which every consumer here (`? :`, `!`, further `&`) reads by truthiness. */
+  assign(ref: E, e: E) {
+    const v = this.bcast(e, ref.t).s, c = branchless() ? this.condNow() : null;
+    this.emit(c ? `${ref.s} = (${c.s} ? ${v} : ${ref.s});` : `${ref.s} = ${v};`);
+  }
   if(c: E, then: () => void, els?: () => void) {
+    if (branchless()) {
+      this.pushCond(c); then(); this.popCond();
+      if (els) { this.pushCond(this.not(c)); els(); this.popCond(); }
+      return;
+    }
     this.emit(`if (${c.s}) {`); this.indent += "  "; then(); this.indent = this.indent.slice(2);
     if (els) { this.emit("} else {"); this.indent += "  "; els(); this.indent = this.indent.slice(2); }
     this.emit("}");
   }
   loop(count: E, body: (i: E) => void) {
-    const i = this.tmp("i"); this.emit(`for (let ${i} = 0; ${i} < ${count.s}; ${i}++) {`); this.indent += "  "; body({ t: "f", s: i }); this.indent = this.indent.slice(2); this.emit("}");
+    const i = this.tmp("i");
+    this.emit(`for (let ${i} = 0; ${i} < ${count.s}; ${i}++) {`); this.indent += "  ";
+    if (branchless()) {
+      const live = this.tmp("l"), b = this.tmp("k");
+      this.emit(`let ${live} = true;`);
+      this.emit(`let ${b} = false;`);
+      this.pushCond({ t: "b", s: live }); this.brks.push({ live: { t: "b", s: live }, brk: { t: "b", s: b } });
+      body({ t: "f", s: i });
+      this.brks.pop(); this.popCond();
+      this.emit(`${live} = ${live} & !${b};`);
+    } else body({ t: "f", s: i });
+    this.indent = this.indent.slice(2); this.emit("}");
   }
-  brk() { this.emit("break;"); }
+  brk() {
+    const f = branchless() ? this.brks[this.brks.length - 1] : undefined;
+    if (!f) { this.emit("break;"); return; }
+    this.assign(f.brk, this.bool(true));
+    this.emit(`${f.live.s} = ${f.live.s} & !${f.brk.s};`);
+  }
 }
 
 // Parameter-only backend: walks the very same codegen path as WGSL / JS but

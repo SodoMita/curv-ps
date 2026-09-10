@@ -4,31 +4,50 @@
 // code, so animation / re-solving only re-uploads the parameter buffer.  The
 // CPU fallback runs the JS flavour of the same generated code.
 import { ATLAS_W, ATLAS_H, type Atlas } from "./atlas";
-import { makeJSRuntime } from "./gen";
+import { makeJSRuntime, SHADER_FLAGS, sdfSteps } from "./gen";
+import { BB_PAD_K, type BBox3 } from "../curv/shapes";
 
-export interface Compiled { code: string; d: string; c: string; params: Float32Array }
+export interface Compiled { code: string; d: string; c: string; params: Float32Array; solid?: boolean;
+  /** the scene's finite 3D bounding box (null = unbounded, or the 2D slice view): the solid-view
+   *  marcher skips the empty space outside it — see the slab test in the 3D wrappers below */
+  bbox3?: BBox3 | null }
 /** World-space camera: centre in world units, zoom = device-independent px per world unit.  y is always up. */
 export interface Camera { cx: number; cy: number; zoom: number }
+/** Orbit camera for the 3D (solid) view: target + distance + yaw/pitch around it, fov in radians. */
+export interface Camera3 { tx: number; ty: number; tz: number; dist: number; yaw: number; pitch: number; fov: number }
 export interface Renderer {
   kind: "webgpu" | "cpu";
   adapterInfo?: string;
   /** `scale` (0..1] renders at a fraction of the device resolution (adaptive quality while animating). */
-  render(prog: Compiled, cam: Camera, bg: [number, number, number], time: number, scale?: number): Promise<void>;
+  render(prog: Compiled, cam: Camera, bg: [number, number, number], time: number, scale?: number, cam3?: Camera3): Promise<void>;
   resize(scale?: number): void;
   destroy(): void;
-  stats: { compiles: number; lastCompileMs: number; cached: number; gpuMs: number; timestamps: boolean };
+  stats: { compiles: number; lastCompileMs: number; cached: number; gpuMs: number; timestamps: boolean;
+    /** non-finite distances seen by the CPU raster loops (a NaN distance paints a black pixel);
+     *  always 0 on the WebGPU path, which cannot report per-pixel values back */ nan: number;
+    /** SDF evaluations of the 3D marcher's ray loop, cumulative (CPU fallback only — the GPU
+     *  cannot count them back; `scripts/marchbench.ts` reads deltas of this counter) */ steps: number };
 }
 
-export async function createRenderer(canvas: HTMLCanvasElement, atlas: Atlas, mode: "auto" | "cpu" = "auto"): Promise<Renderer> {
+export interface RendererOptions {
+  /** Pin the CPU fallback's adaptive resolution (0..1] instead of letting it settle from frame
+   *  time — used by the gates so two builds can be timed on exactly the same pixel count. */
+  fixedScale?: number;
+}
+export async function createRenderer(canvas: HTMLCanvasElement, atlas: Atlas, mode: "auto" | "cpu" = "auto", opts: RendererOptions = {}): Promise<Renderer> {
   if (mode === "auto") {
     try { const r = await createWebGPU(canvas, atlas); if (r) return r; }
     catch (e) { console.warn("WebGPU init failed, using CPU fallback", e); }
   }
-  return createCPU(canvas, atlas);
+  return createCPU(canvas, atlas, opts.fixedScale);
 }
 
+// cam: 2D slice camera (cx, cy, zoom); cam3a: 3D target + distance; cam3b: yaw, pitch, tan(fov/2), aspect
+// bb0/bb1: the scene's bounding box min/max corners.  A scene without a finite box gets the
+// everything-box (±1e30): the slab test then yields t0 = 0.02 / t1 = FAR, i.e. exactly the old
+// march-from-the-eye, so bounded and unbounded scenes run the same code with no behavioural seam.
 const PREAMBLE = /* wgsl */ `
-struct U { res: vec2f, time: f32, pad0: f32, bg: vec4f, atlas: vec4f, cam: vec4f };
+struct U { res: vec2f, time: f32, pad0: f32, bg: vec4f, atlas: vec4f, cam: vec4f, cam3a: vec4f, cam3b: vec4f, bb0: vec4f, bb1: vec4f };
 @group(0) @binding(0) var<uniform> u: U;
 @group(0) @binding(1) var<storage, read> P: array<f32>;
 @group(0) @binding(2) var atlasTex: texture_2d<f32>;
@@ -42,15 +61,176 @@ fn hsv2rgb(c: vec3f) -> vec3f {
   return c.z - c.z * c.y * max(vec3f(0.0), min(min(k, 4.0 - k), vec3f(1.0)));
 }
 `;
-const wrapWGSL = (c: Compiled) => `${PREAMBLE}
+/** Which flavour of the 3D wrapper is in force: with `branchless3D` (or the master `branchless`
+ *  flag) the raymarch loop has no `if` and no `break`, so every ray runs all `sdfSteps` steps and
+ *  is shaded even when it hits nothing — same pixels, strictly more work. */
+const solidBranchless = () => SHADER_FLAGS.branchless3D || SHADER_FLAGS.branchless;
+/** The raymarch loop bound as a WGSL literal — a compile-time constant of the generated shader,
+ *  not a uniform read (see `ShaderFlags.sdfSteps`).  Changing it changes the wrapper text, and
+ *  the pipeline cache key (`keyOf`) carries it, so each setting gets its own compiled pipeline. */
+const stepsLit = () => sdfSteps() + "u";
+/** The box pad, as a WGSL expression of the camera distance: at least the plate half-thickness
+ *  (`FLAT_K * rad` — a flattened 2D shape is a slab that thick around z = 0 while its own bbox
+ *  has zero z extent) with margin for the 0.001 hit epsilon; `BB_PAD_K` lives beside `FLAT_K` in
+ *  shapes.ts so the two cannot drift apart. */
+const padExpr = `max(0.01, rad * ${BB_PAD_K})`;
+/** Ray ∩ padded-scene-box, the shared head of both 3D wrappers.  Written with min/max only, so
+ *  the branched and the branchless build compute bit-identical bounds from it (flagcheck holds
+ *  them to identical pixels).  A ray that misses the box cannot meet the surface — the box bounds
+ *  the field's zero set (stdcheck samples that invariant) — so it is background without a single
+ *  field evaluation; a ray that meets it starts marching at the entry point and stops at the exit.
+ *  `1/rd` is ±inf on an axis-parallel ray and the min/max then voids that axis; the degenerate
+ *  0·inf = NaN corner (ray origin exactly on a box face, rd exactly axis-parallel) fails open:
+ *  the march starts at a NaN t, every distance is NaN, and the ray paints background — wasted
+ *  steps, never a wrong pixel. */
+const slabWGSL = `  let pad = ${padExpr};
+  let dinv = vec3f(1.0) / rd;
+  let ta = (u.bb0.xyz - vec3f(pad) - ro) * dinv;
+  let tb = (u.bb1.xyz + vec3f(pad) - ro) * dinv;
+  let lo = min(ta, tb); let hi = max(ta, tb);
+  let t0 = max(0.02, max(max(lo.x, lo.y), lo.z));
+  let t1 = min(FAR, min(min(hi.x, hi.y), hi.z));
+`;
+
+const wrapWGSL2D = (c: Compiled) => `${PREAMBLE}
 @fragment fn fs(@builtin(position) fc: vec4f) -> @location(0) vec4f {
   let px = fc.xy / u.atlas.w;
-  let p0 = vec2f(1.0, -1.0) * (px - u.res * 0.5) / u.cam.z + u.cam.xy;
+  // 3D-native body: the point is a vec3 on the z = 0 plane (the exact 2D slice)
+  let p0 = vec3f(vec2f(1.0, -1.0) * (px - u.res * 0.5) / u.cam.z + u.cam.xy, 0.0);
 ${c.code}
   let d = ${c.d}; let col = ${c.c};
   let aa = clamp(0.5 - d * u.cam.z, 0.0, 1.0) * col.a;
   return vec4f(mix(u.bg.rgb, col.rgb, aa), 1.0);
 }`;
+// 3D solid view: raymarch the distance field; the same straight-line body becomes a step() and
+// a colour() function of the ray position.  Lighting matches the C++ viewer (ambient + 2 key
+// lights + rim).
+const wrapWGSL3D = (c: Compiled) => `${PREAMBLE}
+fn stepf(q: vec3f) -> f32 {
+  let p0 = q;
+${c.code}
+  return ${c.d};
+}
+fn colf(q: vec3f) -> vec4f {
+  let p0 = q;
+${c.code}
+  return ${c.c};
+}
+@fragment fn fs(@builtin(position) fc: vec4f) -> @location(0) vec4f {
+  let tgt = u.cam3a.xyz;
+  let rad = max(u.cam3a.w, 0.001);
+  let cy = cos(u.cam3b.x); let sy = sin(u.cam3b.x);
+  let cp = cos(u.cam3b.y); let sp = sin(u.cam3b.y);
+  let ro = tgt + rad * vec3f(sy * cp, sp, cy * cp);
+  let fw = normalize(tgt - ro);
+  let rt = normalize(cross(fw, vec3f(0.0, 1.0, 0.0)));
+  let up = cross(rt, fw);
+  // normalised device coords in [-1, 1] — the CPU marcher divides by (res * 0.5); this used to
+  // multiply by 2.0 instead, which made nd ~res wide (e.g. ±800), so every ray left at a right
+  // angle to the view direction and the 3D view came out empty on the GPU while the CPU path
+  // (and therefore every headless gate) looked fine.
+  let nd = vec2f(1.0, -1.0) * (fc.xy / u.atlas.w - u.res * 0.5) / (u.res * 0.5);
+  let rd = normalize(fw + rt * (nd.x * u.cam3b.z * u.cam3b.w) + up * (nd.y * u.cam3b.z));
+  // the far plane follows the camera: a viewport-sized 2D program is ~900 units across and the
+  // auto-fit puts the eye ~1900 units out, where a fixed 400-unit far plane never reaches it
+  let FAR = max(400.0, rad * 6.0);
+${slabWGSL}  if (t0 > t1) { return vec4f(u.bg.rgb, 1.0); }
+  var tt = t0;
+  var hit = false;
+  // the step count is baked in as a literal (sdfSteps): a comptime constant the shader compiler
+  // can unroll and constant-fold around, not a uniform it has to read every iteration
+  for (var i = 0u; i < ${stepsLit()}; i = i + 1u) {
+    let dd = stepf(ro + rd * tt);
+    // WGSL needs a compound statement for the body of an if: "if (dd > FAR) break;" is a syntax
+    // error (naga: expected '{' for if statement), which is how round 17 shipped a 3D view that
+    // only ever worked on the CPU fallback.
+    if (dd < 0.001) { hit = true; break; }
+    if (dd > FAR) { break; }
+    tt += min(dd, FAR);
+    if (tt > t1) { break; }
+  }
+  if (!hit) { return vec4f(u.bg.rgb, 1.0); }
+  let ph = ro + rd * tt;
+  let e = max(0.0012, rad * 0.0006);
+  let n = normalize(vec3f(
+    stepf(ph + vec3f(e, 0.0, 0.0)) - stepf(ph - vec3f(e, 0.0, 0.0)),
+    stepf(ph + vec3f(0.0, e, 0.0)) - stepf(ph - vec3f(0.0, e, 0.0)),
+    stepf(ph + vec3f(0.0, 0.0, e)) - stepf(ph - vec3f(0.0, 0.0, e))));
+  let cc = colf(ph);
+  let l1 = normalize(vec3f(0.55, 0.8, 0.5));
+  let l2 = normalize(vec3f(-0.5, -0.25, -0.6));
+  let rim = pow(1.0 - clamp(dot(n, -rd), 0.0, 1.0), 3.0);
+  let lum = 0.32 + 0.75 * max(dot(n, l1), 0.0) + 0.35 * max(dot(n, l2), 0.0) + 0.3 * rim;
+  return vec4f(min(cc.rgb * lum, vec3f(1.0)), 1.0);
+}`;
+const wrapWGSL3Db = (c: Compiled) => `${PREAMBLE}
+fn stepf(q: vec3f) -> f32 {
+  let p0 = q;
+${c.code}
+  return ${c.d};
+}
+fn colf(q: vec3f) -> vec4f {
+  let p0 = q;
+${c.code}
+  return ${c.c};
+}
+@fragment fn fs(@builtin(position) fc: vec4f) -> @location(0) vec4f {
+  let tgt = u.cam3a.xyz;
+  let rad = max(u.cam3a.w, 0.001);
+  let cy = cos(u.cam3b.x); let sy = sin(u.cam3b.x);
+  let cp = cos(u.cam3b.y); let sp = sin(u.cam3b.y);
+  let ro = tgt + rad * vec3f(sy * cp, sp, cy * cp);
+  let fw = normalize(tgt - ro);
+  let rt = normalize(cross(fw, vec3f(0.0, 1.0, 0.0)));
+  let up = cross(rt, fw);
+  // normalised device coords in [-1, 1] — the CPU marcher divides by (res * 0.5); this used to
+  // multiply by 2.0 instead, which made nd ~res wide (e.g. ±800), so every ray left at a right
+  // angle to the view direction and the 3D view came out empty on the GPU while the CPU path
+  // (and therefore every headless gate) looked fine.
+  let nd = vec2f(1.0, -1.0) * (fc.xy / u.atlas.w - u.res * 0.5) / (u.res * 0.5);
+  let rd = normalize(fw + rt * (nd.x * u.cam3b.z * u.cam3b.w) + up * (nd.y * u.cam3b.z));
+  // the far plane follows the camera: a viewport-sized 2D program is ~900 units across and the
+  // auto-fit puts the eye ~1900 units out, where a fixed 400-unit far plane never reaches it
+  let FAR = max(400.0, rad * 6.0);
+${slabWGSL}  var tt = t0;
+  var hit = 0.0;    // 1 once the ray reached a surface
+  var live = select(0.0, 1.0, t0 <= t1);   // a ray that misses the scene box is retired before step 1
+  for (var i = 0u; i < ${stepsLit()}; i = i + 1u) {
+    let dd = stepf(ro + rd * tt);
+    // branchless: no break, no if.  near stops the advance, gone retires the ray (a NaN
+    // distance is a retire too: it would otherwise poison tt and the normal).  Every iteration
+    // runs; once live is 0 the updates are no-ops, so the result is the same as breaking out.
+    let near = select(0.0, 1.0, dd < 0.001);
+    let gone = select(0.0, 1.0, (dd > FAR) | (tt > t1) | !(dd == dd));
+    hit = max(hit, live * near);
+    // select, not a 0 factor: min(NaN, FAR) is NaN and 0 * NaN is still NaN
+    let adv = select(min(dd, FAR), 0.0, gone > 0.5);
+    tt = tt + live * (1.0 - near) * adv;
+    live = live * (1.0 - near) * (1.0 - gone);
+  }
+  let ph = ro + rd * tt;
+  let e = max(0.0012, rad * 0.0006);
+  // gradient length instead of normalize(): a background pixel has a zero gradient, and
+  // normalize(0) is NaN - and mix(bg, NaN, 0.0) is NaN too, because 0 * NaN is NaN.
+  let gv = vec3f(
+    stepf(ph + vec3f(e, 0.0, 0.0)) - stepf(ph - vec3f(e, 0.0, 0.0)),
+    stepf(ph + vec3f(0.0, e, 0.0)) - stepf(ph - vec3f(0.0, e, 0.0)),
+    stepf(ph + vec3f(0.0, 0.0, e)) - stepf(ph - vec3f(0.0, 0.0, e)));
+  let n = gv / max(length(gv), 1e-20);
+  let cc = colf(ph);
+  let l1 = normalize(vec3f(0.55, 0.8, 0.5));
+  let l2 = normalize(vec3f(-0.5, -0.25, -0.6));
+  let rim = pow(1.0 - clamp(dot(n, -rd), 0.0, 1.0), 3.0);
+  let lum = 0.32 + 0.75 * max(dot(n, l1), 0.0) + 0.35 * max(dot(n, l2), 0.0) + 0.3 * rim;
+  // select, not mix: the shaded colour is computed for every pixel (background included) and a
+  // mix() would drag its NaN/Inf into the result even at t = 0
+  return vec4f(select(u.bg.rgb, min(cc.rgb * lum, vec3f(1.0)), hit > 0.5), 1.0);
+}`;
+/** The full shader source the GPU actually sees, for one compiled program.  Exported so the gate can
+ *  parse exactly this text: the body alone is not enough (the wrapper is where the raymarch loop
+ *  lives, and a syntax error there fails on the GPU while the CPU path keeps working). */
+export const wrapWGSL = (c: Compiled) => (c.solid ? (solidBranchless() ? wrapWGSL3Db(c) : wrapWGSL3D(c)) : wrapWGSL2D(c));
+
 
 async function createWebGPU(canvas: HTMLCanvasElement, atlas: Atlas): Promise<Renderer | null> {
   if (!("gpu" in navigator) || !navigator.gpu) return null;
@@ -71,7 +251,7 @@ async function createWebGPU(canvas: HTMLCanvasElement, atlas: Atlas): Promise<Re
     { binding: 3, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
   ] });
   const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl] });
-  const uniform = device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const uniform = device.createBuffer({ size: 128, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   const tex = device.createTexture({ size: [ATLAS_W, ATLAS_H], format: "r8unorm", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
   device.queue.writeTexture({ texture: tex }, atlas.data, { bytesPerRow: ATLAS_W }, [ATLAS_W, ATLAS_H]);
   const sampler = device.createSampler({ magFilter: "linear", minFilter: "linear" });
@@ -94,15 +274,21 @@ async function createWebGPU(canvas: HTMLCanvasElement, atlas: Atlas): Promise<Re
 
   const cache = new Map<string, GPURenderPipeline>();
   const pending = new Map<string, Promise<GPURenderPipeline>>();
-  const stats = { compiles: 0, lastCompileMs: 0, cached: 0, gpuMs: 0, timestamps: hasTs };
+  const stats = { compiles: 0, lastCompileMs: 0, cached: 0, gpuMs: 0, timestamps: hasTs, nan: 0, steps: 0 };
   // timestamp query: begin/end of the render pass → resolve → copy to a mappable buffer (skipped while a readback is in flight)
   const qs = hasTs ? device.createQuerySet({ type: "timestamp", count: 2 }) : null;
   const qResolve = hasTs ? device.createBuffer({ size: 16, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC }) : null;
   const qRead = hasTs ? device.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }) : null;
   let qBusy = false;
+  // the same generated body compiles to different frames per view mode, so the mode is part of the cache key
+  // the wrapper is hand-written and depends on the branchless flag and (solid only) the sdf-steps
+  // count — both are baked into its text, so both are part of the key: flipping either must
+  // compile a new pipeline, never serve the stale one
+  const keyOf = (c: Compiled) => (solidBranchless() ? "b" : "") + (c.solid ? "3|s" + sdfSteps() + "|" : "2|") + c.code;
   const getPipeline = (c: Compiled): Promise<GPURenderPipeline> => {
-    const hit = cache.get(c.code); if (hit) return Promise.resolve(hit);
-    const p0 = pending.get(c.code); if (p0) return p0;
+    const k = keyOf(c);
+    const hit = cache.get(k); if (hit) return Promise.resolve(hit);
+    const p0 = pending.get(k); if (p0) return p0;
     const t0 = performance.now();
     const p = (async () => {
       const code = wrapWGSL(c);
@@ -115,14 +301,16 @@ async function createWebGPU(canvas: HTMLCanvasElement, atlas: Atlas): Promise<Re
         await device.popErrorScope().catch(() => null);
         const ci = await module.getCompilationInfo();
         const errs = ci.messages.filter((m) => m.type === "error");
-        throw new Error("shader: " + (errs.length ? errs.map((m) => `${m.message} (line ${m.lineNum - 20})`).join("; ") : (e as Error).message));
+        // the line number is a line of the *generated* shader (preamble included), not of the
+        // program: say so instead of subtracting a made-up constant that pointed at nonsense
+        throw new Error("shader: " + (errs.length ? errs.map((m) => `${m.message} (${c.solid ? "solid" : "slice"} WGSL line ${m.lineNum})`).join("; ") : (e as Error).message));
       }
       const e = await device.popErrorScope(); if (e) throw new Error("shader: " + e.message);
       if (cache.size > 24) cache.delete(cache.keys().next().value!);
-      cache.set(c.code, pipeline); stats.compiles++; stats.lastCompileMs = performance.now() - t0; stats.cached = cache.size;
+      cache.set(k, pipeline); stats.compiles++; stats.lastCompileMs = performance.now() - t0; stats.cached = cache.size;
       return pipeline;
     })();
-    pending.set(c.code, p); p.finally(() => pending.delete(c.code)); return p;
+    pending.set(k, p); p.finally(() => pending.delete(k)); return p;
   };
 
   let curScale = 1;
@@ -133,18 +321,23 @@ async function createWebGPU(canvas: HTMLCanvasElement, atlas: Atlas): Promise<Re
     if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
   };
   resize();
-  const ubuf = new Float32Array(16);
+  const ubuf = new Float32Array(32);
   let serial = 0;
   return {
     kind: "webgpu", adapterInfo: info, resize, stats,
-    async render(prog, cam, bg, time, scale = 1) {
+    async render(prog, cam, bg, time, scale = 1, cam3) {
       const my = ++serial;
       const pipeline = await getPipeline(prog);
-      if (my !== serial && cache.has(prog.code) === false) return; // superseded
+      if (my !== serial && !cache.has(keyOf(prog))) return; // superseded
       resize(scale);
       const dpr = canvas.width / Math.max(1, canvas.clientWidth);
+      const c3 = cam3 ?? { tx: 0, ty: 0, tz: 0, dist: 14, yaw: 0.65, pitch: 0.42, fov: (38 * Math.PI) / 180 };
       if (prog.params.length > paramCap) makeParams(Math.max(prog.params.length, paramCap * 2));
-      ubuf.set([canvas.clientWidth, canvas.clientHeight, time, 0, bg[0], bg[1], bg[2], 1, ATLAS_W, ATLAS_H, 8, dpr, cam.cx, cam.cy, cam.zoom, 0]);
+      // the scene box for the marcher's empty-space skip; ±1e30 = no finite box, under which the
+      // slab test degenerates to exactly the old march-from-the-eye (t0 = 0.02, t1 = FAR)
+      const bb = prog.solid ? prog.bbox3 : null;
+      ubuf.set([canvas.clientWidth, canvas.clientHeight, time, 0, bg[0], bg[1], bg[2], 1, ATLAS_W, ATLAS_H, 8, dpr, cam.cx, cam.cy, cam.zoom, 0, c3.tx, c3.ty, c3.tz, c3.dist, c3.yaw, c3.pitch, Math.tan(c3.fov / 2), canvas.clientWidth / Math.max(1, canvas.clientHeight),
+        bb ? bb[0] : -1e30, bb ? bb[1] : -1e30, bb ? bb[2] : -1e30, 0, bb ? bb[3] : 1e30, bb ? bb[4] : 1e30, bb ? bb[5] : 1e30, 0]);
       device.queue.writeBuffer(uniform, 0, ubuf);
       if (prog.params.length) device.queue.writeBuffer(paramBuf, 0, prog.params.buffer, prog.params.byteOffset, prog.params.byteLength);
       const enc = device.createCommandEncoder();
@@ -170,30 +363,183 @@ async function createWebGPU(canvas: HTMLCanvasElement, atlas: Atlas): Promise<Re
 
 type PixelFn = (P: Float32Array, R: unknown, W: number, H: number, scale: number, cam: Camera, T: number, bg: number[], px: Uint8ClampedArray) => void;
 
-function createCPU(canvas: HTMLCanvasElement, atlas: Atlas): Renderer {
+/**
+ * The source the CPU fallback compiles, as text — `wrapWGSL`'s counterpart for the code panel.
+ * `compile3` / `compile` build their functions from exactly these strings, so what the panel shows
+ * cannot drift from what runs (the WGSL wrapper learned that lesson in round 21: a wrapper nobody
+ * looked at is where the 3D view hid its broken camera for a whole round).
+ */
+const jsStepSrc = (c: Compiled) => `const p0 = q; ${c.code}; return ${c.d};`;
+const jsColSrc = (c: Compiled) => `const p0 = q; ${c.code}; return ${c.c};`;
+const jsPixelBody = (c: Compiled) => `
+      const zoom = cam.zoom;
+      for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) {
+        // 3D-native body expects a vec3 point; the 2D view is the z = 0 slice
+        const p0 = [((i + 0.5) / scale - RW * 0.5) / zoom + cam.cx, -((j + 0.5) / scale - RH * 0.5) / zoom + cam.cy, 0];
+${c.code}
+        // NaN guard: a single non-finite distance paints the pixel black and, worse, hides a
+        // real bug in the field.  Count it and treat it as "far away" (background) instead.
+        let d = ${c.d};
+        if (d !== d) { d = 1e30; NAN.nan++; }
+        const col = ${c.c};
+        const aa = Math.min(1, Math.max(0, 0.5 - d * zoom)) * col[3];
+        const q = (j * W + i) * 4;
+        px[q] = (bg[0] + (col[0] - bg[0]) * aa) * 255; px[q + 1] = (bg[1] + (col[1] - bg[1]) * aa) * 255; px[q + 2] = (bg[2] + (col[2] - bg[2]) * aa) * 255; px[q + 3] = 255;
+      }`;
+/**
+ * The CPU `dist`/`colour` functions of a compiled program — the JS twins of the WGSL `stepf`/`colf`.
+ * Exported so the gates evaluate the *same* body the renderer does (the signature lives here and
+ * nowhere else: `RAD` is the camera distance, which a flattened 2D shape needs for its thickness).
+ */
+export const jsStepFn = (c: Compiled, R: unknown) => {
+  const f = new Function("P", "R", "zoom", "T", "q", "RAD", jsStepSrc(c)) as (P: Float32Array, R: unknown, zoom: number, T: number, q: number[], rad: number) => number;
+  return (P: Float32Array, T: number, q: number[], rad: number) => f(P, R, 1, T, q, rad);
+};
+export const jsColFn = (c: Compiled, R: unknown) => {
+  const f = new Function("P", "R", "zoom", "T", "q", "RAD", jsColSrc(c)) as (P: Float32Array, R: unknown, zoom: number, T: number, q: number[], rad: number) => number[];
+  return (P: Float32Array, T: number, q: number[], rad: number) => f(P, R, 1, T, q, rad);
+};
+/** The whole JS module the CPU fallback compiles for one program (solid = the raymarcher's
+ *  step/colour + the generated marcher itself, so the panel cannot drift from what runs — the
+ *  same lesson the WGSL wrapper learned in round 21).  The marcher's loop bound is the sdf-steps
+ *  count baked in as a literal, the JS twin of the WGSL loop's comptime constant. */
+export const wrapJS = (c: Compiled) => (c.solid
+  ? `// CPU fallback · 3D solid view · the marcher is generated with the sdf-steps count baked in
+// as a loop-bound literal (the comptime twin of the WGSL wrapper's for-loop): ${sdfSteps()} steps
+// per ray, evaluated through dist() and shaded once at the hit by shade3().
+function dist(P, R, zoom, T, q, RAD) { ${jsStepSrc(c)} }
+function col(P, R, zoom, T, q, RAD) { ${jsColSrc(c)} }
+${shade3Src}
+${marcherSrc(sdfSteps(), solidBranchless())}
+`
+  : `// CPU fallback · 2D slice view · one pass over the framebuffer.
+function pixel(P, R, W, H, scale, cam, T, bg, px, RW, RH, NAN) {${jsPixelBody(c)}
+}
+`);
+
+
+const HOME3: Camera3 = { tx: 0, ty: 0, tz: 0, dist: 14, yaw: 0.65, pitch: 0.42, fov: (38 * Math.PI) / 180 };
+
+/** Shading for a ray that reached a surface at `tt` (shared by both marchers).  Kept as source
+ *  text and compiled together with the marcher, so `wrapJS` shows exactly the code that runs;
+ *  the light vectors and their lengths are hoisted to constants (same values, same rounding —
+ *  `Math.hypot(0.55, 0.8, 0.5)` is what the per-call version computed anyway). */
+const shade3Src = `
+const L1 = [0.55, 0.8, 0.5], L2 = [-0.5, -0.25, -0.6];
+const N1 = Math.hypot(0.55, 0.8, 0.5), N2 = Math.hypot(-0.5, -0.25, -0.6);
+function shade3(step, col, ro, rd, tt, e) {
+  const ph = [ro[0] + rd[0] * tt, ro[1] + rd[1] * tt, ro[2] + rd[2] * tt];
+  const qq = [0, 0, 0];
+  qq[0] = ph[0] + e; qq[1] = ph[1]; qq[2] = ph[2]; const na = step(qq);
+  qq[0] = ph[0] - e; const nb = step(qq); const nx = na - nb;
+  qq[0] = ph[0]; qq[1] = ph[1] + e; const nc = step(qq);
+  qq[1] = ph[1] - e; const nd = step(qq); const ny = nc - nd;
+  qq[1] = ph[1]; qq[2] = ph[2] + e; const ne = step(qq);
+  qq[2] = ph[2] - e; const nf = step(qq); const nz = ne - nf;
+  const nl = Math.hypot(nx, ny, nz) || 1;
+  const n = [nx / nl, ny / nl, nz / nl];
+  const cc = col(ph);
+  const rim = Math.pow(1 - Math.max(0, Math.min(1, n[0] * -rd[0] + n[1] * -rd[1] + n[2] * -rd[2])), 3);
+  const lum = 0.32 + 0.75 * Math.max(0, (n[0] * L1[0] + n[1] * L1[1] + n[2] * L1[2]) / N1) + 0.35 * Math.max(0, (n[0] * L2[0] + n[1] * L2[1] + n[2] * L2[2]) / N2) + 0.3 * rim;
+  return [Math.min(1, cc[0] * lum) * 255, Math.min(1, cc[1] * lum) * 255, Math.min(1, cc[2] * lum) * 255];
+}`;
+
+/**
+ * The 3D raymarchers as source text, the step count baked in as a literal (`SHADER_FLAGS.sdfSteps`
+ * — the comptime treatment the WGSL wrapper gets; the compiled function is cached per (steps,
+ * branchless) so a flip recompiles instead of reading a bound parameter every iteration).
+ *
+ * Both twins mirror their WGSL counterparts formula for formula — the slab test against the padded
+ * scene box (skip empty space; a miss returns background without one field evaluation), the same
+ * retire conditions, the same `live`-factor branchless lowering — so branched and branchless
+ * produce identical pixels (flagcheck) and the JS stays the WGSL's shadow.
+ *
+ * `CT` is the caller's counter object: `CT.s` counts field evaluations of the ray loop (renderer
+ * stats.steps, read by scripts/marchbench.ts), `CT.nan` the non-finite ones.  The point `q` is a
+ * hoisted scratch array: the generated body only ever reads `p0` (it is `const`-aliased at the
+ * top and never written through), so reusing one array per ray removes ~steps allocations.
+ */
+const marcherSrc = (steps: number, branchless: boolean) => `
+function march(step, col, ro, rd, e, bg, far, bb, pad, CT) {
+  const FAR = Math.max(400, far);   // mirrors the WGSL wrapper: a viewport-sized program sits ~1900 units out
+  let t0 = 0.02, t1 = FAR;
+  if (bb) {
+    // ray ∩ padded scene box — the slabWGSL twin (same formulas, same order)
+    const ix = 1 / rd[0], iy = 1 / rd[1], iz = 1 / rd[2];
+    const ax = (bb[0] - pad - ro[0]) * ix, bx = (bb[3] + pad - ro[0]) * ix;
+    const ay = (bb[1] - pad - ro[1]) * iy, by = (bb[4] + pad - ro[1]) * iy;
+    const az = (bb[2] - pad - ro[2]) * iz, bz = (bb[5] + pad - ro[2]) * iz;
+    t0 = Math.max(t0, Math.min(ax, bx), Math.min(ay, by), Math.min(az, bz));
+    t1 = Math.min(t1, Math.max(ax, bx), Math.max(ay, by), Math.max(az, bz));
+  }${branchless ? `
+  let tt = t0, hit = 0, live = t0 <= t1 ? 1 : 0;   // a ray that misses the scene box never starts
+  const q = [0, 0, 0];
+  for (let i = 0; i < ${steps}; i++) {
+    q[0] = ro[0] + rd[0] * tt; q[1] = ro[1] + rd[1] * tt; q[2] = ro[2] + rd[2] * tt;
+    const dd = step(q); CT.s++;
+    const bad = dd !== dd ? 1 : 0;                              // non-finite distance: retire
+    const near = dd < 0.001 ? 1 : 0;
+    const gone = dd > FAR || tt > t1 || bad ? 1 : 0;
+    CT.nan += bad * live;
+    hit = hit + live * near;                                    // at most one: live drops to 0
+    const adv = gone ? 0 : Math.min(dd, FAR);                   // select, not a 0 factor (0 * NaN)
+    tt = tt + live * (1 - near) * adv;
+    live = live * (1 - near) * (1 - gone);
+  }
+  const rgb = shade3(step, col, ro, rd, tt, e);
+  return [hit ? rgb[0] : bg[0], hit ? rgb[1] : bg[1], hit ? rgb[2] : bg[2]];` : `
+  if (t0 > t1) return bg;   // the ray misses the scene's (padded) bounding box: no surface possible
+  let tt = t0, hit = false;
+  const q = [0, 0, 0];
+  for (let i = 0; i < ${steps}; i++) {
+    q[0] = ro[0] + rd[0] * tt; q[1] = ro[1] + rd[1] * tt; q[2] = ro[2] + rd[2] * tt;
+    const dd = step(q); CT.s++;
+    if (dd !== dd) { CT.nan++; break; }   // non-finite distance: stop marching, paint background
+    if (dd < 0.001) { hit = true; break; }
+    if (dd > FAR) break;
+    tt += Math.min(dd, FAR);
+    if (tt > t1) break;   // left the scene box (t1 ≤ FAR always: the slab clamps it)
+  }
+  if (!hit) return bg;
+  return shade3(step, col, ro, rd, tt, e);`}
+}`;
+type Marcher = (step: (q: number[]) => number, col: (q: number[]) => number[], ro: number[], rd: number[], e: number, bg: number[], far: number, bb: BBox3 | null, pad: number, CT: { s: number; nan: number }) => number[];
+const marcherCache = new Map<string, Marcher>();
+/** The compiled marcher for (steps, branchless), cached: the loop bound is a literal inside it. */
+const getMarcher = (steps: number, branchless: boolean): Marcher => {
+  const k = steps + "|" + (branchless ? 1 : 0);
+  let m = marcherCache.get(k);
+  if (!m) { m = (new Function(`${shade3Src}\nreturn (${marcherSrc(steps, branchless).trim()});`)() as Marcher); marcherCache.set(k, m); }
+  return m;
+};
+
+function createCPU(canvas: HTMLCanvasElement, atlas: Atlas, fixedScale?: number): Renderer {
   const ctx2d = canvas.getContext("2d")!;
   const R = makeJSRuntime((u, v) => {
     const x = Math.min(ATLAS_W - 1, Math.max(0, Math.round(u * ATLAS_W - 0.5))), y = Math.min(ATLAS_H - 1, Math.max(0, Math.round(v * ATLAS_H - 0.5)));
     return atlas.data[y * ATLAS_W + x] / 255;
   });
   const cache = new Map<string, PixelFn>();
-  const stats = { compiles: 0, lastCompileMs: 0, cached: 0, gpuMs: 0, timestamps: false };
+  const cache3 = new Map<string, { step: (P: Float32Array, T: number, q: number[], rad: number) => number; col: (P: Float32Array, T: number, q: number[], rad: number) => number[] }>();
+  const stats = { compiles: 0, lastCompileMs: 0, cached: 0, gpuMs: 0, timestamps: false, nan: 0, steps: 0 };
+  const CT = { s: 0, nan: 0 };   // per-frame marcher counters, drained into stats after the loop
+  const compile3 = (c: Compiled) => {
+    let f = cache3.get(c.code); if (f) return f;
+    const t0 = performance.now();
+    // the body may reference the frame's `zoom`/`T` free variables (child contexts inherit them);
+    // in the solid view zoom is 1 (it only scales 2D AA/culling terms)
+    f = { step: jsStepFn(c, R), col: jsColFn(c, R) };
+    if (cache3.size > 24) cache3.delete(cache3.keys().next().value!);
+    cache3.set(c.code, f); stats.compiles++; stats.lastCompileMs = performance.now() - t0;
+    return f;
+  };
   const compile = (c: Compiled): PixelFn => {
     let f = cache.get(c.code); if (f) return f;
     const t0 = performance.now();
-    const body = `
-      const zoom = cam.zoom;
-      for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) {
-        const p0 = [((i + 0.5) / scale - RW * 0.5) / zoom + cam.cx, -((j + 0.5) / scale - RH * 0.5) / zoom + cam.cy];
-${c.code}
-        const d = ${c.d}, col = ${c.c};
-        const aa = Math.min(1, Math.max(0, 0.5 - d * zoom)) * col[3];
-        const q = (j * W + i) * 4;
-        px[q] = (bg[0] + (col[0] - bg[0]) * aa) * 255; px[q + 1] = (bg[1] + (col[1] - bg[1]) * aa) * 255; px[q + 2] = (bg[2] + (col[2] - bg[2]) * aa) * 255; px[q + 3] = 255;
-      }`;
-    f = new Function("P", "R", "W", "H", "scale", "cam", "T", "bg", "px", "RW", "RH", body) as unknown as PixelFn;
+    const body = jsPixelBody(c);
+    f = new Function("P", "R", "W", "H", "scale", "cam", "T", "bg", "px", "RW", "RH", "NAN", body) as unknown as PixelFn;
     const raw = f;
-    f = (P, R2, W, H, scale, cam, T, bg, px) => (raw as unknown as (...a: unknown[]) => void)(P, R2, W, H, scale, cam, T, bg, px, W / scale, H / scale);
+    f = (P, R2, W, H, scale, cam, T, bg, px) => (raw as unknown as (...a: unknown[]) => void)(P, R2, W, H, scale, cam, T, bg, px, W / scale, H / scale, stats);
     if (cache.size > 24) cache.delete(cache.keys().next().value!);
     cache.set(c.code, f); stats.compiles++; stats.lastCompileMs = performance.now() - t0; stats.cached = cache.size;
     return f;
@@ -203,20 +549,67 @@ ${c.code}
     if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
   };
   resize();
-  let scale = 0.5;
+  let scale = fixedScale ?? 0.5;   // 2D slice view
+  let scale3 = fixedScale ?? 0.35; // 3D raymarch (much heavier: starts coarser)
   return {
     kind: "cpu", resize, stats,
-    async render(prog, cam, bg, time) {
+    async render(prog, cam, bg, time, _scale, cam3) {
       resize();
       const W = canvas.width, H = canvas.height;
-      const w = Math.max(1, Math.floor(W * scale)), h = Math.max(1, Math.floor(H * scale));
+      const s = prog.solid ? scale3 : scale;
+      const w = Math.max(1, Math.floor(W * s)), h = Math.max(1, Math.floor(H * s));
       const img = ctx2d.createImageData(w, h);
-      const f = compile(prog);
       const t0 = performance.now();
-      f(prog.params, R, w, h, scale, cam, time, bg, img.data);
+      if (prog.solid) {
+        const c3 = cam3 ?? HOME3;
+        const { step, col } = compile3(prog);
+        const P = prog.params;
+        const cy = Math.cos(c3.yaw), sy = Math.sin(c3.yaw), cp = Math.cos(c3.pitch), sp = Math.sin(c3.pitch);
+        const ro = [c3.tx + c3.dist * sy * cp, c3.ty + c3.dist * sp, c3.tz + c3.dist * cy * cp];
+        let fw = [c3.tx - ro[0], c3.ty - ro[1], c3.tz - ro[2]];
+        const fl = Math.hypot(fw[0], fw[1], fw[2]) || 1; fw = [fw[0] / fl, fw[1] / fl, fw[2] / fl];
+        const cross = (a: number[], b: number[]) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+        let r0 = cross(fw, [0, 1, 0]); const rl = Math.hypot(r0[0], r0[1], r0[2]) || 1; r0 = [r0[0] / rl, r0[1] / rl, r0[2] / rl];
+        const upv = cross(r0, fw);
+        const fovy = Math.tan(c3.fov / 2), asp = w / Math.max(1, h);
+        const e = Math.max(0.0012, c3.dist * 0.0006);
+        const bgpx = [bg[0] * 255, bg[1] * 255, bg[2] * 255];
+        // everything per-ray that does not depend on the pixel: the marcher (with its baked step
+        // count), the step/colour closures over this frame's parameters, and the scene box + pad
+        // of the empty-space skip.  These used to be re-selected (and re-allocated) per pixel.
+        const march = getMarcher(sdfSteps(), solidBranchless());
+        const stepP = (q: number[]) => step(P, time, q, c3.dist);
+        const colP = (q: number[]) => col(P, time, q, c3.dist);
+        const bb = prog.bbox3 ?? null;
+        const pad = Math.max(0.01, BB_PAD_K * c3.dist);
+        const rd = [0, 0, 0];   // reused per pixel (normalised in place: same values, no second array)
+        for (let j = 0; j < h; j++) {
+          const ndy = -(((j + 0.5) - h * 0.5) / (h * 0.5));
+          for (let i = 0; i < w; i++) {
+            const ndx = ((i + 0.5) - w * 0.5) / (w * 0.5);
+            rd[0] = fw[0] + r0[0] * ndx * fovy * asp + upv[0] * ndy * fovy;
+            rd[1] = fw[1] + r0[1] * ndx * fovy * asp + upv[1] * ndy * fovy;
+            rd[2] = fw[2] + r0[2] * ndx * fovy * asp + upv[2] * ndy * fovy;
+            const rl2 = Math.hypot(rd[0], rd[1], rd[2]) || 1;
+            rd[0] = rd[0] / rl2; rd[1] = rd[1] / rl2; rd[2] = rd[2] / rl2;
+            const rgb = march(stepP, colP, ro, rd, e, bgpx, c3.dist * 6, bb, pad, CT);
+            const q = (j * w + i) * 4;
+            img.data[q] = rgb[0]; img.data[q + 1] = rgb[1]; img.data[q + 2] = rgb[2]; img.data[q + 3] = 255;
+          }
+        }
+        stats.steps += CT.s; CT.s = 0;
+        if (CT.nan) { stats.nan += CT.nan; CT.nan = 0; }
+      } else {
+        const f = compile(prog);
+        f(prog.params, R, w, h, s, cam, time, bg, img.data);
+      }
       const ms = performance.now() - t0;
-      // adapt resolution to keep the CPU path interactive
-      if (ms > 120 && scale > 0.2) scale = Math.max(0.2, scale * 0.7); else if (ms < 30 && scale < 1) scale = Math.min(1, scale * 1.25);
+      // adapt resolution to keep the CPU path interactive (pinned when the caller fixed the scale)
+      if (fixedScale === undefined) {
+        const cur = prog.solid ? scale3 : scale;
+        const next = ms > 120 && cur > 0.2 ? Math.max(0.2, cur * 0.7) : ms < 30 && cur < 1 ? Math.min(1, cur * 1.25) : cur;
+        if (prog.solid) scale3 = next; else scale = next;
+      }
       const off = document.createElement("canvas"); off.width = w; off.height = h; off.getContext("2d")!.putImageData(img, 0, 0);
       ctx2d.imageSmoothingEnabled = true; ctx2d.drawImage(off, 0, 0, W, H);
     },

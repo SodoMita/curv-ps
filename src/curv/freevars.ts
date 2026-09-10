@@ -110,6 +110,15 @@ export function freeVarsOfBlock(stmts: Stmt[]): FreeInfo {
   return r;
 }
 
+const exprMemo = new WeakMap<Expr, FreeInfo>();
+/** Free variables of an arbitrary expression in an empty scope (round 16: the expression-level memo
+ *  keys on these; same analysis, same never-under-approximate guarantee). */
+export function freeVarsOfExpr(e: Expr): FreeInfo {
+  let r = exprMemo.get(e);
+  if (!r) { const fv = new FV(); fv.expr(e, new Set()); r = { free: [...fv.free], pure: fv.pure, why: fv.why }; exprMemo.set(e, r); }
+  return r;
+}
+
 const fnMemo = new WeakMap<Expr, Map<number, FreeInfo>>();
 /** Free variables of a closure body given the parameters that are still unapplied (`params.slice(i)`). */
 export function freeVarsOfFn(params: Pat[], body: Expr): FreeInfo {

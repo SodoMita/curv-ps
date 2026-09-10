@@ -2,7 +2,7 @@
 // its (possibly indirect) inputs change, and identical values + a block cache hit when they do not.
 import { createCanvas } from "@napi-rs/canvas";
 import { loadPsolve } from "../src/psolve/psolve";
-import { Interp, resetSolveCache, Rec } from "../src/curv/interp";
+import { Interp, resetSolveCache, Rec, callMemoTable } from "../src/curv/interp";
 import { buildAtlas } from "../src/gpu/atlas";
 (globalThis as any).document = { createElement: () => createCanvas(1, 1) as any };
 await loadPsolve();
@@ -69,6 +69,13 @@ const ccases: [string, string, boolean, boolean][] = [ // [name, src, expectHits
   ["recursive", `let f n = if (n <= 1) n + ${W} else f (n - 1) + f (n - 2); in f 8 + time`, true, true],
   ["returns shape accessor", `let f x = let dd = ${W} in (circle 1).dist in [(f 5) [2, 0], (f 5) [0.4, 0]]`, true, false],
   ["returns shape bbox", `let f b = let dd = ${W} in (circle b).bbox in (f 2).[1].[X] + (f 2).[1].[Y]`, true, false],
+  // round 16: expression-level memo (list literals / comprehensions as first-class memo sites)
+  ["exprmemo list literal", `let f x = x * 2 + ${W}; in [f 1, f 2, f 3]`, true, false],
+  ["exprmemo comprehension", `let n = 1 + floor time; in [for (i in 1..n) i + ${W}]`, true, true],
+  ["exprmemo via viewport", `let w = viewport.w + time; in [w + ${W}, w * 2]`, true, true],
+  ["exprmemo impure print fn", `let f x = do print x; in x + ${W}; in [for (i in 0..2) f i]`, false, false],
+  ["exprmemo impure write fn", `do local s = 0; local f x = do s := s + x + ${W}; in s; in [for (i in 0..2) f 1]`, false, false],
+  ["exprmemo impure parametric", `let f x = parametric k :: slider[0,1] = 0.5; in x + k + ${W}; in [f 1, f 2]`, false, false],
 ];
 for (const [name, src, expectHits, expectTimeDep] of ccases) {
   resetSolveCache();
@@ -80,11 +87,18 @@ for (const [name, src, expectHits, expectTimeDep] of ccases) {
     const other = run(2), other2 = run(2);
     const same = show(cold.value) === show(warm.value) && show(other.value) === show(other2.value);
     const dep = show(cold.value) !== show(other.value);
-    const hits = warm.callMemo.hits > 0;
+    // expectHits=false means "the impure site never gets memoised" — asserted PER SITE since round 16:
+    // an unrelated pure lambda in the same frame may legitimately be elected (timing-dependent),
+    // so the old "no hits anywhere" proxy would flake.  The invariant itself is per-site:
+    // no MEMO row may belong to an impure function or to a list site containing it (the three
+    // negative cases below all name their impure function `f`).
+    const table = callMemoTable();
+    const badSite = table.some((r) => r.mode === "memo" && (r.name.startsWith("«") || r.name === "f"));
+    const hits = expectHits ? warm.callMemo.hits > 0 : !badSite;
     const traces = cold.traces.length === warm.traces.length && warm.traces.every((t) => t.cached);
     const ok = same && dep === expectTimeDep && hits === expectHits && traces;
     if (!ok) fails++;
-    console.log(`${ok ? "OK " : "ERR"} ${name.padEnd(30)} hits=${warm.callMemo.hits}/${warm.callMemo.misses + warm.callMemo.hits}${hits !== expectHits ? ` (expected ${expectHits ? "hits" : "no hits"})` : ""}${same ? "" : " VALUES DIFFER FOR SAME INPUTS"}${dep === expectTimeDep ? "" : " time-dependence wrong"}${traces ? "" : " TRACES DIFFER"}  ${show(warm.value).slice(0, 40)}`);
+    console.log(`${ok ? "OK " : "ERR"} ${name.padEnd(30)} hits=${warm.callMemo.hits}/${warm.callMemo.misses + warm.callMemo.hits}${hits !== expectHits ? ` (expected ${expectHits ? "hits" : "no memo at an impure site"})` : ""}${same ? "" : " VALUES DIFFER FOR SAME INPUTS"}${dep === expectTimeDep ? "" : " time-dependence wrong"}${traces ? "" : " TRACES DIFFER"}  ${show(warm.value).slice(0, 40)}`);
   } catch (e: any) { fails++; console.log(`ERR ${name}: ${e.message}`); }
 }
 // node identity: a memoised shape-valued call returns the very same tree across frames (bbox / key memos hit)
@@ -97,6 +111,17 @@ for (const [name, src, expectHits, expectTimeDep] of ccases) {
   const ok = a.shape === b.shape && a.shape !== null;
   if (!ok) fails++;
   console.log(`${ok ? "OK " : "ERR"} ${"node identity across frames".padEnd(30)} same=${a.shape === b.shape}`);
+}
+// list identity: an expression-memoised list literal returns the very same array across frames
+{
+  resetSolveCache();
+  const src = `let f x = x * 2; in [f 1, f 2, [f 3, f 4], f 5]`;
+  const run = () => new Interp(atlas, { viewport: { x: 0, y: 0, w: 1, h: 1 }, time: 0, mouse: { x: 0, y: 0, down: false } }).run(src);
+  let a = run(); for (let i = 0; i < 6; i++) a = run();
+  const b = run();
+  const ok = a.value === b.value;
+  if (!ok) fails++;
+  console.log(`${ok ? "OK " : "ERR"} ${"list identity across frames".padEnd(30)} same=${a.value === b.value}`);
 }
 
 // ---- shared prelude: the prelude env is evaluated once per process and its vars map is shared read-only;

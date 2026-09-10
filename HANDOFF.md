@@ -1,4 +1,4 @@
-# Curv+solve — handoff (dev round 14)
+# Curv+solve — handoff (dev round 23)
 
 Browser playground for **Curv** (2D F-Rep, compiled to WGSL / JS) extended with
 `solve { }` constraint blocks solved by **psolve** (LP + convex QP, WebAssembly).
@@ -11,13 +11,486 @@ Headless checks (all use the JS backend, no browser needed):
 | `npx tsx scripts/selftest.ts [id \| file.curv …]` | evaluates every example, compiles both backends (`anim`/`anim(shader)` flags when the program reads time in the evaluator / only inside compiled shader code), renders `/tmp/t/<id>.png` |
 | `npx tsx scripts/paramcheck.ts` | **fast-path oracle**: `walkParams` buffer == ParamsOnly buffer == full codegen's; key stable and shader text identical across time/viewport; **memo replays are bitwise-identical and memo-vs-cold buffers agree within `warmΔ ≤ 1e-6`** (`memo=` column; the Δ is solve-path rounding from accepted warm starts, replay itself stays bitwise); **`skip=safe`** when a program reads no time/mouse/viewport and its key *and* parameter buffer are identical for every input |
 | `npx tsx scripts/memotest.ts` | solve-block **and call-memo** dependency tests (time/mouse/viewport through closures, shadowing, mutations, impure bodies, `print`/`parametric`, node identity …) |
+| `npx tsx scripts/threedcheck.ts` | **round-17 3D gate**: every example evaluates; the 3D group compiles in solid mode on both backends; `bbox3` sanity; `is_2d`/`is_3d` + dimensional `bbox` of the shape record; the CPU raymarcher really draws (centre lit / background outside / slice parity / animation divergence) |
+| `npx tsx scripts/stdcheck.ts` | **C++ `std.curv` parity**: prelude values (`transpose`, `sort`, `contains`, colours …), 2D/3D boxes against the C++ formulas, and — the load-bearing part — the *generated* field sampled on a grid: no non-finite distance anywhere, and no point inside the shape outside its own `bbox3` |
+| `npx tsx scripts/branchbench.ts [id …]` | **round-19 branch-vs-branchless benchmark**: times five builds (`branching`, `noShortCircuit`, `+cullSelect`, `branchless` bodies, `branchless` raymarch) on the CPU fallback at a pinned resolution, interleaved, and counts the `if`/`break`/`&&` that remain in the WGSL |
+| `npx tsx scripts/wgslcheck.ts` | **round-18 WGSL gate**: parses the **whole** shader the GPU sees (`wrapWGSL`, wrapper included) for every example *and* a list of codegen corner cases, in **both** view modes (50 shaders).  Needed because the JS/CPU target accepts things WGSL does not: `if (dd > FAR) break;` in the 3D raymarch loop shipped green through every gate and failed only in the browser |
+| `npx tsx scripts/pdiff.ts [--update] [id …]` | **golden pixel gate**: renders every example headlessly (slice mode at 240×160 + solid mode at 96×64 for the 3D group), hashes the framebuffer and compares with `scripts/golden/pdiff.json`; counts non-finite distances per frame. `--update` (re)writes the goldens after an intended change |
+| `npx tsx scripts/flagcheck.ts [id …]` | **round-21 invariance gate for the shader-generation options**: every example × every flag setting the menu can produce — pixels and parameter buffer identical to the shipped default in **both** view modes, the walked buffer equal to the codegen buffer, each setting's code independent of which setting was compiled before it, and the two view modes never sharing a compiled program.  The **round-23 sdf-steps section** checks the one option that is allowed to change pixels: 2D untouched, params/body fixed, lit pixels monotone in the count |
+| `npx tsx scripts/marchbench.ts [example …]` | **round-23 marcher benchmark**: ms/frame and SDF evaluations per frame (the renderer's `stats.steps` counter) for the 3D raymarcher on the CPU fallback — the bbox empty-space skip on/off (a program with its box vs the same program with the box stripped, in-process A/B), the `sdfSteps` sweep 32/64/128/256, and the branchless raymarch — interleaved best-of-N, and the WGSL loop line printed per step count to show the comptime literal |
 | `npx tsx scripts/warmcheck.ts` | **round-14 bridge oracle**: warm→cold drag equivalence (plan P0.2 acceptance: pixel-identity), failure degradation/recovery with **no memo pollution**, first-frame certified-infeasible error message, wall-clock **budget → STOPPED + approximate incumbent (never garbage)**, budget ladder certifies |
 | `npx tsx scripts/warmbench.ts [example …]` | cold-vs-chained solve timing, interleaved best-of-4 per width (round-12 noise lesson), warm-accept / cold-retry counters |
-| `npx tsx scripts/prof.ts [-v]` | warm eval / codegen / params-only timings, per-`solve` cache kind, call-memo hit/miss counters; `-v` prints the per-function memo decisions |
+| `npx tsx scripts/internbench.ts [example …]` | round-15 hash-consing A/B (inode ON/OFF, alternated in-process, best-of-6): full-eval cost vs fresh-tree key+param-walk cost, hit counters |
+| `npx tsx scripts/exprbench.ts [example …]` | round-16 expression-memo A/B (alternated in-process, best-of-6): full-eval cost with the list-site memo ON vs OFF |
+| `npx tsx scripts/prof.ts [-v]` | warm eval / codegen / params-only timings, per-`solve` cache kind, call-memo hit/miss counters; `-v` prints the per-site memo decisions (function bodies and «list» expression sites) |
 
-All five checks were green at the end of this round (`paramcheck` / `memotest` / `warmcheck` exit 1 on any failure — check the exit code).
+All thirteen check scripts were green at the end of this round (`paramcheck` / `memotest` / `warmcheck` / `threedcheck` / `wgslcheck` / `stdcheck` / `pdiff` exit 1 on any failure — check the exit code).  `pdiff` and `stdcheck` run with `setSolveBudget(0)`: the UI's 16 ms per-solve budget can hand back an incumbent that depends on machine load, which would make a golden frame flaky.
 
-## What changed in this round — psolve sync + the bridge upgrade (upstream `docs/CURV_PS_PLAN.md` P0, and §6 "what curv-ps should change")
+## What changed in this round (21) — two cache keys that forgot an input of codegen
+
+Round 20 put every `SHADER_FLAGS` option behind a menu, which makes one question load-bearing for
+every cache that is keyed on the shape tree: *is this entry valid under the flags and the view mode
+of the request?*  `scripts/flagcheck.ts` asks it for all 27 examples × 7 settings.  Two answers were
+no:
+
+* **`structKey` was mode-blind.**  It mixes `cullable()`'s answer per child — and `cullable` is false
+  for every child when `cull` is false, so any tree *without* a cullable child hashed identically in
+  the two view modes.  Slice unions blend with coverage AA and carry cull brackets; solid unions take
+  the exact min and the raymarcher owns early-out, so the two are not the same shader — yet the code
+  LRU (and the `prev` fast path in `compileTree`) served the 2D one to the 3D view, and the other way
+  round.  Every 3D example was exposed: once a program had been compiled in 2D, its 3D view ran the
+  2D shader — 12.9% of the pixels differ on `rings3d`, 3.9% on `loft3d`.  The key now carries the
+  mode (`|1|` / `|0|`).
+* **`walkParams`' memo was flag-blind.**  Its slots were keyed on `cull` alone, but `cullable()` reads
+  `SHADER_FLAGS.cullWeight`, and a cull bracket pushes its bbox as four parameters.  After moving the
+  cull-weight slider the tree walk kept handing out the buffer built under the old threshold — 615
+  numbers to a shader compiled for 635 — and the walk is exactly what feeds the GPU every frame.
+  Slots are now keyed on `flagsKey()`, like the struct-key slots already were.
+
+Both are the same class: a cache keyed on "the shape" that forgot one input of codegen.  The gate
+compiles each setting twice in two different orders (a setting's text must not depend on which
+setting ran before it), compares every setting's pixels and parameter buffer against the shipped
+default in both view modes, checks the walked buffer against the codegen buffer, and asserts the two
+view modes never share a compiled program.
+
+### Reported from the browser: the 3D view was empty, and the tooltip lost its camera
+
+Three defects the headless gates could not see — all three are things the browser does that the
+gates do not (run the WGSL, fit a camera, wait for a pointer):
+
+* **The 3D view rendered nothing on the GPU.**  The hand-written WGSL wrapper built its ray
+  direction from `(pixel - res * 0.5) * 2.0`, where the CPU marcher has
+  `((i + 0.5) - w * 0.5) / (w * 0.5)`.  So `nd` came out ~res wide instead of ±1 and every ray left
+  the eye at a right angle to the view axis — measured 89.9° at the frame corner against the CPU's
+  31.3° — with a 38° fov, nothing was ever inside the frustum.  Both backends share the generated
+  body but each has its own camera code, so the CPU fallback (and therefore all 35 golden frames)
+  looked perfect.  `scripts/wgslcheck.ts` now compares the two formulas' shape: parsing cannot catch
+  this, and it is the second WGSL-only defect to reach `main` (round 18 was the brace-less `if`).
+* **The far plane was 400 units, absolute.**  A viewport-sized program is ~900 units across, so the
+  3D auto-fit puts the eye ~1900 units out and every ray stopped before it reached the shape:
+  `split`, `dashboard`, `stacks`, `buttons`, `toolbar`, `wrapfit`, `chart` were a transparent screen
+  (0.0% of pixels lit).  `FAR` now follows the camera — `max(400, dist * 6)` — in both backends, and
+  those examples went from 0% to 44–55% lit.
+* **The mouse sentinel broke the one-shot camera fit.**  With no pointer over the canvas the app
+  reported the mouse at (-1e6, -1e6); the constrained tooltip places its solved box at the mouse, so
+  its bbox reached -1e6 and the fit zoomed out six orders of magnitude — the 54-unit tooltip came
+  out 0.03 px tall, a speck, until the pointer moved.  A never-seen pointer now reports the middle
+  of the view; the same example fits at 45.8 px.
+
+**The code panel was showing a fifth of the file.**  The `WGSL` / `JS` overlay only ever showed the
+generated body — for `rings3d` in the 3D view that is 21 of the 109 lines the GPU compiles, 1.3 kB of
+5.7 kB; the uniform struct, the vertex and fragment entry points and the raymarch loop were
+invisible, which is exactly where the round-21 camera bug lived.  It now opens on `whole` (with
+`body` one click away), and the CPU fallback grew the counterpart to `wrapWGSL`: `wrapJS`, whose
+strings are the ones `compile` / `compile3` hand to `new Function`, so the panel cannot drift from
+what runs.  The two are cached separately in the app — a shape like `circle 3` compiles to the *same*
+body in both view modes and to two very different wrappers (1.1 kB vs 3.2 kB), so the wrapper is
+keyed on mode + body while the branch census stays on the body alone.
+
+The pink boxes are the `solve` debug overlay (the `boxes` checkbox, off by default).  It reads like a
+performance option and is not one — it *draws* the boxes the solver computed — so the label now says
+what it is and turns pink while it is on.
+
+Two golden frames changed (`rings3d@solid`, `loft3d@solid`): the 3D goldens had been recorded with
+the 2D shader.  `scripts/pdiff.ts --update` also no longer drops the goldens it did not re-render
+when it is given a list of example ids — it did, once, in this round.
+
+## What changed in round 22 — a 2D shape in the 3D view is a plate, not an infinite prism
+
+**Reported from the browser:** *"in 3d text look like infinitely deep instead of flat"*.
+
+A 2D shape's distance field ignores z — the whole 2D vocabulary (`circle`, `rect`, `text`, …), and
+every Curv program that returns a 2D shape, is a field of x and y only.  Hand that to a raymarcher
+and it is an **infinite prism**: each glyph and each panel became a slab receding for ever along z,
+and a layout like `dashboard` filled the frame with extruded walls.
+
+**The fix** (`src/curv/shapes.ts`): in the solid view, every *maximal* 2D subtree — Curv's own
+`is_2d && !is_3d` — is intersected with a thin slab on its own z = 0 plane:
+
+    d = max(d2(x, y), abs(z) - h)      h = FLAT_K * (camera distance),  FLAT_K = 0.001
+
+`h` is about one pixel on screen at any zoom level — the camera distance is the only scale a 2D
+shape has (`u.cam3a.w` in WGSL, `RAD` in the CPU body, the same number the marcher's `FAR` and
+normal epsilon already use) — and in practice it never falls below the marcher's 0.001 hit epsilon,
+so the plate is a real surface rather than a grazing-ray dropout.  Only the outermost node of a 2D
+subtree is wrapped, so a 2D program is *one* plate and not a stack of them, and a 2D shape under a
+3D transform keeps its own plane (the wrap happens in the child's space, before the transform).
+
+Three details that carry weight:
+
+* **Nodes that slice their child at z = 0 — `extrude`, `loft`, `perimeter_extrude`, `slice2` — pass
+  `in3d: false`.**  That child has no z of its own to be flat in, and intersecting it with a slab
+  first would cap the extrusion at the plate: `extrude 2 (circle 1)` would come out 0.002 tall
+  instead of 2.  `threedcheck` asserts the height survives.
+* **The slice (2D) view is untouched** — the wrap is emitted in solid mode only.  `wgslcheck`
+  asserts the slab is absent from the slice shader, and all 35 golden frames are byte-identical,
+  which covers every 3D example and every 2D slice.
+* **No new parameter.**  The camera distance is read inside the shader, not baked into the parameter
+  buffer, so `walkParams` — the tree walk that refills that buffer every frame — needed no change
+  and cannot drift from codegen.  (It would have been the round-21 bug class again.)
+
+Measured on the CPU fallback, solid view, camera at the auto-fit distance:
+
+| example | before (infinite prisms) | after (flat plate) |
+|---|---|---|
+| buttons | 82.9 % of pixels lit | 12.6 % |
+| dashboard | 99.8 % | 72.0 % |
+| tooltip | 99.9 % | 75.0 % |
+
+**Gates.** `threedcheck` gained an oracle that does not depend on pixels: for a point inside the
+shape at z = 0 the field must be well *outside* it a little way up (`circle 2`: d(0,0,10) = 9.99,
+d(0,0,0.05) > 0 — solid in its plane, and thin), a 3D shape must keep its depth (`sphere 2`:
+d(0,0,0.9) < 0), `extrude` must keep its height, and every 2D example is checked the same way.
+`wgslcheck` checks the WGSL text on both sides of the mode switch.  `stdcheck`'s bbox-coverage
+sampling now samples a flat-bbox3 shape on the z = 0 slice: a plate has no deep interior along z, so
+the old grid found none and reported a failure that was really about the new (correct) geometry.
+
+**Not claimed:** C++ Curv parity.  How a 2D shape is drawn in a 3D view is a viewer decision, not
+something `std.curv` defines, and `stdcheck` does not exercise Curv's viewer.  What is checked is the
+behaviour above; a 2D shape that wants depth has `extrude`.
+
+## What changed in round 23 — the raymarcher gets an sdf-steps option (a comptime constant) and an empty-space skip
+
+The 3D view's sphere-tracing loop was hardcoded to `128` steps in four places (both WGSL wrappers,
+both CPU marchers), and every ray marched from the eye through empty space to reach the scene.  Both
+changed; `scripts/marchbench.ts` (new) measures the result on the CPU fallback, interleaved, at the
+App's auto-fit camera distance:
+
+| example (48×32, solid view) | march from the eye | bbox skip | |
+|---|---|---|---|
+| toolbar (a viewport-sized plate) | 9734 ms | 1025 ms | **9.5×** |
+| packed | 681 ms | 57 ms | **12×** |
+| dashboard | 3232 ms | 1025 ms | **3.2×** |
+| the 11-example sweep | 14405 ms | 3069 ms | **4.7× wall-clock, 3.7× fewer field evaluations** |
+
+### The sdf-steps option is a compile-time constant, not a uniform
+
+`SHADER_FLAGS.sdfSteps` (default `128`, the old hardcoded count) is exposed in the `gen:` panel as a
+select (16…512).  The count is **baked into the generated code as a literal** — `for (var i = 0u; i <
+128u; i = i + 1u)` in WGSL, `for (let i = 0; i < 128; i++)` in the CPU fallback's marcher — so the
+shader compiler knows the trip count and can unroll and constant-fold around it, and each setting
+gets its own compiled pipeline rather than paying an indirection every iteration.  The CPU marchers
+are now *generated from source text* (`marcherSrc` in renderer.ts, cached per steps×branchless and
+shown verbatim by `wrapJS`), the same show-what-runs treatment the WGSL wrapper got in round 21.
+
+Hits are monotone in the count — the first N steps of an M-step march are the same march — so fewer
+steps only ever lose grazing surfaces (flagcheck asserts `lit(32) ≤ lit(64) ≤ lit(128) ≤ lit(256)`
+per example; `rings3d` goes 329 → 339).  The sweep is worth ~1.2× at the default camera (most rays
+converge well before the cap); the option matters for slow-converging fields.
+
+Body code and the parameter buffer do **not** depend on the count, so it is deliberately absent from
+`flagsKey` — the body/param caches stay valid across a steps change (wgslcheck asserts the body is
+byte-identical and `compileTree` reuse holds).  The wrapper-only inputs are keyed where they matter:
+the WebGPU pipeline key (`keyOf`, which already hashed the branchless flavour) and the code panel's
+refresh key in App.tsx, which now includes `flagsKey()` — before, flipping `branchless3D` (also a
+wrapper-only flag) left the panel showing the previous wrapper's text.
+
+### The empty-space skip: ray ∩ padded scene box, before the march
+
+`compileTree` now returns `bbox3` (in solid mode, recomputed on *every* compilation — the
+params-only reuse path is exactly where a solved layout or animated radius moves the box).  Both 3D
+wrappers and both CPU marchers intersect the ray with that box, padded by `max(0.01, BB_PAD_K·rad)`
+(`BB_PAD_K = 4·FLAT_K`, beside `FLAT_K` in shapes.ts so the constants cannot drift):
+
+* a ray that **misses** the box paints background without a single field evaluation — the box bounds
+  the field's zero set, which is what `bbox3Of` means and what stdcheck samples;
+* a ray that **meets** it starts at the entry point and stops at the exit (`t1` replaces the `tt >
+  FAR` check — the slab already clamps it);
+* **no finite box** (unbounded scene: `grad3d`, any `gyroid` not clipped) → the renderer writes the
+  everything-box (±1e30) and the slab test degenerates to *exactly* the old march-from-the-eye
+  (`t0 = 0.02`, `t1 = FAR`): `grad3d@solid` and `gyroid3d@solid` goldens are byte-identical.
+
+The pad exists because a flattened 2D shape is a slab ±`FLAT_K·rad` thick around z = 0 while its own
+bbox has zero z extent — without the pad the skip would shave the plate's visible faces off.  The
+slab test is written with min/max only, so the branched and branchless builds compute bit-identical
+bounds from it (flagcheck still holds the two to identical pixels) and fails *open* in the
+degenerate `0·inf` corner (NaN t → NaN distances → background — wasted steps, never a wrong pixel).
+
+**Custom shapes never skip.**  A `make_shape` bbox is a user *declaration* that drives the camera
+fit, and the repo's own examples break the "box bounds the field" promise it implies: `mandelbrot`
+is `everything.dist` (inside everywhere) with a view-fitting box, `liquid_paint` declares
+`dist = -inf`.  Skipping around such a box would clip real geometry at its edge, so `marchBoxOf`
+(shapes.ts) returns null for any tree containing a custom node — those keep the march-from-the-eye
+path.  The soundness oracle in threedcheck caught exactly these two before they shipped.
+
+### Gates
+
+* **threedcheck** grew two oracles: *soundness* (the field cannot register a hit — `d < 0.001` — at
+  a shell of sample points outside the padded box, 20 examples) and *parity* (each 3D example
+  rendered with the box and without it agrees pixel-for-pixel — measured **0.00% of pixels differ**
+  on all 8; the resolution is pinned, because the adaptive scale would otherwise move the pixel
+  count between the two renders).
+* **flagcheck**: every COMBOS entry now pins `sdfSteps: 128`, and a new section checks the option's
+  own invariants (slice pixels untouched, params/body fixed, lit monotone in the count, NaN count
+  monotone).
+* **wgslcheck** §7: the loop-bound literal follows the flag, the wrapper text changes with it (so
+  the pipeline key does), the body does not, the slab formulas are identical in both wrapper
+  flavours, and the slice wrapper has neither steps nor slab.
+* **pdiff**: six solid goldens changed (ball3d, rings3d, molecule3d, twist3d, loft3d, pulse3d) —
+  every one with an **identical lit-pixel count** (±0) and `nan=0`: the skip moved shading by
+  floating-point path differences, not a single pixel's lit/background classification.  All 27
+  slice frames and the two box-less solid frames are byte-identical.
+* **marchbench** (new, above) is the measurement of record; `branchbench` still measures the
+  branchless body/wrapper trade (its branchless-ray column is now ~62× off the shipped build,
+  because the branched build got 4.7× faster while the branchless one — all steps, every pixel, by
+  design — could not benefit from the skip).
+
+The CPU render loop was also de-allocated: the marcher, the step/colour closures and the
+scene box+pad used to be re-selected and re-created *per pixel*, and the marcher allocated a fresh
+`[x,y,z]` per step (~128 per ray) plus eight small arrays per shaded pixel.  All of that is hoisted
+per frame or reused as a scratch — same values in the same order, so pixels are unchanged by it.
+
+## Round 19 recap — branchless shaders: built, measured, and mostly *not* shipped
+
+The round-18 bug (a brace-less `if` in the hand-written WGSL wrapper) invited the obvious cure:
+generate **no branching at all**.  `Gen` can now lower control flow instead of emitting it:
+
+* `assign` under a condition → `x = select(x, v, cond)` (WGSL) / `x = (cond ? v : x)` (JS);
+* `if`/`else` → **both** arms emitted, each guarded by the condition (or its negation) — no control
+  flow, and assignments compose, so nesting works without any special case;
+* `break` → a per-loop `live` flag cleared *at the break site* (clearing it only at the end of the
+  iteration lets one more body run — that bug cost an afternoon and showed up as a wrong Mandelbrot);
+* `&&`/`||` → non-short-circuiting `&`/`|`, which WGSL also defines for `bool`;
+* loops stay: a `for` whose trip count is a parameter is uniform, not divergent.
+
+Four flags (`src/gpu/gen.ts`): `branchless` (master: masked `if`s/`break`s *and* the 3D raymarch),
+`noShortCircuit`, `cullSelect` (only the bbox-cull bracket), `branchless3D` (only the raymarch).
+All are in `flagsKey()`, so cached code is never confused across them.
+
+**Result: zero `if`, `else`, `break`, `continue` and zero short-circuit operators** in the
+branchless build — every example and every corner case, in both view modes — and `wgslcheck`
+now *asserts* that (it parses both flavours and fails if the branchless one still branches).
+`pdiff` is 35/35 identical with **either** build, as are `threedcheck` and `stdcheck`: the two
+builds are the same program, only the price differs.
+
+### Measured (`scripts/branchbench.ts`, CPU fallback, best-of-N, resolution pinned)
+
+| build | 2D slice | 3D solid (3D group) |
+|---|---|---|
+| branching (round-18 default) | 1.00× | 1.00× |
+| `noShortCircuit` (`&&`→`&`) | **1.00×** | **1.02×** |
+| `+cullSelect` | 2.79× | 1.01× |
+| `branchless` (bodies + raymarch) | **3.05×** | **9.72×** |
+
+Worst cases, all from removing a branch that was *doing work*: a text-heavy 2D tree rendered in the
+3D view (`buttons` 19.3×, `split` 17.9×, `dashboard` 17.7× — the glyph loop samples the atlas for
+every glyph of every label at every pixel once `if (inside cell)` is gone), and the raymarch
+(9.7× — every ray now runs all 128 steps and is shaded even when it hits nothing).
+
+**Why it cannot be cheap:** two of the branches are load-bearing optimisations, not artefacts.
+The bbox-cull branch *skips a whole subtree* for pixels outside its box, and the raymarch's
+early-out *stops marching*.  A branchless build must evaluate both sides, so it is ≥ the branching
+build in ALU work by construction; what it buys is warp coherence, which here is worth far less
+than the work it costs.
+
+**Shipped:** `noShortCircuit: true` (measured free, and it removes every `&&`/`||` from the
+generated code — on a GPU that is a real branch removed for one AND).  `branchless`, `cullSelect`
+and `branchless3D` stay off: implemented, documented, benchable with one flag, and shown above.
+`polygon` is the one example that got *faster* branchless (0.72×, `polySelect` replaces a `%`),
+which is a nudge towards measuring `polySelect` on its own.
+
+**In the UI:** the bottom of the preview column has a **shader generation** panel
+(`src/components/GenOptions.tsx`) with a `branched | branchless` switch that exposes every
+`SHADER_FLAGS` option, each with its measured cost in the tooltip, plus a live branch
+census of the last compiled shader (`N lines · i if · b break · s && || · L loops`).  (It started as a
+popover off the toolbar; ten options and their costs do not fit in one and cannot be read while
+dragging a slider, so it is a panel now — the last of the bottom row's three panels.)  All three bottom panels (parametric, solver trace, shader generation) **stack and fold**: they sit one
+above the other at full width — three columns of a wide table were three narrow tables — and fold to a
+thin bar titled left to right (`src/components/Panel.tsx`).  The **whole header** is the fold target,
+chevron and title together, not the 12px arrow; the panel's own actions (reset, the branched switch,
+the timings) stay to the right of it.  Both bars are ~18px: every pixel of chrome is a pixel the
+content does not get.  Folding one gives the others its height, the row grows with what is open
+(32% / 44% / 54%, floored by `min(150px,50%)` / `min(230px,55%)` / `min(320px,60%)` so a landscape
+window cannot squeeze a panel down to its title).  **Every seam between two regions is draggable**
+(`src/components/Splitter.tsx`): the one between the canvas and the row takes an explicit height,
+the vertical one between the editor column and the preview column takes an explicit width, the seam
+between two open panels trades height between just those two (the pair's total is untouched, so the
+third panel never moves), the reference drawer has one on its top edge, and the code view (the WGSL/JS
+overlay) has one on its bottom edge, so it can be made short enough to keep the picture in sight.  Double-click — or Enter —
+hands any of them back to the layout, the arrow keys nudge a focused seam by 16px, and each drag is
+floored (a panel keeps 44px, the editor column 280px, the preview 360px) and clamped to the window, so
+no region can be dragged out of existence; a dragged size is re-clamped when the window changes under
+it.  The inter-panel seams are **overlays**, not tracks: they float on the border between two panels
+and cost no layout height, which is the same reason the bars are thin.  Flipping an option
+mutates `SHADER_FLAGS` and clears `lastProg`/`staticCache`; three `wgslcheck` checks keep that honest:
+switching to `branchless` must produce different code (not a reused shader), switching back must restore
+the old text, and the **parameter layout must not move** (292 params either way) — the menu cannot be
+allowed to invalidate the memoised tree walk.
+
+Caveat, stated plainly: **these are CPU-fallback numbers.**  Headless Node here has no WebGPU
+device (`@kmamal/gpu`/Dawn hangs with no adapter), so the GPU side of the trade is unmeasured —
+the ALU increase is the same, the coherence win is not, and the browser preview is the only oracle.
+
+## Round 18 recap (kept from the round-18 handoff — all still in force)
+
+### The 3D view never compiled on a GPU, and the gate that would have said so
+
+**The bug.**  `wrapWGSL3D`'s raymarch loop contained `if (dd > FAR) break;` and `if (tt > FAR) break;`.
+In WGSL the body of an `if` must be a *compound* statement, so both are syntax errors — naga reports
+`expected '{' for if statement`.  Every 3D shader (and every 2D example switched to the 3D view)
+failed to compile, and the app surfaced it as `error: shader: expected '{' for if statement (line 61)`.
+
+**Why nothing caught it.**  The WGSL and JS backends share the generated *body*, but the two wrappers
+are hand-written — and the JS target happily accepts a brace-less `if`.  Headless scripts use the CPU
+renderer, so `selftest`, `threedcheck` and `pdiff` all ran the JS wrapper; the WGSL wrapper was never
+parsed, compiled or executed once.  The line number in the message was also a lie: it subtracted a
+constant 20 meant to skip the preamble, which points at an arbitrary line of the body for an error
+that lives in the wrapper.
+
+**The fixes.**
+* `if (dd > FAR) { break; }` / `if (tt > FAR) { break; }` (both backends' wrappers reviewed; the 2D
+  one has no bare statements).
+* The shader error now says which view and which line *of the generated shader*
+  (`… (solid WGSL line 123)`) instead of pretending to be a line of the program.
+* **The status bar has a `copy` button** whenever there is an error: it copies the message, the
+  example id, the view mode (2D slice / 3D solid), the backend (`webgpu` + adapter, or the CPU
+  fallback) and the program — everything a bug report needs.  `navigator.clipboard` first, a hidden
+  `textarea` + `execCommand` fallback for non-secure contexts.
+* **`scripts/wgslcheck.ts`** (new gate, in CI): parses every example plus 23 hand-picked codegen
+  corner cases (`text`, `repeat_xyz [3,3,0]`, `cone {mode:"mitred"}`, `capsule`, `slice_xz`, `gyroid`,
+  `twist`, `bend`, `loft`, `morph`, `make_shape`, …) in **both** view modes with `wgsl_reflect`
+  (devDependency).  It parses the output of `wrapWGSL` — the wrapper is where the hand-written WGSL
+  lives — so `wrapWGSL` is now exported for that reason.  Verified as a real oracle: reintroducing
+  the missing brace makes it fail with the offending line and three lines of context.
+  It is a *parser*, not a validator: syntax, not types.  Real semantic validation needs a WebGPU
+  device, and headless Node has none here (`@kmamal/gpu`/Dawn hangs with no adapter).
+
+**Lesson for the next round:** any hand-written shader text is code that only one backend runs.  The
+CPU fallback is a *fallback*, not a second implementation — a gate that never touches WGSL cannot
+protect the WebGPU path.  `tsconfig.json` also type-checks only `src` and `vite.config.ts`, so the
+gate scripts themselves are unchecked (they run through `tsx`, which strips types).
+
+## Round 17 recap (kept from the round-17 handoff — all still in force)
+
+### 3D: solid raymarch view + the C++ 3D vocabulary (PR #3), then the review fixes
+
+**The 2D language is now a `z = 0` slice of a 3D field.**  `genShape` compiles one body for a `vec3`
+point; the 2D view evaluates it on the plane, the 3D view raymarches it.  One code path, two compile
+modes (`mode: "slice" | "solid"`), per-mode pipeline caches, and `fp` (the App's static-frame skip
+fingerprint) carries the view mode so a mode switch cannot reuse a stale frame.  On top of that,
+PR #3 added ~50 C++ `std.curv` symbols (`sphere`/`box3`/`cone`/`capsule`/`torus`/`cylinder`/`gyroid`,
+`extrude`/`extrude_mitred`/`loft`/`twist`/`bend`/`taper`/`shear`/`repeat_xyz`/`repeat_finite`,
+`slice_xy/xz/yz`, `reflect_x…yz`, `set_bbox`, `distance_field`, implicit fields, matrix helpers) and
+nine `SNode` kinds.
+
+Then the review of that PR — and the fixes, which are this round's substance:
+
+1. **`repeat_xy` painted the whole frame NaN** (the `vec2 → vec3` migration): the spacing was built as
+   `vec3(a, b, 0)` and `mod(z, 0)` is NaN, which poisons `length()`/min() for every pixel.  Repeats are
+   now per-lane (`repeat_x/y/xy/xyz`), and a lane with **spacing 0 is not repeated** instead of
+   dividing by zero (C++ would NaN there; `repeat_xyz [3,3,0]` is a legitimate 2D repeat).
+2. **Every text glyph was NaN on the JS backend**: `clamp(lp/qs, 0, 1)` clamped a `v3` and `mix(v2, v2, v3)`
+   reconciled the mismatch with `R.bc`, which is *scalar → vector* only.  `Gen.bcast` now **throws** on a
+   vector → vector broadcast (WGSL used to truncate it silently), and the clamp takes `swz(lp, [0, 1])`.
+3. **`cylinder` was twice as tall as C++** and `extrude`/`loft`'s `bbox3` was half the truth: `extrude`
+   stores the *half* height (`let h = d/2`) but `cylinder` passed the full one, while `bbox3Of` read it
+   as full.  Both are `±n.h` now, which also fixes the 3D camera fit (it frames `bbox3Of`).
+4. **`rotate {angle, axis}` turned the solid the wrong way**: C++ `rot3` is the *domain* transform
+   `R(−angle)`, so the shape rotates by `+angle`.  The matrix is now `rot3`'s, and `bbox3Of("xform3")`
+   maps the child box through its **transpose** (the image of a domain transform is `M⁻¹·box`).
+5. **`make_shape` rejected `is_2d && is_3d`**, which C++ allows (`nothing`, `everything`, `show_dist`,
+   `show_gradient`) and the new `set_bbox` forwards verbatim.  Dropped; a `make_shape` that declares
+   the flags now reports exactly those flags (previously they were re-derived from the bbox), and a
+   2-point bbox on a 3D shape means a `z = 0` slab.
+6. **`transpose` returned a matrix of matrices**: `a.[[j, i]]` indexes *by the list* `[j, i]`; C++'s
+   `a.[j, i]` is a two-index lookup — `a.[j].[i]` here.
+7. **Bounding boxes that mis-frame the shape** (`S1`): `repeat_finite` (2D and 3D: the span was folded
+   into the *min*), `bend` (now C++ `±(height + ry)`, was `1.6·max(w,h)`), `box3`'s 2D footprint
+   (`±(hx, hy)`, not `±max(hx, hz)`), `slice_xz`/`slice_yz` (inverted y-range ⇒ "empty"), and
+   `xform3`'s 2D box — which now really cuts the child's 3D box with the `z = 0` plane (corners on the
+   plane + edge crossings) instead of projecting the 2D box through the xy block.  `capsule` also
+   reports `is_3d` (it shares the `seg` node with `stroke`; the z coordinates tell them apart) and its
+   radius is `d/2` again — the node's `th` is a diameter, so `th: d/2` halved it once more.
+8. **`cone` is C++'s Euclidean field** (`cone.call = exact`, MERCURY/hg_sdf apex + base-ring
+   corrections); `mode: "mitred"` keeps the cheaper mitred cone, like `cylinder`.
+9. **Two new gates** so this class of bug cannot pass again: `scripts/stdcheck.ts` (values, boxes, and
+   field sampling — finite distances and "nothing inside the shape may lie outside its box") and
+   `scripts/pdiff.ts` (golden frame hashes, `nan` counted per frame).  The CPU raster loops and
+   `march3` now **count non-finite distances** (`renderer.stats.nan`) and treat them as background
+   instead of painting black holes.  `selftest` fails an example that produces any.
+10. Parity nits: `chartreuse`/`spring_green` are `sRGB.hue` (as in `std.curv`, not `web_colour.curv`);
+    `sec`/`csc` keep C++'s *swapped* definitions with a comment saying so; `polyline`'s comment now
+    admits it is the closed `polygon` field (C++ `polyline` is an open stroke) and its bbox is padded
+    by `d/2`; `bend`'s unused `g.param(n.ry)` is documented as lockstep with `walkSeg`.
+
+Net effect, measured with `pdiff` against `main`: **18 of the 19 pre-existing 2D examples are
+bit-identical again** (before the fixes, 12 differed — ten of them because every glyph was NaN);
+`peppermint` differs on purpose (the C++ skimage `swirl`).
+
+## Round 16 recap (kept from the round-16 handoff — all still in force)
+
+### expression-level memo (the round-15 gap, shipped) + a merged editor PR
+
+**Merge against the PR-edited origin** (parallel "round 15" line, PR #1: editor syntax highlighting +
+brace-pair matching — `src/components/highlight.ts` permissive Curv tokenizer used purely for spans,
+`Editor.tsx` overlay highlight + bracket matching, `index.css` theme).  Clean fast-forward; suites
+green on the merged tree.  This round's own work was the round-15-designated next step:
+
+1. **Expression memo for pure list literals / comprehensions** (`applyExprMemo`, interp.ts; analysis
+   `freeVarsOfExpr`, freevars.ts).  The round-15 study showed the warm-frame residual is *evaluator*
+   assembly work, not solvable by hashing trees cheaper — this memo is the mechanism at the right
+   grain: a `[nav vp, panel "x" rows, for (c in cards) card c]` site whose free variables hash
+   identically replays as ONE hit (identical immutable array returned), instead of re-hashing every
+   item's call memo every frame.  Same profile-guided election as the call memo (memo iff warm body
+   ≥ max(8 µs, 2 × warm-hash)), same flags/trace replay (`time`/`mouse`/`viewport` through closures
+   are covered by hashing the *values* of free names — a closure's captured inputs hash with it),
+   LRU per site (`EXPR_LRU` 8) inside the global cap.  `memoWorthyList` gates constant/tiny lists
+   (colour vectors, point pairs — cheaper to evaluate than to profile).  Measured (`exprbench`,
+   alternated best-of-6, all 19 examples): **total 14.0 → 5.2 ms (2.7×)**; solve/UI corpus 1.8–7.1×
+   (dashboard 5.6×, polygon 7.1×, packed 3.6×, buttons 2.7×, chart 2.7×, toolbar 2.2×); shader-only
+   programs within ±8 % (frep 0.82× worst: site profiling on tiny trees — sub-µs absolute).
+2. **Purity hardening the memo forced** (the interesting part): a list's *static* free-variable
+   purity says nothing about a *callee's* effects — `[for (i in xs) f 1]` is only as pure as `f`,
+   and memotest's three impurity gates caught it (hits on assigns-outer/prints/parametric-through-
+   closure).  Two layers: (a) at election, every closure reachable from the free values (bounded
+   scan, depth ≤ 3 / 32 values) must itself be statically pure and non-printing — over-approximate
+   skips are safe; (b) a **measure-phase tripwire** (envEpoch / `params.length` / new `printCount`
+   snapshots around each sampled run) catches host effects an unsampled callee branch could hide.
+   `memotest` negative-case assertion is now **per-site** ("no MEMO row on the impure construct"),
+   not "no hits in the frame" — a legitimately elected pure lambda beside an impure site would
+   flake the old proxy, and the λ here is semantically correct (time-keyed, verified by the
+   same/dep columns).  New positive cases: list literal / comprehension / viewport lists (values,
+   time-dependence, trace replay) and list identity across frames (same array object).
+3. `setExprMemo` bench switch; `callMemoTable()` now reports «list» rows for `prof -v`; invariants
+   section grew rules for callee purity, the tripwire, the per-site gate assertion, and the
+   `EXPR_LRU`/threshold reuse.
+
+## Round 15 recap (kept from the round-15 handoff — all still in force)
+
+
+1. **Hash-consing (`inode`, shapes.ts) — studied, measured, kept OFF.**  Design: S() hash-conses every
+   constructed node through a WeakRef table keyed by a numeric content hash (`cHash`, two u32 lanes
+   stored on the node as `__ch__`, table key `__ik__`, coverage 1:1 with `nodeHashRaw`), so equal
+   subtrees become one object and every identity-keyed memo hits across frames.  Measured
+   (`internbench`, in-process alternated ON/OFF, best-of-6, all 19 examples): the fresh-tree
+   key+param walk drops 8–48× as designed — **but full eval costs 2.4× more, on every shape-bearing
+   example, so all 19 net negative.**  The mechanism, measured by bisection (off / hash-only /
+   full table): the entire regression is the *hasher*, not the WeakRef table; it is not the string
+   hash (a WeakMap-keyed string hash and an inline-field numeric hash cost the same), it is the
+   per-call constant work + allocation churn (CHash objects, closures, table stores) on ~10²–10³
+   constructed nodes per frame — while the walks it replaces were already mostly amortised by the
+   existing WeakMap memos.  **Verdict: default OFF, infrastructure kept** (`setInterning`, bench),
+   same outcome class as round-12/13's off-by-default shader variants.  The invariant it would have
+   needed stays recorded: *amortised WalkMap walks are cheaper than correct eager hashing; sharing
+   identity only pays when the hash itself is (nearly) free or the shared work is per-node ×K, not
+   per-frame ×1.*
+2. **Structural keys are two avalanche-mixed u32 lanes now (the shipped win).**  `structKeyRaw`'s
+   per-fresh-node string concatenation was the largest *legitimate* residual on dirty frames
+   (internbench's fresh-tree walk column: 1.86 ms/frame on wrapfit, 1.59 on toolbar).  Same
+   coverage (kinds, tree layout and child order, repeat mode, text align, polygon arity, unit-scale
+   xform, per-child cull-bracket state), same memo-per-(cull,flags)-slot design, but lanes are mixed
+   with inline `Math.imul` arithmetic (no closures — closure allocation per node ate the first
+   attempt's win on medium trees) and materialised as ONE short `flags|h1.h2` string per tree.
+   `skNum`'s `h1==0` sentinel is stored mapped (`-0x80000000`) **uniformly on miss and hit** —
+   memo-hit/miss lane mismatches would fork every parent key.  Fresh-tree key+walk, same machine
+   and harness before→after: wrapfit 1.92→0.55, toolbar 1.59→0.61, dashboard 0.83→0.72,
+   tooltip 0.50→0.38, chart 0.46→0.36, buttons 0.29→0.14, everything else ~1.1–2× better,
+   custom-function trees unchanged (they skip the walk).  `paramcheck` stayed 19/19 bitwise-green
+   (the oracle's `reused`/`codeSame`/`memo=`/`skip=safe` columns all exercise key semantics).
+3. `tsconfig` target/lib ES2020 → ES2021 (`WeakRef`, for the kept-off inode table).
+
+## Round 14 recap (kept from the round-14 handoff — all still in force)
+
 
 Upstream psolve moved to `main` (`05f9411cccbc`, merge of `arena/01a07358-psolve`, PR #1: certified QP
 Phase-I infeasibility, warm starts, wall-clock budgets, the psolve-owned wasm bridge).  This round
@@ -275,12 +748,22 @@ src/curv/interp.ts      tree-walking interpreter, shared static builtins + dynam
                         compileTree (structural-key reuse + codeLru) / collectParams / collectParamsFast
 src/curv/subcurv.ts     SubCurv: compiles user dist/colour functions to shader code (inlining, loops);
                         tags the point argument, reports time reads (Gen.usesTime)
-src/curv/shapes.ts      SNode F-Rep tree, bboxOf (memoised), textMetrics/textGlyphs, nodeHash (memoised),
-                        weight (memoised), structKey (memoised per subtree), genShape, walkParams (segment-memoised)
+src/curv/shapes.ts      SNode F-Rep tree, bboxOf/bbox3Of (memoised), flags3Of, textMetrics/textGlyphs,
+                        nodeHash (memoised), weight (memoised), structKey (numeric two-lane, memoised
+                        per (cull,flags) slot), inode hash-consing (off by default — round-15 study),
+                        genShape (one body, two modes: "slice" | "solid"), walkParams (segment-memoised)
 src/curv/prelude.ts     palette, box helpers, layout combinators (incl. flow / hstack_fit), UI components — in Curv
-src/curv/examples.ts    example programs (group "solve" | "curv")
+src/curv/examples.ts    example programs (group "solve" | "curv" | "3d")
 src/gpu/gen.ts          code generators: WGSL, JS, ParamsOnly; dynBlock/finalParams; Gen.usesTime
-src/gpu/renderer.ts     WebGPU renderer (pipeline cache keyed by code, timestamp queries) + CPU fallback
+src/components/Panel.tsx       folding for the bottom row: collapsed bar + the header chevron, shared by
+                        all three panels
+src/components/Splitter.tsx    a draggable edge between two regions (bar = its own track, overlay =
+                        floats on a seam); reports a pixel delta, knows no geometry
+src/components/GenOptions.tsx  the bottom-row shader-generation panel (branched / branchless + every
+                        SHADER_FLAGS option, with measured costs and a branch census)
+src/gpu/renderer.ts     WebGPU renderer (pipeline cache keyed by code, timestamp queries) + CPU
+                        fallback; 3D raymarch (WGSL `stepf`/`colf` + CPU `march3`), orbit camera,
+                        per-mode pipeline caches, `stats.nan` counter
 src/gpu/atlas.ts        SDF glyph atlas (Canvas2D + EDT), GLYPHS charset, kerning
 src/psolve/constraints.ts  Lin/Quad affine exprs, Cons, presolve (relative thresholds, unreduced
                            fallback, constant-false = certified proof), row normalisation, QP/LP
@@ -292,7 +775,9 @@ psolve-src/             vendored upstream bridge (verbatim) + shims + build-wasm
 src/App.tsx             UI: editor, preview (camera, pause, CPU-aware quality controller, static-frame
                         skip cache, shader-time re-render path, single-eval camera fitting), solver +
                         params panels, memo hits + static badge in the status line
-scripts/                selftest, paramcheck, memotest, warmcheck, warmbench, prof, shaderbench, sheet (headless, tsx)
+scripts/                selftest, paramcheck, memotest, warmcheck, threedcheck, stdcheck, pdiff
+                        (+ scripts/golden/pdiff.json), warmbench, internbench, exprbench, prof,
+                        shaderbench, sheet (headless, tsx)
 ```
 
 ## Invariants to keep (things that will silently break otherwise)
@@ -305,6 +790,11 @@ scripts/                selftest, paramcheck, memotest, warmcheck, warmbench, pr
   produce identical buffers.  Run `scripts/paramcheck.ts` after touching either and check its exit code.
 * Any new `SNode` kind or new codegen branch on a *value* must be reflected in `structKey`/`structKeyMemo`,
   `nodeHash`, **and** `walkSeg`; anything else that varies must go through `g.param(...)`.
+  **Round-17 trap, hit twice:** a branch on a *parameter value* is a branch on structure as far as the
+  shader cache is concerned, because `structKey` deliberately ignores parameter *values*.  `repeat`'s
+  generated code skips the lanes whose spacing is 0 and `cone` picks a field by `mode`, so both are part
+  of the structural key now (see the comments at those cases) — otherwise two trees that share a key but
+  differ in a zero lane / mode silently reuse the wrong shader (measured: a whole frame of NaN).
 * `ParamsOnly` must invoke every callback (`if` then+else, `loop` body once) so parameter order matches.
 * Variable-length parameter blocks must use `g.dynBlock` (via `dynBase`) and the buffer must be read with
   `finalParams()`; never bake `g.params.length` into code as a literal.  `ParamSeg.blocks.at` is a
@@ -323,6 +813,39 @@ scripts/                selftest, paramcheck, memotest, warmcheck, warmbench, pr
   memoisation — there are none today (`text_size` depends only on the constant atlas).
 * The results of memoised blocks/calls are shared between frames: records/lists/**SNodes** must stay
   immutable in the evaluator (including `WalkParams` segments — never mutate `seg.nums` after caching).
+* **3D: one field, two views.**  `genShape` always compiles a `vec3` point body; the 2D view is the
+  `z = 0` slice, the 3D view raymarches the same body.  Consequences to respect:
+  - a transform node's matrix is a **domain** transform (`q = M·(p − t)`), so its image box / slice is
+    `t + M⁻¹·child` — `bbox3Of("xform3")` uses the transpose, and the 2D box cuts that box with `z = 0`
+    (corners on the plane + edge crossings), it does not project the child's 2D box;
+  - `bbox3Of` must **contain** the shape (`extrude`/`loft`/`cylinder` store a *half* height — the 3D
+    camera fit frames `bbox3Of`, so a too-small box clips the view) — `stdcheck` asserts it by sampling;
+  - nothing may produce a non-finite distance: one NaN lane poisons a pixel (`min`/`length`) or a whole
+    frame.  `mod(x, 0)`, `normalize(0)`, `x/0` and vector-size mismatches are the usual suspects.
+* **Two branches are load-bearing, do not "optimise" them away.**  The bbox-cull bracket in
+  `kidCulled` skips a whole subtree for pixels outside its box, and the 3D raymarch's `break` stops
+  marching when a ray hits or escapes.  Round 19 measured the branchless lowering of both: 2.8–3.0×
+  slower in the 2D view and 9.7× in the 3D view (up to 19× for label-heavy trees in the 3D view).
+  A branchless build is ≥ the branching build in ALU work *by construction* — it computes both
+  sides — so only measure it, never assume it.  The one branch that is free to remove is
+  short-circuit: `&&`/`||` → `&`/`|` measured 1.00× and is the shipped default
+  (`SHADER_FLAGS.noShortCircuit`).
+* **Hand-written shader text is per-backend code, and only one backend ever runs it.**  `wrapWGSL2D`
+  / `wrapWGSL3D` (WGSL) and the two `new Function` bodies in `createCPU` (JS) are written by hand;
+  the headless gates use the CPU renderer and the browser uses WebGPU, so neither exercises the
+  other's wrapper.  WGSL is the stricter language — a compound statement is required after `if`/`for`
+  /`while`, there are no implicit conversions — and round 18 shipped a brace-less `if` in the 3D
+  raymarch loop that every gate passed and the browser rejected.  `scripts/wgslcheck.ts` parses the
+  wrapped source (wrapper included) of every example in both view modes; run it after touching any
+  wrapper.  It is a parser, not a validator: types still need a real device.
+* **No vector → vector broadcast**: `Gen.bcast` throws (WGSL's constructor used to truncate a `v3` to a
+  `v2`, the JS runtime built a nested array and produced NaN).  Broadcast a scalar, or swizzle.
+* `bbox3Of`/`flags3Of`/`bboxOf` memoise per node in `WeakMap`s that ignore `atlas` — fine while the atlas
+  is a build-time singleton, as `bboxMemo` already assumed.
+* **Golden frames need deterministic solves**: `scripts/pdiff.ts` and `scripts/stdcheck.ts` call
+  `setSolveBudget(0)`.  The UI keeps `SOLVE_BUDGET_MS = 16`, whose STOPPED incumbent depends on machine
+  load — a gate that compares pixels must not inherit that (measured: `toolbar`'s hash changed between
+  two runs of the same build).
 * `nodeHash` must cover *everything* the evaluator can observe about a plain node; `custom`/`colourfn`
   nodes (which read the time uniform) must stay unhashable, and host-state-free builtin `Fn`s are the
   only ones that may get a `.key`.
@@ -377,6 +900,27 @@ scripts/                selftest, paramcheck, memotest, warmcheck, warmbench, pr
 * When touching the wasm: bump `PIN`, `PSOLVE_WASM_SHA256`/`PSOLVE_UPSTREAM_PIN`, keep
   `psw_abi()` == `PSOLVE_BRIDGE_ABI`, re-run the build twice and compare sha256 before committing
   the blob.
+* **Structural-key coverage is a correctness invariant on its own** (`skRaw`): any new `SNode`
+  kind, or any new codegen branch on a *value*, must be mixed into the numeric lanes in lockstep
+  (the old string-key rule, now `skNum`); the `(0,0)` pair means "unhashable" and `h1==0` is
+  stored as `-0x80000000` through ONE code path so memo-hit and memo-miss return identical lanes.
+  `paramcheck` (exit code) is the oracle — its `reused`/`codeSame` and skip-oracle only hold when
+  keys partition exactly like codegen.
+* `__ch__`/`__ik__` on nodes are inode's private cache fields; never enumerate or branch on them
+  (all evaluator observation goes through `n.k`-switched code — keep that exhaustive).
+* `inode` is OFF by default (round-15 measured net loss at S()-level on all 19 examples); enabling
+  it anywhere needs an internbench run first.  Do not diversify its hash coverage away from
+  `nodeHashRaw` — the intern table's correctness argument is the same interchangeability lemma.
+* **Expression memo (round 16) is bound by callee purity, not just site purity**: any new memo site
+  must (a) reject statically impure free-variable closures *reachable from the free values* (the
+  bounded scan in `applyExprMemo`), and (b) keep the measure-phase tripwire (envEpoch /
+  `params.length` / `printCount`) armed so host effects through unsampled callee branches are
+  observed exactly once.  New host-state reads reachable from expression evaluation also need a
+  tripwire channel (or to mark the site impure statically) — a memoised site that hides an effect
+  shows stale pictures with no error.
+* `memotest` negative cases assert **per-site** (no MEMO row on the impure construct), never
+  "no hits in the frame" — unrelated pure lambdas may be elected legitimately beside an impure
+  site (JIT-dependent), and that is not a violation.
 
 ## Known gaps / next steps
 
@@ -396,14 +940,31 @@ scripts/                selftest, paramcheck, memotest, warmcheck, warmbench, pr
 * The psolve arena (`psw_arena_*`) is deliberately **not** used: upstream measured it *slower* than
   libc malloc on this QP workload (their P2.4), and an exhausted arena aborts the module; it stays a
   determinism option, not a speed one.
-* Eval of the *rest* of an animated cached frame (user-tree construction, `union` literals) is nearly
-  all that remains on warm frames (split 0.04 ms, dashboard ≈ 0.9 ms raw; static examples skip
-  evaluation entirely).  Builtins (round 10) and the prelude (round 9) are shared per-process now; the
-  per-frame cost is now dominated by the program's own tree allocation.
+* Eval of the *rest* of an animated cached frame is now covered by three memo layers: block memo
+  (solve), call memo (function bodies) and the round-16 expression memo (list assembly sites);
+  exprbench totals 14.0 → 5.2 ms.  What remains below that: list *item* evaluation that was too
+  cheap to memoise individually (the honest tail), record literals (`rec` is not a memo site yet —
+  worth benching if a profile shows it), and genuinely time-varying trees (chart/frep: misses are
+  physics, not overhead — the gate keeps their extra hashing at ≤2× the would-be body cost).
 * The shader-only-time fast path keeps the quality scale while animating; settling to full resolution
   only happens on pause / interactions (a settle tick that schedules itself per frame was judged too
   finicky).
-* Solids-of-revolution style 3D shapes are rejected ('box [w,h,d]' error) — only 2D SDF.
+* **3D is young** (round 17): the raymarcher has no bounding-volume early-out (every pixel marches from
+  `t = 0.02`), a fixed 128-step cap and `FAR = 400`, and `wrapWGSL3D` inlines the whole body **twice**
+  (`stepf` + `colf`) — the first thing to hurt on big UI trees.  `gyroid` keeps C++'s uncompensated
+  Lipschitz 4/3 (`lipschitz 1.33` after extracting isosurfaces, per `std.curv`), so it is the first
+  candidate to alias at a fixed step count.  Deliberate divergences from `std.curv`, all commented in
+  the source: `loft` mixes its children's colours (C++ leaves it white), `distance_field` drops the
+  green `bit(abs(d) == inf)` channel, `warp_domain_xy` ignores `warp.function` (so the bbox falls back
+  to the child's), `chamfer` folds a list instead of taking exactly two shapes, and 2D `inter` keeps
+  its own AA-aware colour rule (`sel(b.d > acc.d, …)`) instead of C++'s "`colour = s1.colour`" — the
+  solid-mode rule does follow C++.
+  A GPU-side branch-vs-branchless measurement is **missing**: `scripts/branchbench.ts` can only
+  time the CPU fallback (no WebGPU device in headless Node), so the round-19 3×/9.7× numbers are
+  CPU numbers — the ALU half of the trade is the same on a GPU, the coherence half is not.
+  The WGSL path is **syntax-checked only**: no headless WebGPU device exists in this environment
+  (`@kmamal/gpu` + Dawn hangs with no adapter), so type errors, uniform-layout questions and how a
+  real GPU rasterises the 3D view are unverified — the sandbox's browser preview is the only oracle.
 * `flow`/`flow_fit`/`fit_labels` need *numeric* budgets (wrapping is discrete); `hstack_fit` gives all
   items the same font size / padding.
 * Kerning is measured pairwise from the canvas font, so metrics can differ slightly between machines; the
