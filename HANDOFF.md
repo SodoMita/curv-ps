@@ -240,6 +240,17 @@ scene box+pad used to be re-selected and re-created *per pixel*, and the marcher
 `[x,y,z]` per step (~128 per ray) plus eight small arrays per shaded pixel.  All of that is hoisted
 per frame or reused as a scratch — same values in the same order, so pixels are unchanged by it.
 
+**Follow-up (same round): the three numeric rows are free integer fields, not dropdowns.**
+`sdf steps`, `cull weight` and `unroll loops ≤` were `<select>`s with four fixed values each — a
+poor control for a number, and one that hid the legal values between them (96 steps, a cull weight
+of 6).  They are now `<input type="number">`s (`NumField` in GenOptions.tsx): local text state so a
+transient empty string never snaps back mid-keystroke, `apply` only on a parseable integer clamped
+to the documented range, re-canonicalisation when the value moves from elsewhere, and blur cleans
+up anything the browser let through (`1e3`, `1.5`).  Cull weight's "off" is the empty field (it
+applies `Infinity`, as the old dropdown's `off` did); typing `0` also turns it off; unrolling keeps
+`0` as a real value (= never).  flagcheck gained a `hand-typed` combo (cull weight 6, unroll ≤ 5)
+so the invariance gate covers odd integers too, not just the values the old dropdowns offered.
+
 ## Round 19 recap — branchless shaders: built, measured, and mostly *not* shipped
 
 The round-18 bug (a brace-less `if` in the hand-written WGSL wrapper) invited the obvious cure:

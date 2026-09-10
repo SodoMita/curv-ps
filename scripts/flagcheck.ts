@@ -52,7 +52,9 @@ const fnv = (b: Uint8ClampedArray | string): string => {
 
 type Flags = Partial<typeof SHADER_FLAGS>;
 // every setting the menu can produce: the shipped default, everything off, the master switch, each
-// branch option on its own, and the two groups of "other codegen" rows
+// branch option on its own, the two groups of "other codegen" rows, and — since the numeric rows
+// became free integer fields — a hand-typed pair of odd values (the dropdowns used to decide what
+// the menu could produce; now any integer can, and the invariances must not care)
 const COMBOS: { name: string; flags: Flags }[] = [
   { name: "shipped", flags: { polySelect: false, textBranchless: false, cullWeight: 4, flattenIf: false, unrollMax: 0, textWindow: false, branchless: false, noShortCircuit: true, cullSelect: false, branchless3D: false, sdfSteps: 128 } },
   { name: "all-off", flags: { polySelect: false, textBranchless: false, cullWeight: 4, flattenIf: false, unrollMax: 0, textWindow: false, branchless: false, noShortCircuit: false, cullSelect: false, branchless3D: false, sdfSteps: 128 } },
@@ -61,6 +63,7 @@ const COMBOS: { name: string; flags: Flags }[] = [
   { name: "branchless3D", flags: { polySelect: false, textBranchless: false, cullWeight: 4, flattenIf: false, unrollMax: 0, textWindow: false, branchless: false, noShortCircuit: true, cullSelect: false, branchless3D: true, sdfSteps: 128 } },
   { name: "selects", flags: { polySelect: true, textBranchless: true, cullWeight: 4, flattenIf: true, unrollMax: 0, textWindow: true, branchless: false, noShortCircuit: true, cullSelect: false, branchless3D: false, sdfSteps: 128 } },
   { name: "unroll8+cull1", flags: { polySelect: false, textBranchless: false, cullWeight: 1, flattenIf: false, unrollMax: 8, textWindow: false, branchless: false, noShortCircuit: true, cullSelect: false, branchless3D: false, sdfSteps: 128 } },
+  { name: "hand-typed", flags: { polySelect: false, textBranchless: false, cullWeight: 6, flattenIf: false, unrollMax: 5, textWindow: false, branchless: false, noShortCircuit: true, cullSelect: false, branchless3D: false, sdfSteps: 128 } },
 ];
 const setFlags = (f: Flags) => { Object.assign(SHADER_FLAGS, f); };
 const BASE = COMBOS[0].flags;
