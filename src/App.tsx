@@ -6,7 +6,7 @@ import { ParamsPanel } from "./components/ParamsPanel";
 import { EXAMPLES } from "./curv/examples";
 import { Interp, compileTree, type CompiledTree, type SolveTrace, type ParamDesc } from "./curv/interp";
 import { CurvError } from "./curv/parser";
-import { bboxOf, bbox3Of, finiteBBox, type SNode } from "./curv/shapes";
+import { bboxOf, bbox3Of, finiteBBox, finiteBBox3, type SNode } from "./curv/shapes";
 import { buildAtlas, type Atlas } from "./gpu/atlas";
 import { wrapWGSL, wrapJS, createRenderer, type Renderer, type Camera, type Camera3 } from "./gpu/renderer";
 import { SHADER_FLAGS, flagsKey } from "./gpu/gen";
@@ -223,8 +223,10 @@ export default function App() {
             // the body alone is the middle of the file: the panel should show the shader/module the
             // backend actually compiles (uniforms, entry point, raymarch loop and all).  A shape whose
             // two bodies are identical (a plain `circle`) still has two different wrappers, hence the
-            // mode in the key.
-            const wk = (solid ? "3|" : "2|") + prog.code;
+            // mode in the key — and the wrapper also depends on flags the body does not (the
+            // branchless 3D loop, the sdf-steps literal), so the key carries flagsKey() too: without
+            // it, flipping one of those left the panel showing the previous wrapper's text.
+            const wk = (solid ? "3|" : "2|") + flagsKey() + "|" + prog.code;
             if (updateCode && wk !== wholeRef.current) {
               wholeRef.current = wk;
               setWhole(r.kind === "webgpu" ? wrapWGSL({ ...prog, solid }) : wrapJS({ ...prog, solid }));
@@ -735,7 +737,6 @@ export default function App() {
 }
 
 const fmtNum = (v: number) => (Math.abs(v) >= 1000 ? v.toFixed(0) : Math.abs(v) >= 10 ? v.toFixed(1) : v.toFixed(2));
-const finiteBBox3 = (b: number[] | null): number[] | null => (b && b.length === 6 && b.every(Number.isFinite) ? b : null);
 
 function Icon({ d }: { d: string }) {
   return <svg viewBox="0 0 24 24" className="h-3 w-3 fill-current"><path d={d} /></svg>;

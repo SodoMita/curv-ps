@@ -20,6 +20,7 @@ export interface GenFlags {
   flattenIf: boolean;
   cullWeight: number;
   unrollMax: number;
+  sdfSteps: number;
 }
 
 /** Branch census of the last compiled shader body (`if` / `break` / short-circuit / `for`). */
@@ -71,7 +72,7 @@ export function GenOptions({ flags, onChange, census, collapsed, onToggle }: { f
       <div className="min-h-0 flex-1 overflow-auto px-2 py-1.5">
         <div className="px-1 pb-1 text-[10px] leading-snug">
           {flags.branchless
-            ? "No if / break / short-circuit at all: both arms of every branch are computed. Measured 3× slower in 2D and 10× in the 3D view (branchbench) — the picture is identical."
+            ? "No if / break / short-circuit at all: both arms of every branch are computed. Measured 3× slower in 2D, and far worse in the 3D view, where the branched build's empty-space skip (4.7× on its own) cannot help a loop that must run every step — the picture is identical."
             : "Cull and early-out branches are kept — the fast build. The branchless build exists to measure what those branches are worth on a real GPU."}
         </div>
 
@@ -79,7 +80,13 @@ export function GenOptions({ flags, onChange, census, collapsed, onToggle }: { f
           <div className="px-1 pb-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] text-fg/50">branches</div>
           {row("non-short-circuit && / ||", "noShortCircuit", "Emit & and | instead of && and ||: no short-circuit, no branch. Measured free (1.00×).", implied("noShortCircuit"))}
           {row("cull bracket → select", "cullSelect", "Replace the bbox-cull if with a select — the child is then evaluated for every pixel (2.8× in 2D).", implied("cullSelect"))}
-          {row("branchless raymarch (3D)", "branchless3D", "The 3D loop keeps marching instead of breaking: all 128 steps and shading for every pixel (9.7×).", implied("branchless3D"))}
+          {row("branchless raymarch (3D)", "branchless3D", `The 3D loop keeps marching instead of breaking: all ${flags.sdfSteps} steps and shading for every pixel, with no help from the empty-space skip — dozens of times slower (branchbench).`, implied("branchless3D"))}
+        </div>
+
+        <div className="mt-1.5 border-t border-line pt-1.5">
+          <div className="px-1 pb-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] text-fg/50">3d raymarch</div>
+          {sel("sdf steps", flags.sdfSteps, [["16", 16], ["32", 32], ["64", 64], ["128", 128], ["256", 256], ["512", 512]],
+            "Sphere-tracing steps per ray in the 3D view. Baked into the generated shader and marcher as a literal — a compile-time constant, not a uniform — so each setting compiles its own pipeline and the compiler can unroll around the bound. Fewer steps march faster (the sweep is worth ~1.2× here) but can miss grazing surfaces; hits are monotone in the count. Together with the bounding-box empty-space skip (4.7× on its own) this is what marchbench measures.", (v) => onChange({ sdfSteps: v }))}
         </div>
 
         <div className="mt-1.5 border-t border-line pt-1.5">

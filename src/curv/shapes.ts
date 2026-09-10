@@ -230,6 +230,38 @@ export function bbox3Of(n: SNode, atlas: Atlas): BBox3 | null {
   if (b === undefined) { b = bbox3Raw(n, atlas); bb3Memo.set(n, b); }
   return b;
 }
+/** Is `v` a shape-tree node?  (SNode children live in plain fields — `s`, `a`, `b`, `kids` — so a
+ *  generic reflective walk over a node's own properties reaches every child, also of kinds added
+ *  later; scalars and number arrays fail the `.k` test.) */
+const isSNode = (v: unknown): v is SNode => !!v && typeof v === "object" && typeof (v as { k?: unknown }).k === "string";
+const customMemo = new WeakMap<SNode, boolean>();
+/** Does this subtree contain a `custom` (make_shape) node? */
+function hasCustom(n: SNode): boolean {
+  let hit = customMemo.get(n);
+  if (hit === undefined) {
+    hit = n.k === "custom";
+    if (!hit) for (const key of Object.keys(n)) {
+      const v = (n as unknown as Record<string, unknown>)[key];
+      if (isSNode(v)) { if (hasCustom(v)) { hit = true; break; } }
+      else if (Array.isArray(v)) for (const x of v) if (isSNode(x) && hasCustom(x)) { hit = true; break; }
+    }
+    customMemo.set(n, hit);
+  }
+  return hit;
+}
+/**
+ * The box the 3D marcher may skip empty space around (renderer.ts): the scene's bbox3, whose
+ * null-propagation is kind-aware (an intersection is bounded by any one bounded child, so the
+ * gyroid ∩ sphere cell gets the sphere's box) — but only when the tree contains **no custom
+ * shape**.  A `custom` (make_shape) bbox is a user *declaration* (it drives the camera fit), and a
+ * user is free to declare a box smaller than the field: the mandelbrot example is
+ * `everything.dist` — inside everywhere — with a view-fitting box, and liquid_paint declares
+ * `dist = -inf`.  Skipping around such a box would clip real geometry at its edges, so any tree
+ * with a custom shape keeps the march-from-the-eye path.
+ */
+export function marchBoxOf(n: SNode, atlas: Atlas): BBox3 | null {
+  return hasCustom(n) ? null : bbox3Of(n, atlas);
+}
 function bbox3Raw(n: SNode, atlas: Atlas): BBox3 | null {
   const c = (k: SNode) => bbox3Of(k, atlas);
   const flat = (b: BBox3 | null, k: number) => (b && b.every(Number.isFinite) ? bb3Grow(b, k) : b);
@@ -324,6 +356,12 @@ const f3Memo = new WeakMap<SNode, { is2d: boolean; is3d: boolean }>();
 /** Half-thickness of a flattened 2D shape in the 3D view, as a fraction of the camera distance:
  *  ~1/1000 of the view is about one pixel on screen, and it never falls below the marcher's epsilon. */
 export const FLAT_K = 0.001;
+/** How much the 3D marcher (src/gpu/renderer.ts) pads a scene's bounding box before using it to
+ *  skip empty space, as a multiple of the camera distance (with a 0.01 absolute floor there):
+ *  at least the plate half-thickness FLAT_K·rad — a flattened 2D shape is a slab that thick
+ *  around z = 0 while its own bbox has zero z extent — plus margin for the 0.001 hit epsilon.
+ *  Lives beside FLAT_K so the two constants cannot drift apart. */
+export const BB_PAD_K = 4 * FLAT_K;
 /** A shape with no extent in z (Curv's own is_2d and not is_3d): in the 3D view it needs a depth. */
 export const flat2D = (n: SNode): boolean => { const f = flags3Of(n); return f.is2d && !f.is3d; };
 export function flags3Of(n: SNode): { is2d: boolean; is3d: boolean } {
@@ -369,6 +407,9 @@ export function flags3Of(n: SNode): { is2d: boolean; is3d: boolean } {
   return out;
 }
 export function finiteBBox(b: BBox | null): BBox | null { return b && !isEmpty(b) && b.every(Number.isFinite) ? b : null; }
+/** A finite 3D box (null = infinite or empty): what the solid-view marcher needs before it may
+ *  skip the empty space outside it.  Shared by compileTree and the App's 3D camera fit. */
+export function finiteBBox3(b: BBox3 | null): BBox3 | null { return b !== null && b.every(Number.isFinite) ? b : null; }
 
 /** Per-glyph parameter rows [cell x, u0, v0, u1, v1] of a text node (spaces produce no glyph). Shared by codegen and walkParams. */
 export function textGlyphs(n: { text: string; size: number; align: "center" | "left" }, atlas: Atlas, m = textMetrics(n, atlas)): number[][] {
