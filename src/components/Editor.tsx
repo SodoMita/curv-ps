@@ -5,7 +5,6 @@ interface Props { value: string; onChange: (v: string) => void; errorLine?: numb
 
 const PAIR_OF: Record<string, string> = { "(": ")", "[": "]", "{": "}", '"': '"', "'": "'" };
 const OPENERS = new Set(["(", "[", "{"]);
-const CLOSERS = new Set([")", "]", "}"]);
 const QUOTES = new Set(['"', "'"]);
 const canPairBefore = (ch: string | undefined) => !ch || ch === " " || ch === "\t" || ch === "\n" || ch === "\r";
 
@@ -207,7 +206,6 @@ export function Editor({ value, onChange, errorLine }: Props) {
 
     if (plain && e.key.length === 1) {
       const k = e.key;
-      if (CLOSERS.has(k) && s === en && v[s] === k) { e.preventDefault(); el.selectionStart = el.selectionEnd = s + 1; syncCursor(el); return; }
       if (QUOTES.has(k)) {
         if (s === en && v[s] === k) { e.preventDefault(); el.selectionStart = el.selectionEnd = s + 1; syncCursor(el); return; }
         if (s !== en) { e.preventDefault(); typeText(k + v.slice(s, en) + k); requestAnimationFrame(() => { el.selectionStart = s + 1; el.selectionEnd = en + 1; syncCursor(el); }); return; }
